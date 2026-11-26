@@ -28,6 +28,8 @@ use std::time::Duration;
 /// Téléchargements simultanés au plus ; les suivants attendent.
 const MAX_ACTIFS: usize = 3;
 const QUEUE: &str = "queue.json";
+/// Reste à télécharger sous lequel un fichier démarre même si la file est pleine.
+const PETIT: u64 = 10_000_000;
 const SETTINGS: &str = "settings.json";
 /// Carte d'astuces de la barre latérale : (icône, titre, texte), une toutes les `ASTUCE_S` s.
 const ASTUCES: [(Icone, &str, &str); 8] = [
@@ -175,6 +177,8 @@ enum Modale {
     Page(String),
     /// Annuler un téléchargement : effacer aussi le fichier partiel ? (oui par défaut)
     Annuler { id: u64, supprimer: bool },
+    /// Lien expiré : nouveau lien pour le même fichier.
+    NouveauLien { id: u64, lien: String },
     /// Installation guidée de l'extension.
     Guide(guide::Guide),
     /// Une extension demande l'appairage : « Autoriser ? ».
@@ -258,6 +262,8 @@ pub struct App {
     horloge: std::time::Instant,
     /// Entrées de queue.json illisibles par cette version : gardées telles quelles.
     inconnues: Vec<serde_json::Value>,
+    /// Police CJK du système déjà cherchée.
+    cjk: bool,
 }
 
 impl App {
@@ -317,6 +323,7 @@ impl App {
             lien_copie: None,
             horloge: std::time::Instant::now(),
             inconnues: Vec::new(),
+            cjk: false,
         };
         if let Some(d) = capture {
             app.demo();
@@ -602,6 +609,12 @@ impl App {
             fini = true;
             e.status = match r {
                 Some(Ok(Outcome::Done(p))) => {
+                    // Nom final (« nom (1).ext » si un fichier du même nom est apparu entre-temps).
+                    if e.kind == Kind::Http {
+                        if let Some(n) = p.file_name() {
+                            e.name = Some(n.to_string_lossy().into_owned());
+                        }
+                    }
                     // Marque « venu d'Internet » (Windows) ; un dossier seulement pour un torrent
                     // (yt-dlp sans chemin final renvoie le dossier de téléchargement).
                     if p.is_file() || matches!(e.kind, Kind::Torrent { .. }) {
@@ -644,9 +657,12 @@ impl App {
             .filter(|e| e.status == Status::Running && !self.partage(e.id))
             .count();
         for i in 0..self.entries.len() {
-            if actifs < MAX_ACTIFS && self.entries[i].status == Status::Queued {
+            let e = &self.entries[i];
+            // Petit fichier de taille connue : passe devant, sans attendre les gros.
+            let petit = e.size.is_some_and(|s| s.saturating_sub(e.done) < PETIT);
+            if e.status == Status::Queued && (actifs < MAX_ACTIFS || petit) {
                 self.start(i);
-                actifs += 1;
+                actifs += usize::from(!petit);
             }
         }
     }
@@ -688,7 +704,9 @@ impl App {
             .show(ui, |ui| {
                 // Astuce suivante toutes les 12 s (fondu enchaîné), ou au clic.
                 let (mut cur, mut avant, mut depuis) = self.astuce;
-                if self.capture.is_none() && self.now - depuis >= ASTUCE_S {
+                // Fenêtre au second plan : l'astuce ne tourne pas (aucune image dépensée).
+                let devant = ui.ctx().input(|i| i.viewport().focused.unwrap_or(true));
+                if self.capture.is_none() && devant && self.now - depuis >= ASTUCE_S {
                     (avant, cur, depuis) = (cur, (cur + 1) % ASTUCES.len(), self.now);
                 }
                 let a = ((self.now - depuis) / FONDU_S).clamp(0.0, 1.0) as f32;
@@ -769,12 +787,12 @@ impl App {
                     (avant, cur, depuis) = (cur, (cur + 1) % ASTUCES.len(), self.now);
                 }
                 self.astuce = (cur, avant, depuis);
-                // Images seulement pendant le fondu (30 i/s) ; sinon une seule, au prochain
+                // Images seulement pendant le fondu (15 i/s) ; sinon une seule, au prochain
                 // changement.
-                if self.capture.is_none() {
+                if self.capture.is_none() && devant {
                     let reste = (self.now - depuis).max(0.0);
                     if reste < FONDU_S {
-                        ui.ctx().request_repaint_after(Duration::from_millis(33));
+                        ui.ctx().request_repaint_after(Duration::from_millis(66));
                     } else {
                         ui.ctx()
                             .request_repaint_after(Duration::from_secs_f64(ASTUCE_S - reste));
@@ -1007,16 +1025,20 @@ impl App {
                     self.url = s;
                 }
             }
+            let vide = self.url.trim().is_empty();
             let go = a_la_place(ui, bd, |ui| {
-                bouton_gel(
-                    ui,
-                    t(l, "Download"),
-                    Some(Icone::Telecharger),
-                    bd.size(),
-                    GEL_VERT,
-                )
+                ui.add_enabled_ui(!vide, |ui| {
+                    bouton_gel(
+                        ui,
+                        t(l, "Download"),
+                        Some(Icone::Telecharger),
+                        bd.size(),
+                        GEL_VERT,
+                    )
+                })
+                .inner
             });
-            if go.clicked() || entree {
+            if (go.clicked() || entree) && !vide {
                 self.add();
             }
             ui.add_space(10.0);
@@ -1203,6 +1225,11 @@ impl App {
                     (Icone::Dossier, "Open folder", Act::Folder),
                     (Icone::Fermer, "Cancel", Act::Cancel),
                 ],
+                Status::Failed(m) if m == engine::ERR_EXPIRE => &[
+                    (Icone::Lien, "Update the link", Act::NouveauLien),
+                    (Icone::Dossier, "Open folder", Act::Folder),
+                    (Icone::Fermer, "Cancel", Act::Cancel),
+                ],
                 Status::Failed(m) if m == engine::ERR_PAGE => &[
                     (Icone::Lien, "Open in browser", Act::Navigateur),
                     (Icone::Lecture, "Try as video", Act::Video),
@@ -1354,7 +1381,20 @@ impl App {
                     self.last_save = f64::NEG_INFINITY;
                 }
             },
-            Act::Resume => self.entries[i].status = Status::Queued,
+            Act::Resume => {
+                // Même contrôle qu'au lancement : un .part effacé à la main n'est pas recréé.
+                let e = &mut self.entries[i];
+                e.status = Status::Queued;
+                store::au_lancement(e);
+            }
+            Act::NouveauLien => {
+                if self.modale.is_none() {
+                    self.modale = Some(Modale::NouveauLien {
+                        id,
+                        lien: String::new(),
+                    });
+                }
+            }
             Act::Recommencer => {
                 let e = &mut self.entries[i];
                 delete_parts(e, true);
@@ -1499,10 +1539,13 @@ impl App {
         let Some(j) = self.jobs.get(&e.id) else {
             ui.add_space(28.0);
             ui.label(
-                egui::RichText::new(if e.status == Status::Done {
-                    t(l, "Download complete.")
-                } else {
-                    t(l, "No live data: resume to see the connections.")
+                egui::RichText::new(match e.status {
+                    Status::Done => t(l, "Download complete."),
+                    Status::Queued => t(
+                        l,
+                        "Waiting: it starts as soon as one of the running downloads finishes.",
+                    ),
+                    _ => t(l, "No live data: resume to see the connections."),
                 })
                 .font(regulier(13.5))
                 .color(TEXTE2),
@@ -1531,6 +1574,10 @@ impl App {
             (
                 !lv.ranges && e.status == Status::Running && e.kind == Kind::Http,
                 "Server refuses ranges: 1 connection.",
+            ),
+            (
+                lv.size_unverified && e.kind == Kind::Http,
+                "Size not verifiable: the server did not announce it.",
             ),
         ]
         .into_iter()
@@ -2047,7 +2094,7 @@ impl App {
                             if on {
                                 ui.add_space(8.0);
                                 let v = &mut self.settings.speed_limit_mb;
-                                boite_valeur(ui, &format!("{v:.0} MB/s"), 84.0);
+                                boite_valeur(ui, &format!("{v:.0} {}/s", octets_parts(1_000_000).1), 84.0);
                                 let mut f = *v as f64;
                                 if curseur(ui, &mut f, (1.0, 1000.0), true, 1.0, 160.0).changed() {
                                     *v = f.round() as f32;
@@ -2140,7 +2187,7 @@ impl App {
         let f = *frame;
         let dir = dir.clone();
         // Assez d'images entre le changement de vue et la capture pour finir les animations.
-        let vues: [(Tab, Lang, &str); 14] = [
+        let vues: [(Tab, Lang, &str); 18] = [
             (Tab::Downloads, Lang::En, "downloads"),
             (Tab::Benchmark, Lang::En, "benchmark"),
             (Tab::Settings, Lang::En, "settings"),
@@ -2155,6 +2202,10 @@ impl App {
             (Tab::Settings, Lang::En, "extension_guide_en"),
             (Tab::Settings, Lang::Fr, "pairing_fr"),
             (Tab::Downloads, Lang::Fr, "extension_bubble_fr"),
+            (Tab::Downloads, Lang::Fr, "cancel_fr"),
+            (Tab::Downloads, Lang::Fr, "expired_link_fr"),
+            (Tab::Downloads, Lang::Fr, "non_latin_names_fr"),
+            (Tab::Downloads, Lang::Fr, "narrow_900x600_fr"),
         ];
         for (i, (tab, lang, nom)) in vues.into_iter().enumerate() {
             let k = 30 * (i as u32 + 1);
@@ -2162,6 +2213,9 @@ impl App {
                 self.tab = tab;
                 self.settings.lang = lang;
                 self.demo_vue(nom);
+                if nom.starts_with("narrow") {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(900.0, 600.0)));
+                }
             }
             if f == k {
                 ctx.send_viewport_cmd(screenshot(dir.join(format!("{nom}.png"))));
@@ -2214,6 +2268,28 @@ impl App {
                 });
             }
             "torrent_pieces_fr" => self.selected = Some(5),
+            "cancel_fr" => {
+                self.modale = Some(Modale::Annuler {
+                    id: 3,
+                    supprimer: true,
+                })
+            }
+            "expired_link_fr" => {
+                if let Some(e) = self.entries.iter_mut().find(|e| e.id == 4) {
+                    e.status = Status::Failed(engine::ERR_EXPIRE.into());
+                }
+                self.selected = Some(4);
+                self.modale = Some(Modale::NouveauLien {
+                    id: 4,
+                    lien: "https://cdn.example.org/archive.tar.zst?token=…".into(),
+                });
+            }
+            "non_latin_names_fr" => {
+                self.entries[1].name = Some("Документы_2024 — отчёт.zip".into());
+                self.entries[2].name = Some("Ελληνικά → αρχείο.pdf".into());
+                self.selected = Some(2);
+            }
+
             "extension_guide_fr" | "extension_guide_en" => self.demo_guide(false),
             "extension_guide_firefox_fr" => self.demo_guide(true),
             "pairing_fr" => {
@@ -2431,6 +2507,8 @@ enum Act {
     Resume,
     /// Fichier partiel introuvable : repartir de zéro.
     Recommencer,
+    /// Lien expiré : en coller un nouveau (le `.part` est gardé si c'est le même fichier).
+    NouveauLien,
     Cancel,
     Remove,
 }
@@ -2442,6 +2520,7 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Horloge à nous : fenêtre masquée, l'heure d'egui reste celle de la dernière image.
         let now = self.horloge.elapsed().as_secs_f64();
+        UNITES_FR.store(self.settings.lang == Lang::Fr, Ordering::Relaxed);
         if self.capture.is_none() {
             self.schedule(now);
         }
@@ -2532,6 +2611,25 @@ impl eframe::App for App {
             self.suivre_appairage(ctx);
         }
         self.suivre_modale();
+        // Nom chinois, japonais ou coréen : police du système chargée à la première rencontre.
+        if !self.cjk {
+            let torrent = match &self.modale {
+                Some(Modale::Torrent {
+                    apercu: Some(Ok(a)),
+                    ..
+                }) => a.fichiers.iter().any(|f| besoin_cjk(&f.nom)) || besoin_cjk(&a.nom),
+                _ => false,
+            };
+            if torrent
+                || self
+                    .entries
+                    .iter()
+                    .any(|e| e.name.as_deref().is_some_and(besoin_cjk))
+            {
+                self.cjk = true;
+                charger_cjk(ctx);
+            }
+        }
         self.persist(now);
         // Au repos, aucune image : on ne repasse que si quelque chose bouge ou télécharge
         // (les animations egui demandent elles-mêmes leurs images).
@@ -2610,7 +2708,8 @@ impl eframe::App for App {
                 panneau(ui, marge, 0.5);
                 self.sidebar(ui)
             });
-        if self.tab == Tab::Downloads {
+        // Fenêtre étroite (petit écran à 125–150 %) : la liste prend la place du détail.
+        if self.tab == Tab::Downloads && ecran.width() >= 1100.0 {
             let marge = Margin {
                 left: 28,
                 right: 38,
@@ -2740,14 +2839,24 @@ pub fn octets(n: u64) -> String {
     format!("{v} {u}")
 }
 
+/// Unités françaises (Mo, Go, virgule décimale) : langue de l'interface, mise à jour à chaque
+/// passe (`octets` est appelé partout sans la langue).
+static UNITES_FR: AtomicBool = AtomicBool::new(false);
+
 /// Nombre et unité séparés (le nombre en grand, l'unité en discret).
 fn octets_parts(n: u64) -> (String, &'static str) {
+    let fr = UNITES_FR.load(Ordering::Relaxed);
     let n = n as f64;
-    match n {
-        n if n >= 1e9 => (format!("{:.2}", n / 1e9), "GB"),
-        n if n >= 1e6 => (format!("{:.1}", n / 1e6), "MB"),
-        n if n >= 1e3 => (format!("{:.0}", n / 1e3), "kB"),
-        n => (format!("{n:.0}"), "B"),
+    let (v, i) = match n {
+        n if n >= 1e9 => (format!("{:.2}", n / 1e9), 3),
+        n if n >= 1e6 => (format!("{:.1}", n / 1e6), 2),
+        n if n >= 1e3 => (format!("{:.0}", n / 1e3), 1),
+        n => (format!("{n:.0}"), 0),
+    };
+    if fr {
+        (v.replace('.', ","), ["o", "ko", "Mo", "Go"][i])
+    } else {
+        (v, ["B", "kB", "MB", "GB"][i])
     }
 }
 

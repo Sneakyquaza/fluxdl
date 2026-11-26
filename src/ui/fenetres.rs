@@ -73,6 +73,18 @@ impl App {
         }
     }
 
+    /// Nouveau lien pour un téléchargement au lien expiré : même nom (le moteur garde le `.part`
+    /// si taille et validateurs concordent), reprise. Vrai = fermer.
+    fn nouveau_lien(&mut self, id: u64, lien: String) -> bool {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+            e.url = lien.trim().to_string();
+            e.status = Status::Queued;
+            store::au_lancement(e);
+        }
+        self.last_save = f64::NEG_INFINITY;
+        true
+    }
+
     /// Voile sur toute la fenêtre (bloque les clics dessous) et fenêtre de verre centrée.
     pub(super) fn modale(&mut self, ctx: &egui::Context) {
         if self.modale.is_none() {
@@ -177,12 +189,61 @@ impl App {
                 }
                 return false;
             }
+            Modale::NouveauLien { id, mut lien } => {
+                titre_modale(ui, Icone::Lien, t(l, "Update the link"));
+                paragraphe(
+                    ui,
+                    t(
+                        l,
+                        "This link has expired. Paste a new link to the same file (from the site): what is already downloaded is kept if the file is the same.",
+                    ),
+                );
+                ui.add_space(10.0);
+                let (r, _) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
+                let rep = champ(
+                    ui,
+                    r,
+                    &mut lien,
+                    "https://…",
+                    Some(Icone::Lien),
+                    regulier(13.5),
+                );
+                if !rep.has_focus() && lien.is_empty() {
+                    rep.request_focus();
+                }
+                let u = lien.trim();
+                let ok = u.starts_with("http://") || u.starts_with("https://");
+                let entree = ok && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                match boutons_avec(
+                    ui,
+                    t(l, "Cancel"),
+                    t(l, "Resume"),
+                    ok,
+                    Icone::Lecture,
+                    GEL_VERT,
+                ) {
+                    Some(true) => return self.nouveau_lien(id, lien),
+                    _ if entree => return self.nouveau_lien(id, lien),
+                    Some(false) => return true,
+                    None => self.modale = Some(Modale::NouveauLien { id, lien }),
+                }
+                return false;
+            }
             Modale::Annuler { id, mut supprimer } => {
                 titre_modale(ui, Icone::Fermer, t(l, "Cancel this download?"));
                 paragraphe(ui, t(l, "It leaves the list."));
                 ui.add_space(8.0);
                 coche(ui, &mut supprimer, t(l, "Also delete the partial file"), "");
-                match boutons(ui, t(l, "Keep downloading"), t(l, "Cancel download"), true) {
+                // Action destructive : bouton rouge avec une croix (pas le vert « télécharger »).
+                match boutons_avec(
+                    ui,
+                    t(l, "Keep downloading"),
+                    t(l, "Cancel download"),
+                    true,
+                    Icone::Fermer,
+                    gel_de(DANGER),
+                ) {
                     Some(true) => {
                         self.annuler(id, supprimer);
                         return true;
@@ -964,7 +1025,13 @@ impl App {
                     t(l, "missing")
                 }
             };
-            let aide = format!("yt-dlp : {}, ffmpeg : {}", etat(&o.ytdlp), etat(&o.ffmpeg));
+            // Espace avant « : » en français seulement.
+            let sep = if l == Lang::Fr { " :" } else { ":" };
+            let aide = format!(
+                "yt-dlp{sep} {}, ffmpeg{sep} {}",
+                etat(&o.ytdlp),
+                etat(&o.ffmpeg)
+            );
             let complets = o.complets();
             reglage(ui, t(l, "yt-dlp and ffmpeg"), &aide, |ui| {
                 if cfg!(windows) && !complets {
@@ -1150,6 +1217,18 @@ fn attente(ui: &mut Ui, s: &str) {
 /// Boutons du bas, à droite : secondaire (`Some(false)`), principal vert (`Some(true)`, absent
 /// si `ok` est vide, grisé si `actif` est faux).
 pub(super) fn boutons(ui: &mut Ui, annuler: &str, ok: &str, actif: bool) -> Option<bool> {
+    boutons_avec(ui, annuler, ok, actif, Icone::Telecharger, GEL_VERT)
+}
+
+/// Comme `boutons`, avec l'icône et la couleur du bouton principal.
+pub(super) fn boutons_avec(
+    ui: &mut Ui,
+    annuler: &str,
+    ok: &str,
+    actif: bool,
+    icone: Icone,
+    couleur: Gel,
+) -> Option<bool> {
     ui.add_space(16.0);
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
     let mut res = None;
@@ -1165,7 +1244,7 @@ pub(super) fn boutons(ui: &mut Ui, annuler: &str, ok: &str, actif: bool) -> Opti
         let rep = ui
             .scope_builder(UiBuilder::new().max_rect(b), |ui| {
                 ui.add_enabled_ui(actif, |ui| {
-                    bouton_gel(ui, ok, Some(Icone::Telecharger), b.size(), GEL_VERT)
+                    bouton_gel(ui, ok, Some(icone), b.size(), couleur)
                 })
                 .inner
             })

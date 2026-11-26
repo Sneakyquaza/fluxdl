@@ -94,6 +94,7 @@ async function sendToApp(url, extra, settings) {
   const body = { url };
   if (isHttp(extra.referrer)) body.referrer = extra.referrer;
   if (extra.filename) body.filename = extra.filename;
+  if (extra.probe) body.probe = true;
   if (extra.title) body.title = extra.title; // ignoré par l'appli 0.2.x, gardé pour plus tard
   const cookies = await cookiesFor(url, settings);
   if (cookies) body.cookies = cookies;
@@ -287,7 +288,8 @@ function shouldCapture(item, settings) {
 // Envoie à l'appli ; vrai seulement si l'appli a confirmé (le navigateur doit alors abandonner)
 async function handOver(item, settings) {
   const url = item.finalUrl || item.url;
-  const res = await sendToApp(url, { referrer: item.referrer, filename: basename(item.filename) || undefined }, settings);
+  // probe : l'appli vérifie d'abord que le lien donne bien le fichier (sinon le navigateur le garde)
+  const res = await sendToApp(url, { referrer: item.referrer, filename: basename(item.filename) || undefined, probe: true }, settings);
   if (res.state === "ok") return true;
   flagBadge();
   const msg = { rate: "notifRateLimited", kept: "notifAppKept" }[res.state] ?? "notifKeptInBrowser";

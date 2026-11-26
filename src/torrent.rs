@@ -116,6 +116,8 @@ pub fn moteur() -> Result<&'static Moteur, String> {
             Moteur::new(SessionOptions {
                 dht: Some(dht),
                 listen: Some(ListenerOptions::default()),
+                // Pas d'annonce sur le réseau local de ce qu'on télécharge.
+                disable_local_service_discovery: true,
                 ..Default::default()
             })
         })
@@ -214,7 +216,7 @@ impl Moteur {
     ) -> Result<Outcome, String> {
         // Plusieurs fichiers : dans un sous-dossier au nom du torrent (librqbit écrit sinon
         // directement dans le dossier donné).
-        let (nom, multi) = {
+        let (nom, multi, total) = {
             let m = librqbit::torrent_from_bytes(&octets).map_err(err)?;
             let v = m.info.data.clone().validate().map_err(err)?;
             chemins_surs(
@@ -226,6 +228,13 @@ impl Moteur {
                 }),
                 cfg!(windows),
             )?;
+            // Taille des fichiers choisis (place libre vérifiée avant de commencer).
+            let total: u64 = v
+                .iter_file_details()
+                .enumerate()
+                .filter(|(i, _)| fichiers.as_ref().is_none_or(|l| l.contains(i)))
+                .map(|(_, f)| f.len)
+                .sum();
             let i = &m.info.data;
             let nom = i
                 .name
@@ -233,7 +242,7 @@ impl Moteur {
                 .map(|n| dlcore::engine::sanitize(&String::from_utf8_lossy(n.as_ref())))
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| "torrent".into());
-            (nom, i.files.is_some())
+            (nom, i.files.is_some(), total)
         };
         let cible = dir.join(&nom);
         let sortie = if multi {
@@ -242,6 +251,9 @@ impl Moteur {
             dir.to_path_buf()
         };
         std::fs::create_dir_all(&sortie).map_err(|e| format!("{}: {e}", sortie.display()))?;
+        if !reprise && dlcore::engine::espace_libre(&sortie).is_some_and(|l| l < total) {
+            return Err(dlcore::engine::ERR_ESPACE.into());
+        }
         // Le sous-dossier ne doit pas mener ailleurs (lien symbolique posé à l'avance).
         let dans = |p: &Path| std::fs::canonicalize(p).ok();
         if !dans(&sortie)

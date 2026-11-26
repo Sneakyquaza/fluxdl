@@ -46,6 +46,10 @@ pub struct Demande {
     pub filename: Option<String>,
     #[serde(default)]
     pub cookies: Option<String>,
+    /// Capture automatique : sonder le lien avant d'accepter (le navigateur abandonne sa copie
+    /// sur « added ») ; page web, erreur ou délai → refus, le navigateur garde son téléchargement.
+    #[serde(default)]
+    pub probe: bool,
     /// Vrai si la demande vient de l'appli elle-même (fichier .torrent local permis).
     #[serde(skip)]
     pub locale: bool,
@@ -550,6 +554,27 @@ pub fn lancer(
     Ok(port)
 }
 
+/// Le lien mène-t-il à un fichier (sonde avec le référent et les cookies de l'extension, 5 s
+/// au plus) ? Une page de connexion, un POST rejoué en GET ou une erreur : non.
+fn sonde_fichier(d: &Demande) -> bool {
+    use dlcore::engine;
+    let mut h = Vec::new();
+    if let Some(r) = &d.referrer {
+        h.push(("Referer".to_string(), r.clone()));
+    }
+    if let Some(c) = &d.cookies {
+        h.push(("Cookie".to_string(), c.clone()));
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let url = d.url.trim().to_string();
+    std::thread::spawn(move || {
+        let ok =
+            engine::probe(&engine::agent(), &url, &h).is_ok_and(|p| !engine::est_page(&p, &url));
+        let _ = tx.send(ok);
+    });
+    rx.recv_timeout(Duration::from_secs(5)).unwrap_or(false)
+}
+
 /// Une connexion : lecture, traitement, décision de l'UI pour un `/add`, réponse.
 #[allow(clippy::too_many_arguments)]
 fn servir(
@@ -570,6 +595,12 @@ fn servir(
         traiter(&brut, port, (&j, local), &mut l, &mut p, Instant::now())
     };
     if let Some(mut d) = r.demande.take() {
+        if d.probe && !sonde_fichier(&d) {
+            r.code = 409;
+            r.corps = r#"{"ok":false,"status":"refused"}"#.into();
+            repondre(s, &r);
+            return;
+        }
         let attendre = !d.url.is_empty();
         let dec = Arc::new(Decision::default());
         if attendre {
@@ -986,5 +1017,60 @@ mod tests {
             t,
         );
         assert_eq!(r.code, 200);
+    }
+
+    /// Petit serveur HTTP : chaque requête reçoit `ctype` (206, 4 octets).
+    fn site(ctype: &'static str) -> u16 {
+        let e = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = e.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for s in e.incoming() {
+                let Ok(mut s) = s else { continue };
+                let mut b = [0u8; 4096];
+                let _ = s.read(&mut b);
+                let _ = s.write_all(
+                    format!("HTTP/1.1 206 Partial Content\r\nContent-Type: {ctype}\r\nContent-Range: bytes 0-0/4\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx").as_bytes(),
+                );
+            }
+        });
+        port
+    }
+
+    /// Audit M8 : capture automatique d'un lien qui donne une page (connexion exigée, POST) →
+    /// refus avant toute décision de l'UI : le navigateur garde sa copie.
+    #[test]
+    fn capture_sondee_avant_accord() {
+        let page = site("text/html; charset=utf-8");
+        let fichier = site("application/zip");
+        let (tx, rx) = std::sync::mpsc::channel::<Demande>();
+        let port = lancer(
+            0,
+            Arc::new(Mutex::new(J.into())),
+            J.into(),
+            Arc::default(),
+            tx,
+            || {},
+        )
+        .unwrap();
+        // Code HTTP et corps de la réponse.
+        let ajout = |u: String| match ureq::post(&format!("http://127.0.0.1:{port}/add"))
+            .set("Origin", "chrome-extension://abcdefghijklmnop")
+            .set("X-Fluxdl-Token", J)
+            .send_string(&serde_json::json!({ "url": u, "probe": true }).to_string())
+        {
+            Ok(r) => (200, r.into_string().unwrap()),
+            Err(ureq::Error::Status(c, _)) => (c, String::new()),
+            Err(_) => (0, String::new()),
+        };
+        let r = ajout(format!("http://127.0.0.1:{page}/telecharger.zip"));
+        assert_eq!(r.0, 409);
+        assert!(rx.try_recv().is_err(), "rien n'arrive à l'UI");
+        let ui = std::thread::spawn(move || {
+            let d = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            d.decision.as_ref().unwrap().decider(|| Statut::Ajoute);
+        });
+        let r = ajout(format!("http://127.0.0.1:{fichier}/a.zip"));
+        assert!(r.0 == 200 && r.1.contains("added"));
+        ui.join().unwrap();
     }
 }

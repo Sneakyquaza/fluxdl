@@ -3,6 +3,35 @@
 use crate::store::Lang;
 
 const FR: &[(&str, &str)] = &[
+    (
+        "Waiting: it starts as soon as one of the running downloads finishes.",
+        "En attente : il démarre dès qu'un des téléchargements en cours se termine.",
+    ),
+    ("Update the link", "Mettre à jour le lien"),
+    (
+        "This link has expired. Paste a new link to the same file (from the site): what is already downloaded is kept if the file is the same.",
+        "Ce lien a expiré. Colle un nouveau lien vers le même fichier (depuis le site) : la partie déjà téléchargée est gardée si c'est le même fichier.",
+    ),
+    (
+        "The link has expired or is no longer allowed.",
+        "Le lien a expiré ou n'est plus autorisé.",
+    ),
+    (
+        "The server sends the file compressed; it cannot be saved as is.",
+        "Le serveur envoie le fichier compressé : impossible de l'enregistrer tel quel.",
+    ),
+    (
+        "This drive (FAT32) cannot hold files of 4 GB or more.",
+        "Ce disque (FAT32) ne peut pas contenir de fichiers de 4 Go ou plus.",
+    ),
+    (
+        "Unsafe file name in torrent.",
+        "Torrent refusé : un nom de fichier sortirait du dossier choisi.",
+    ),
+    (
+        "Size not verifiable: the server did not announce it.",
+        "Taille non vérifiable : le serveur ne l'a pas annoncée.",
+    ),
     ("Cancel this download?", "Annuler ce téléchargement ?"),
     ("It leaves the list.", "Il sera retiré de la liste."),
     ("Also delete the partial file", "Supprimer aussi le fichier partiel"),

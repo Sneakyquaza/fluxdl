@@ -108,10 +108,12 @@ pub fn affiche(t: f32) -> FontId {
     FontId::new(t, FontFamily::Name("affiche".into()))
 }
 
-/// Polices, visuels egui, textures du style. Renvoie les textures (à garder en vie).
-pub fn installer_style(ctx: &egui::Context) -> Vec<egui::TextureHandle> {
+/// Polices de l'appli ; `cjk` : police du système pour le chinois, le japonais et le coréen
+/// (trop lourde à embarquer), ajoutée en dernier recours.
+fn polices(cjk: Option<Vec<u8>>) -> egui::FontDefinitions {
     let mut polices = egui::FontDefinitions::empty();
-    // Open Sans (OFL), sous-ensemble latin sans hinting ; chiffres tabulaires d'origine.
+    // Open Sans (OFL), sous-ensemble latin + grec + cyrillique sans hinting ; chiffres
+    // tabulaires d'origine. Flèches et quelques symboles : DejaVu Sans (licence Bitstream Vera).
     for (nom, octets) in [
         (
             "os",
@@ -129,6 +131,10 @@ pub fn installer_style(ctx: &egui::Context) -> Vec<egui::TextureHandle> {
             "os-fin",
             &include_bytes!("../../assets/fonts/OpenSans-Light.ttf")[..],
         ),
+        (
+            "symboles",
+            &include_bytes!("../../assets/fonts/DejaVuSans-Symboles.ttf")[..],
+        ),
     ] {
         polices
             .font_data
@@ -141,11 +147,68 @@ pub fn installer_style(ctx: &egui::Context) -> Vec<egui::TextureHandle> {
         (FontFamily::Name("demi".into()), "os-demi"),
         (FontFamily::Name("affiche".into()), "os-fin"),
     ] {
-        polices
-            .families
-            .insert(famille, vec![nom.to_string(), "os".to_string()]);
+        let mut l = vec![nom.to_string(), "os".to_string(), "symboles".to_string()];
+        if cjk.is_some() {
+            l.push("cjk".to_string());
+        }
+        polices.families.insert(famille, l);
     }
-    ctx.set_fonts(polices);
+    if let Some(o) = cjk {
+        polices
+            .font_data
+            .insert("cjk".into(), Arc::new(egui::FontData::from_owned(o)));
+    }
+    polices
+}
+
+/// Texte en écriture chinoise, japonaise ou coréenne (absente des polices embarquées).
+pub fn besoin_cjk(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(c as u32, 0x2E80..=0x9FFF | 0xA960..=0xA97F | 0xAC00..=0xD7FF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF | 0x20000..=0x2FA1F)
+    })
+}
+
+/// Charge une police CJK du système (une seule fois, au premier nom qui en a besoin : ~20 Mo
+/// en mémoire). Vrai si elle est en place.
+pub fn charger_cjk(ctx: &egui::Context) -> bool {
+    #[cfg(windows)]
+    let essais: Vec<std::path::PathBuf> = {
+        let f = std::path::PathBuf::from(
+            std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()),
+        )
+        .join("Fonts");
+        [
+            "msyh.ttc",
+            "YuGothR.ttc",
+            "malgun.ttf",
+            "msgothic.ttc",
+            "simsun.ttc",
+        ]
+        .iter()
+        .map(|n| f.join(n))
+        .collect()
+    };
+    #[cfg(not(windows))]
+    let essais: Vec<std::path::PathBuf> = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+    ]
+    .iter()
+    .map(std::path::PathBuf::from)
+    .collect();
+    let Some(o) = essais.iter().find_map(|p| std::fs::read(p).ok()) else {
+        return false;
+    };
+    ctx.set_fonts(polices(Some(o)));
+    true
+}
+
+/// Polices, visuels egui, textures du style. Renvoie les textures (à garder en vie).
+pub fn installer_style(ctx: &egui::Context) -> Vec<egui::TextureHandle> {
+    ctx.set_fonts(polices(None));
     let mut style = (*ctx.global_style()).clone();
     style.text_styles = [
         (egui::TextStyle::Small, regulier(12.0)),
@@ -1204,7 +1267,7 @@ pub fn segmente<T: PartialEq + Copy>(ui: &mut Ui, v: &mut T, options: &[(T, &str
 }
 
 /// Reflet qui balaie une jauge en cours (barre de progression Vista). Ne redessine que pendant
-/// le passage ; entre deux passages, une seule image est demandée pour le suivant.
+/// le passage (12 i/s) ; entre deux passages, une seule image est demandée pour le suivant.
 fn balayage(p: &egui::Painter, f: Rect) {
     const PERIODE: f64 = 2.6;
     const PASSAGE: f64 = 1.3;
@@ -1218,7 +1281,8 @@ fn balayage(p: &egui::Painter, f: Rect) {
         let b = Rect::from_center_size(pos2(x, f.center().y), vec2(bande, f.height() * 1.6));
         p.with_clip_rect(f.intersect(p.clip_rect()))
             .add(lueur(b, blanc(150), bande * 0.45));
-        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        // 12 i/s : assez pour le reflet, l'interface reste sous ~12 images/s en téléchargement.
+        ctx.request_repaint_after(std::time::Duration::from_millis(80));
     } else {
         ctx.request_repaint_after(std::time::Duration::from_secs_f64(PERIODE - phase));
     }

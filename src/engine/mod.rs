@@ -384,7 +384,7 @@ pub fn run(
 
 /// Réponse HTML à un lien qui ne finit pas par .htm(l) : une page (vidéo, partage…), pas un
 /// fichier.
-fn est_page(p: &Probe, url: &str) -> bool {
+pub fn est_page(p: &Probe, url: &str) -> bool {
     let chemin = url
         .split(['?', '#'])
         .next()
@@ -1147,7 +1147,7 @@ fn rendre_creux(_: &File) {}
 
 /// Octets libres pour l'utilisateur sur le disque de `dir` (None = inconnu).
 #[cfg(windows)]
-fn espace_libre(dir: &Path) -> Option<u64> {
+pub fn espace_libre(dir: &Path) -> Option<u64> {
     use std::os::windows::ffi::OsStrExt;
     #[link(name = "kernel32")]
     extern "system" {
@@ -1173,7 +1173,7 @@ fn espace_libre(dir: &Path) -> Option<u64> {
 }
 
 #[cfg(unix)]
-fn espace_libre(dir: &Path) -> Option<u64> {
+pub fn espace_libre(dir: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
     // SAFETY : chaîne C valide, `statvfs` remplit la structure.

@@ -91,6 +91,22 @@ impl Veille {
     }
 }
 
+/// Numéro de version du presse-papiers (Windows), qui change à chaque copie ; ailleurs `None`.
+#[cfg(windows)]
+fn sequence() -> Option<u32> {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetClipboardSequenceNumber() -> u32;
+    }
+    // SAFETY : sans argument, lecture d'un compteur du système.
+    Some(unsafe { GetClipboardSequenceNumber() }).filter(|&n| n != 0)
+}
+
+#[cfg(not(windows))]
+fn sequence() -> Option<u32> {
+    None
+}
+
 /// Lance le fil de surveillance ; `actif` faux = aucune lecture. Les liens arrivent par le
 /// canal, l'UI est réveillée à chacun.
 pub fn lancer(ctx: egui::Context, actif: Arc<AtomicBool>) -> Receiver<String> {
@@ -98,6 +114,7 @@ pub fn lancer(ctx: egui::Context, actif: Arc<AtomicBool>) -> Receiver<String> {
     std::thread::spawn(move || {
         let mut veille = Veille::default();
         let mut presse = None;
+        let mut numero = None;
         loop {
             std::thread::sleep(Duration::from_millis(700));
             if !actif.load(Ordering::Relaxed) {
@@ -105,6 +122,13 @@ pub fn lancer(ctx: egui::Context, actif: Arc<AtomicBool>) -> Receiver<String> {
                 veille.vu = None;
                 continue;
             }
+            // Windows : lecture seulement après un changement (ouvrir le presse-papiers toutes
+            // les 700 ms peut le rendre « occupé » pour les autres applis).
+            let n = sequence();
+            if n.is_some() && n == numero && veille.vu.is_some() {
+                continue;
+            }
+            numero = n;
             if presse.is_none() {
                 presse = arboard::Clipboard::new().ok();
             }

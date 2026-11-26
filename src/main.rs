@@ -82,7 +82,7 @@ fn main() -> Result<(), String> {
             .with_title(APP_NAME)
             .with_app_id(APP_NAME)
             .with_inner_size([1180.0, 760.0])
-            .with_min_inner_size([1100.0, 680.0])
+            .with_min_inner_size([900.0, 600.0])
             .with_icon(egui::IconData {
                 rgba: icone::icone_rgba(128),
                 width: 128,
