@@ -3,6 +3,16 @@
 Manifest V3 extension for Chrome, Edge and Firefox that sends downloads to the fluxdl app
 running on `127.0.0.1`. Plain JavaScript, no build step, no remote code.
 
+## Answers from the app (0.2.3)
+
+- `POST /add` now answers after fluxdl decided: `added` or `already_active` (200, the browser
+  copy may be dropped), `already_done` or `refused` (409) and `timeout` (503): the browser keeps
+  its download. Auto-capture sends `probe: true`: fluxdl checks the link gives the file (with
+  the referrer and, if enabled, the cookies) before accepting; a login page is refused.
+- The floating button's style is re-applied each time it appears, and a click only counts if
+  the button is really visible under the pointer (a page making it transparent can't use it).
+- Firefox 128 or later (optional host permissions).
+
 ## Pairing (0.2.2)
 
 - **Connect to fluxdl** (popup and options) or, once, right after installation: the background

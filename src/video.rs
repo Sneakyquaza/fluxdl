@@ -595,6 +595,25 @@ pub fn mettre_a_jour_ytdlp() {
 mod tests {
     use super::*;
 
+    /// Audit L19 : un octet non UTF-8 (page de code Windows) n'arrête pas la lecture.
+    #[test]
+    fn sortie_non_utf8_lue_jusqu_au_bout() {
+        let brut: &[u8] = b"[download] Destination: caf\xe9.mp4\r\nfluxdl 10 100 NA\nfin";
+        let mut l = Vec::new();
+        lignes(Some(brut), |x| {
+            l.push(x);
+            true
+        });
+        assert_eq!(
+            l,
+            [
+                "[download] Destination: caf\u{fffd}.mp4",
+                "fluxdl 10 100 NA",
+                "fin"
+            ]
+        );
+    }
+
     /// Audit H1 : jamais de fichier de config ni de greffon lu (un `yt-dlp.conf` déposé dans
     /// Téléchargements contenait `--exec`) ; dossier courant sûr.
     #[test]

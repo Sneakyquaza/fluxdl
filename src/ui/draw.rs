@@ -1751,3 +1751,29 @@ pub fn boite_valeur(ui: &mut Ui, t: &str, largeur: f32) {
     p.rect_stroke(r, 8.0, Stroke::new(1.0, nuit(70)), StrokeKind::Inside);
     p.text(r.center(), Align2::CENTER_CENTER, t, demi(13.0), TEXTE);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Audit M9 : noms grecs et cyrilliques et flèches des astuces affichés par les polices
+    /// embarquées ; le chinois, le japonais et le coréen demandent la police du système.
+    #[test]
+    fn noms_non_latins() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(polices(None));
+        ctx.run_ui(Default::default(), |_| {})
+            .textures_delta
+            .clear();
+        for police in [regulier(14.0), moyen(13.5), demi(14.5), affiche(24.0)] {
+            ctx.fonts_mut(|f| {
+                assert!(f.has_glyphs(&police, "Документы_2024 — отчёт.zip"));
+                assert!(f.has_glyphs(&police, "Ελληνικά αρχείο.pdf"));
+                assert!(f.has_glyphs(&police, "→ ↑ − ≥ ▾ … •"));
+            });
+        }
+        assert!(ctx.fonts_mut(|f| !f.has_glyphs(&regulier(14.0), "動画")));
+        assert!(besoin_cjk("動画.mp4") && besoin_cjk("한국어") && besoin_cjk("ひらがな"));
+        assert!(!besoin_cjk("Документы αρχείο → café"));
+    }
+}

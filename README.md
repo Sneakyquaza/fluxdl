@@ -26,7 +26,7 @@ A free, open-source multi-connection download manager (Windows + Linux, single e
   delete the partial file. At launch, a download whose `.part` was deleted is not recreated:
   it shows "Partial file not found" with Start over / Remove.
 - Per-connection retries with exponential backoff, redirects (8 max), HTTPS through rustls,
-  optional SHA-256 check and global speed limit.
+  optional SHA-256 check and a per-download speed limit.
 - Benchmark tab: the same link with 1 connection, then N, to a temporary file deleted after.
 
 ## New in 0.2
@@ -35,7 +35,9 @@ A free, open-source multi-connection download manager (Windows + Linux, single e
   background. A notification bubble offers **Update** or **Later**; Settings → Updates shows the
   installed version and a **Check now** button. On Windows the new `fluxdl.exe` is downloaded
   next to the app, checked against `fluxdl.exe.sha256` (GitHub hosts only, every redirect
-  checked), swapped in and restarted. Running downloads pause and resume after the restart
+  checked) and, since 0.2.3, against an Ed25519 signature (`fluxdl.exe.sig`) made with a key
+  that never leaves the maintainer's machine (the public key is built into the app), then
+  swapped in and restarted. Running downloads pause and resume after the restart
   (you are asked first). On Linux the bubble opens the release page.
 - **Videos (yt-dlp).** Paste a YouTube (or other site) link, or retry a link that turned out to
   be a web page: fluxdl runs `yt-dlp -J` and offers best quality (up to 8K), 1080p, 720p, or
@@ -59,6 +61,27 @@ A free, open-source multi-connection download manager (Windows + Linux, single e
   [Install from fluxdl](#install-from-fluxdl-recommended).
 - **Automatic pairing**: the extension asks, fluxdl shows "Allow?", no token to copy.
   See [Pairing](#pairing).
+- **Security and reliability fixes** from an independent audit (42 findings, see
+  `out/audit` locally):
+  - Windows tools (`explorer`, `reg`, `taskkill`, `tar`) are started by their full path, from a
+    safe folder: a file named `explorer.exe` in Downloads is never run.
+  - yt-dlp runs with `--ignore-config` (and without plugins for the app's own copy): a
+    `yt-dlp.conf` dropped in Downloads is ignored.
+  - Only one fluxdl runs: a second launch hands its link to the first one (or brings it to the
+    front) and exits.
+  - Downloads, extension links, the clipboard watcher and saving keep working while the window
+    is minimized or hidden.
+  - The extension gives up the browser's copy only when fluxdl really took the link
+    (`added` / `already_active`); an auto-captured link is checked first (a login page stays in
+    the browser).
+  - Torrent file names that could leave the download folder (`C:`, `..`, `:`, `NUL`…) are refused.
+  - Downloaded files get the Windows "from the Internet" mark (Zone.Identifier).
+  - Compressed (`gzip`) responses, expired links ("Update the link"), weak ETags, redirects
+    with cookies, empty files and dangerous file names are handled; error messages never show
+    the link (signed links carry tokens).
+  - A `queue.json` entry this version can't read is kept, not wiped (`queue.json.bak`).
+  - Greek and Cyrillic names display; Chinese, Japanese and Korean use the system font.
+  - Minimum window 900 × 600; no CPU used at rest apart from the tips card fading every 12 s.
 
 ### Extension features (0.2.1)
 - Auto-capture: clicking a site's download button hands the real file (final URL after redirects) to fluxdl; the browser download is cancelled only once fluxdl confirms. If fluxdl isn't running, the browser keeps the download and shows a badge.
@@ -97,17 +120,17 @@ in the guide (`chrome://extensions`, `edge://extensions`, `brave://extensions`�
 Build the packages by hand (optional, needs only `bash` and `python3`):
 
     ./extension/package.sh
-    # -> extension/dist/fluxdl-chrome-0.2.2.zip
-    # -> extension/dist/fluxdl-firefox-0.2.2.zip
+    # -> extension/dist/fluxdl-chrome-0.2.3.zip
+    # -> extension/dist/fluxdl-firefox-0.2.3.zip
 
 ### Install on Chrome / Edge (by hand)
 1. Open `chrome://extensions` (or `edge://extensions`).
 2. Enable **Developer mode**.
 3. Click **Load unpacked** and select the `extension/` folder (or the folder where you unzipped
-   `fluxdl-chrome-0.2.2.zip`).
+   `fluxdl-chrome-0.2.3.zip`).
 
 ### Install on Firefox (by hand)
-1. Unzip `fluxdl-firefox-0.2.2.zip` into a folder.
+1. Unzip `fluxdl-firefox-0.2.3.zip` into a folder (Firefox 128 or later).
 2. Open `about:debugging` → **This Firefox** → **Load Temporary Add-on…** and pick the
    `manifest.json` from that folder.
 3. Open the extension options and click **Grant access to the app** (Firefox treats access to
@@ -119,7 +142,7 @@ build, which is not provided yet. On Firefox Developer Edition or Nightly you ca
 `.xpi`) permanently.
 
 ### Pairing
-Automatic (0.2.2): right after installation the extension asks fluxdl once (if it is running);
+Automatic (0.2.3): right after installation the extension asks fluxdl once (if it is running);
 otherwise click **Connect to fluxdl** in the popup or the options. fluxdl shows "A fluxdl
 extension asks for access (Chrome, origin chrome-extension://…). Allow?". Click **Allow**: the
 extension receives the token and shows "Paired ✓".
@@ -136,7 +159,7 @@ By hand (fallback, or with an older fluxdl):
    token.
 2. Open the extension options (popup → **Options**), paste the token, keep the port at `47591`
    unless you changed it in the app.
-3. Click **Test connection**: the orb turns green with "Connected to fluxdl 0.2.2".
+3. Click **Test connection**: the orb turns green with "Connected to fluxdl 0.2.3".
 
 If fluxdl is not running (or not paired), **Download with fluxdl** falls back to a normal
 browser download and shows a notification.
@@ -144,8 +167,9 @@ browser download and shows a notification.
 ### Auto-capture
 Off by default. Turn it on in the popup. A browser download (http/https only) is sent to
 fluxdl when its size is at least the threshold (default 20 MB) or its extension is in the list
-(default `zip,7z,rar,iso,exe,msi,dmg,mp4,mkv`). When fluxdl accepts it, the browser download is
-cancelled; when fluxdl is not running, the download stays in the browser. Firefox often doesn't
+(default `zip,7z,rar,iso,exe,msi,dmg,mp4,mkv`). fluxdl first checks that the link gives the
+file (not a login page); only when it accepts it is the browser download cancelled. When fluxdl
+is not running, refuses the link or already has it, the download stays in the browser. Firefox often doesn't
 report the size up front, so the extension list is what usually triggers there.
 
 ### Cookies (optional)
@@ -163,12 +187,19 @@ cargo test
 ```
 
 Command-line helpers: `fluxdl --benchmark URL [--connections 1,8,16] [--seconds 10]`,
-`fluxdl --capture DIR` (renders the UI with demo data to PNG files).
+`fluxdl --capture DIR` (renders the UI with demo data to PNG files), `fluxdl URL|magnet|file.torrent`
+(handed to the running fluxdl if there is one).
+
+Releases: `cargo run --example signer -- signer fluxdl.exe VERSION KEY.pk8` writes
+`fluxdl.exe.sig`; publish `fluxdl.exe`, `fluxdl.exe.sha256`, `fluxdl.exe.sig` and
+`THIRD-PARTY.txt` (regenerate it with `python3 -I packaging/third_party.py > THIRD-PARTY.txt`).
 
 Third-party: librqbit (Apache-2.0) for BitTorrent; yt-dlp (Unlicense) and ffmpeg (GPL build)
 are separate programs, downloaded only with your consent and never bundled.
 
-Font: Open Sans (SIL Open Font License, see `assets/fonts`), Latin subset. Background art: generated image, `assets/fond.jpg`.
+Fonts: Open Sans (SIL Open Font License), Latin, Greek and Cyrillic subset; DejaVu Sans
+(Bitstream Vera license) for arrows and symbols; see `assets/fonts`. Notices of the Rust crates
+built into the exe: `THIRD-PARTY.txt`. Background art: generated image, `assets/fond.jpg`.
 
 ## License
 
