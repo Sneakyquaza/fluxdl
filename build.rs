@@ -1,9 +1,44 @@
-//! Windows : identité du programme (VERSIONINFO, nom montré par le Gestionnaire des tâches),
-//! compilée par windres.
+//! Windows : identité du programme (VERSIONINFO, nom montré par le Gestionnaire des tâches) et
+//! icône de l'exe (dessinée par `src/icone.rs`, PNG dans un .ico), compilées par windres.
+
+include!("src/icone.rs");
+
+/// .ico à entrées PNG (Vista et plus) aux tailles usuelles de l'Explorateur.
+fn ecrire_ico(chemin: &std::path::Path) {
+    let tailles = [16u32, 24, 32, 48, 64, 128, 256];
+    let images: Vec<Vec<u8>> = tailles
+        .iter()
+        .map(|&n| {
+            let mut png = Vec::new();
+            let mut enc = png::Encoder::new(&mut png, n, n);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.set_compression(png::Compression::High);
+            let mut w = enc.write_header().expect("en-tête png");
+            w.write_image_data(&icone_rgba(n)).expect("png");
+            w.finish().expect("png");
+            png
+        })
+        .collect();
+    let mut ico = vec![0, 0, 1, 0, tailles.len() as u8, 0];
+    let mut decalage = 6 + 16 * tailles.len() as u32;
+    for (n, img) in tailles.iter().zip(&images) {
+        let c = if *n >= 256 { 0 } else { *n as u8 };
+        ico.extend_from_slice(&[c, c, 0, 0, 1, 0, 32, 0]);
+        ico.extend_from_slice(&(img.len() as u32).to_le_bytes());
+        ico.extend_from_slice(&decalage.to_le_bytes());
+        decalage += img.len() as u32;
+    }
+    for img in &images {
+        ico.extend_from_slice(img);
+    }
+    std::fs::write(chemin, ico).expect("icône .ico");
+}
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=src/icone.rs");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
@@ -13,8 +48,12 @@ fn main() {
     let mut n: Vec<&str> = version.split('.').collect();
     n.resize(4, "0");
     let num = n.join(",");
+    let ico = sortie.join("fluxdl.ico");
+    ecrire_ico(&ico);
+    let ico = ico.display().to_string().replace('\\', "/");
     let texte = format!(
-        "1 VERSIONINFO\nFILEVERSION {num}\nPRODUCTVERSION {num}\nBEGIN\n\
+        "1 ICON \"{ico}\"\n\
+         1 VERSIONINFO\nFILEVERSION {num}\nPRODUCTVERSION {num}\nBEGIN\n\
          BLOCK \"StringFileInfo\"\nBEGIN\nBLOCK \"040904b0\"\nBEGIN\n\
          VALUE \"CompanyName\", \"Sneakyquaza\"\n\
          VALUE \"ProductName\", \"{nom}\"\n\

@@ -31,7 +31,7 @@ cargo test
 Command-line helpers: `fluxdl --benchmark URL [--connections 1,8,16] [--seconds 10]`,
 `fluxdl --capture DIR` (renders the UI with demo data to PNG files).
 
-Fonts: Pixelify Sans and Silkscreen (SIL Open Font License, see `assets/fonts`).
+Font: Inter 4.1 (SIL Open Font License, see `assets/fonts`), Latin subset with tabular digits.
 
 ## License
 

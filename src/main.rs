@@ -3,6 +3,7 @@
 //! commande (`--capture DOSSIER`, `--benchmark URL`).
 
 mod i18n;
+mod icone;
 mod store;
 mod ui;
 
@@ -26,8 +27,13 @@ fn main() -> Result<(), String> {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_NAME)
             .with_app_id(APP_NAME)
-            .with_inner_size([1100.0, 760.0])
-            .with_min_inner_size([760.0, 520.0]),
+            .with_inner_size([1180.0, 760.0])
+            .with_min_inner_size([1100.0, 680.0])
+            .with_icon(egui::IconData {
+                rgba: icone::icone_rgba(128),
+                width: 128,
+                height: 128,
+            }),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
