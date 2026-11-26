@@ -7,7 +7,7 @@ VERSION=$(python3 -I -c 'import json;print(json.load(open("manifest.json"))["ver
 mkdir -p dist
 
 # Fichiers communs aux deux navigateurs
-FILES=(common.js background.js popup.html popup.css popup.js options.html options.css options.js ui.css)
+FILES=(common.js background.js content.js popup.html popup.css popup.js options.html options.css options.js picker.html picker.css picker.js ui.css)
 
 python3 -I - "$VERSION" "${FILES[@]}" <<'PY'
 import sys, zipfile

@@ -27,6 +27,12 @@
     </label>
     <p class="hint" data-i18n="popupAutoCaptureHint"></p>
 
+    <label class="switch spaced">
+      <span data-i18n="optCaptureAll"></span>
+      <input type="checkbox" id="captureAll">
+      <span class="track"></span>
+    </label>
+
     <label class="field">
       <span data-i18n="popupThreshold"></span>
       <input type="number" id="thresholdMB" min="1" max="100000" step="1">
@@ -37,6 +43,15 @@
       <input type="text" id="extensions" spellcheck="false" data-i18n-placeholder="popupExtensionsHint">
     </label>
     <p id="saved" class="msg ok"></p>
+  </div>
+
+  <div class="card">
+    <label class="switch">
+      <span data-i18n="optFloat"></span>
+      <input type="checkbox" id="floatButton">
+      <span class="track"></span>
+    </label>
+    <p class="hint" data-i18n="popupFloatHint"></p>
   </div>
 
   <div class="footer">

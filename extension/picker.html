@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title data-i18n="pickTitle">fluxdl</title>
+  <link rel="stylesheet" href="ui.css">
+  <link rel="stylesheet" href="picker.css">
+</head>
+<body>
+  <main>
+    <div class="header">
+      <img src="icons/icon48.png" alt="">
+      <div>
+        <h1 data-i18n="pickTitle"></h1>
+        <p id="page" class="hint"></p>
+      </div>
+    </div>
+
+    <section class="card">
+      <div class="tools">
+        <input type="text" id="filter" spellcheck="false" data-i18n-placeholder="pickFilter">
+        <label class="check"><input type="checkbox" id="showAll"> <span data-i18n="pickShowAll"></span></label>
+      </div>
+      <div class="tools">
+        <button type="button" id="all" class="secondary" data-i18n="pickSelectAll"></button>
+        <button type="button" id="none" class="secondary" data-i18n="pickSelectNone"></button>
+        <span id="count" class="count"></span>
+      </div>
+      <ul id="list" class="list" aria-labelledby="count"></ul>
+      <p id="empty" class="hint" data-i18n="pickEmpty" hidden></p>
+    </section>
+
+    <div class="footer">
+      <p id="msg" class="msg" role="status"></p>
+      <button type="button" id="send" class="go" data-i18n="pickSend"></button>
+    </div>
+  </main>
+
+  <script src="common.js"></script>
+  <script src="picker.js"></script>
+</body>
+</html>

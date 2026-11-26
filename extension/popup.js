@@ -47,6 +47,12 @@ async function init() {
   $("extensions").value = s.extensions;
 
   $("autoCapture").addEventListener("change", (e) => save({ autoCapture: e.target.checked }));
+  for (const id of ["captureAll", "floatButton"]) {
+    $(id).checked = !!s[id];
+    $(id).addEventListener("change", (e) => save({ [id]: e.target.checked }));
+  }
+  // Le badge « ! » (capture rendue au navigateur) a été vu
+  Promise.resolve(api.action.setBadgeText({ text: "" })).catch(() => {});
   $("thresholdMB").addEventListener("change", (e) => {
     const n = Math.round(Number(e.target.value));
     if (!Number.isFinite(n) || n < 1) {
@@ -57,11 +63,7 @@ async function init() {
     save({ thresholdMB: n });
   });
   $("extensions").addEventListener("change", (e) => {
-    const clean = e.target.value
-      .split(",")
-      .map((x) => x.trim().replace(/^\./, "").toLowerCase())
-      .filter(Boolean)
-      .join(",");
+    const clean = parseList(e.target.value).join(",");
     e.target.value = clean;
     save({ extensions: clean });
   });

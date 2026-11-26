@@ -10,7 +10,19 @@ const DEFAULTS = {
   autoCapture: false,
   thresholdMB: 20,
   extensions: "zip,7z,rar,iso,exe,msi,dmg,mp4,mkv",
+  captureAll: false,
+  floatButton: true,
+  // Listes de sites (un par ligne ou séparés par virgules ; « exemple.com » couvre ses sous-domaines)
+  allowSites: "",
+  denySites: "",
+  cookieSites: "",
 };
+
+// Extensions « probablement un fichier » pour le bouton flottant et la page de liens
+const FILE_EXTS = (
+  "zip,7z,rar,tar,gz,tgz,bz2,xz,zst,iso,img,dmg,exe,msi,msix,appx,apk,deb,rpm,appimage,pkg,bin," +
+  "mp4,mkv,webm,avi,mov,m4v,wmv,flv,mp3,m4a,aac,flac,wav,ogg,opus,pdf,epub,torrent"
+).split(",");
 
 const APP_ORIGIN = "http://127.0.0.1/*";
 const TIMEOUT_MS = 1500;
@@ -79,6 +91,31 @@ function ping(settings) {
 
 function isHttp(url) {
   return /^https?:\/\//i.test(url || "");
+}
+
+// « a, .b ;c\nd » → ["a", "b", "c", "d"] (minuscules, sans point initial)
+function parseList(text) {
+  return String(text || "")
+    .split(/[\s,;]+/)
+    .map((x) => x.trim().replace(/^\./, "").toLowerCase())
+    .filter(Boolean);
+}
+
+function hostOf(url) {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+// Vrai si l'hôte est un des sites de la liste ou un de leurs sous-domaines
+function hostInList(host, listText) {
+  if (!host) return false;
+  return parseList(listText).some((site) => {
+    const s = site.replace(/^\*\./, "").replace(/^https?:\/\//, "").split("/")[0];
+    return s && (host === s || host.endsWith("." + s));
+  });
 }
 
 // Remplit les éléments marqués data-i18n*

@@ -114,6 +114,24 @@ async function init() {
     );
   });
 
+  // Capture, bouton flottant, listes de sites
+  for (const id of ["autoCapture", "captureAll", "floatButton"]) {
+    $(id).checked = !!s[id];
+    $(id).addEventListener("change", async (e) => {
+      await saveSettings({ [id]: e.target.checked });
+      if (id !== "floatButton") showMsg("captureMsg", t("saved"), true);
+    });
+  }
+  for (const id of ["allowSites", "denySites", "cookieSites"]) {
+    $(id).value = parseList(s[id]).join("\n");
+    $(id).addEventListener("change", async (e) => {
+      const clean = parseList(e.target.value).join("\n");
+      e.target.value = clean;
+      await saveSettings({ [id]: clean });
+      showMsg(id === "cookieSites" ? "cookieMsg" : "captureMsg", t("saved"), true);
+    });
+  }
+
   refreshAccess();
 }
 

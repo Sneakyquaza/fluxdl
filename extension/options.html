@@ -42,6 +42,44 @@
     </section>
 
     <section class="card">
+      <h2 data-i18n="optCaptureTitle"></h2>
+      <label class="switch">
+        <span data-i18n="popupAutoCapture"></span>
+        <input type="checkbox" id="autoCapture">
+        <span class="track"></span>
+      </label>
+      <label class="switch spaced">
+        <span data-i18n="optCaptureAll"></span>
+        <input type="checkbox" id="captureAll">
+        <span class="track"></span>
+      </label>
+      <p class="hint" data-i18n="optCaptureAllHint"></p>
+      <label class="field">
+        <span data-i18n="optAllowSites"></span>
+        <textarea id="allowSites" rows="3" spellcheck="false" data-i18n-placeholder="optSitesPlaceholder"></textarea>
+      </label>
+      <p class="hint" data-i18n="optAllowSitesHint"></p>
+      <label class="field">
+        <span data-i18n="optDenySites"></span>
+        <textarea id="denySites" rows="3" spellcheck="false" data-i18n-placeholder="optSitesPlaceholder"></textarea>
+      </label>
+      <p class="hint" data-i18n="optDenySitesHint"></p>
+      <p id="captureMsg" class="msg"></p>
+    </section>
+
+    <section class="card">
+      <h2 data-i18n="optFloatTitle"></h2>
+      <label class="switch">
+        <span data-i18n="optFloat"></span>
+        <input type="checkbox" id="floatButton">
+        <span class="track"></span>
+      </label>
+      <p class="hint" data-i18n="optFloatHint"></p>
+      <p class="hint" data-i18n="optFloatJsHint"></p>
+      <p class="hint" data-i18n="optPickerHint"></p>
+    </section>
+
+    <section class="card">
       <h2 data-i18n="optCookiesTitle"></h2>
       <label class="switch">
         <span data-i18n="optCookies"></span>
@@ -49,6 +87,11 @@
         <span class="track"></span>
       </label>
       <p class="hint" data-i18n="optCookiesHint"></p>
+      <label class="field">
+        <span data-i18n="optCookieSites"></span>
+        <textarea id="cookieSites" rows="3" spellcheck="false" data-i18n-placeholder="optSitesPlaceholder"></textarea>
+      </label>
+      <p class="hint" data-i18n="optCookieSitesHint"></p>
       <p id="cookieMsg" class="msg"></p>
     </section>
   </main>

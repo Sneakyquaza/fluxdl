@@ -44,6 +44,12 @@ A free, open-source multi-connection download manager (Windows + Linux, single e
   files (asked on the first torrent, toggle in Settings, current user only).
 - **Browser extension** (below).
 
+### Extension features (0.2.1)
+- Auto-capture: clicking a site's download button hands the real file (final URL after redirects) to fluxdl; the browser download is cancelled only once fluxdl confirms. If fluxdl isn't running, the browser keeps the download and shows a badge.
+- Floating "⬇ fluxdl" button when hovering file links and videos (toggle in the popup).
+- Right-click: "Download with fluxdl" on links, videos and audio; "Download all links on this page…" opens a picker.
+- Options: capture everything, always/never-capture site lists, per-site cookie sending (off by default).
+
 ## Browser extension
 
 fluxdl ships a Manifest V3 extension for Chrome, Edge and Firefox (`extension/`). It adds a
@@ -57,17 +63,17 @@ and from other host names are refused, and requests are rate limited.
 Build the packages (optional, needs only `bash` and `python3`):
 
     ./extension/package.sh
-    # -> extension/dist/fluxdl-chrome-0.2.0.zip
-    # -> extension/dist/fluxdl-firefox-0.2.0.zip
+    # -> extension/dist/fluxdl-chrome-0.2.1.zip
+    # -> extension/dist/fluxdl-firefox-0.2.1.zip
 
 ### Install on Chrome / Edge
 1. Open `chrome://extensions` (or `edge://extensions`).
 2. Enable **Developer mode**.
 3. Click **Load unpacked** and select the `extension/` folder (or the folder where you unzipped
-   `fluxdl-chrome-0.2.0.zip`).
+   `fluxdl-chrome-0.2.1.zip`).
 
 ### Install on Firefox
-1. Unzip `fluxdl-firefox-0.2.0.zip` into a folder.
+1. Unzip `fluxdl-firefox-0.2.1.zip` into a folder.
 2. Open `about:debugging` → **This Firefox** → **Load Temporary Add-on…** and pick the
    `manifest.json` from that folder.
 3. Open the extension options and click **Grant access to the app** (Firefox treats access to
