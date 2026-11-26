@@ -28,6 +28,14 @@ const SAVE_EVERY: Duration = Duration::from_millis(500);
 /// Pause ou annulation : attente maximale des connexions avant de rendre la main ; une connexion
 /// bloquée (serveur muet) finit seule ensuite, sans plus rien écrire.
 const STOP_GRACE: Duration = Duration::from_millis(300);
+/// Lecture réseau sans rien recevoir : au-delà, la connexion réessaie. Court aussi pour qu'une
+/// connexion détachée après une pause ne garde pas longtemps son socket et le `.part` ouverts.
+const LECTURE_MAX: Duration = Duration::from_secs(10);
+/// Échecs au total pour une connexion, progrès compris : une boucle de réponses courtes (serveur
+/// qui coupe toujours) finit par s'arrêter.
+const MAX_ECHECS: u32 = 200;
+/// Redirections suivies au plus (à la main : le cookie ne suit que sur le même hôte).
+const MAX_REDIRECTIONS: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -67,6 +75,8 @@ pub struct Probe {
     pub last_modified: Option<String>,
     pub file_name: String,
     pub content_type: Option<String>,
+    /// URL finale après redirections (les connexions y vont directement).
+    pub url: String,
 }
 
 /// Morceau `[start, end)` dont `[start, pos)` est écrit sur le disque.
@@ -116,6 +126,8 @@ pub struct Live {
     /// Le fichier distant a changé depuis la dernière fois : repris de zéro.
     pub restarted: bool,
     pub verifying: bool,
+    /// Taille fixée par la fin du flux (pas de longueur annoncée) : une coupure ne se voit pas.
+    pub size_unverified: bool,
     /// Torrents : pairs connectés, octets envoyés, partage en cours après la fin.
     pub peers: u32,
     pub uploaded: u64,
@@ -178,9 +190,9 @@ struct Saved {
 
 pub fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(15))
-        .timeout_read(Duration::from_secs(30))
-        .redirects(8)
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(LECTURE_MAX)
+        .redirects(0)
         .user_agent(&format!(
             "{}/{}",
             crate::APP_NAME,
@@ -207,6 +219,119 @@ fn with_suffix(p: &Path, s: &str) -> PathBuf {
 pub const ERR_PAGE: &str = "This link is a web page, not a file.";
 /// Erreur de `run` : pas assez de place sur le disque pour ce qui reste à télécharger.
 pub const ERR_ESPACE: &str = "Not enough free disk space for this file.";
+/// Erreur de `run` : le lien a marché puis l'hôte refuse tout (lien signé expiré, session finie).
+pub const ERR_EXPIRE: &str = "The link has expired or is no longer allowed.";
+/// Erreur de `run` : le serveur envoie le fichier compressé (Content-Encoding) malgré la demande.
+pub const ERR_ENCODAGE: &str = "The server sends the file compressed; it cannot be saved as is.";
+/// Erreur de `run` (Windows) : FAT32 ne garde pas de fichier de 4 Gio ou plus.
+pub const ERR_FAT32: &str = "This drive (FAT32) cannot hold files of 4 GB or more.";
+
+/// Requête GET avec redirections suivies à la main : le cookie (venu de l'extension) n'est
+/// renvoyé qu'au même hôte que `origine`, le Referer réduit à son origine vers un autre hôte.
+/// Renvoie la réponse et l'URL finale ; une réponse 3xx = trop de redirections.
+// Même type d'erreur que `ureq::Request::call`, gardé tel quel pour `classify`.
+#[allow(clippy::result_large_err)]
+fn requete(
+    agent: &ureq::Agent,
+    origine: &str,
+    url: &str,
+    headers: &[(String, String)],
+    range: Option<&str>,
+) -> Result<(ureq::Response, String), ureq::Error> {
+    let mut url = url.to_string();
+    let mut sauts = 0;
+    loop {
+        let mut req = agent.get(&url).set("Accept-Encoding", "identity");
+        for (k, v) in entetes_pour(headers, origine, &url) {
+            req = req.set(k, &v);
+        }
+        if let Some(r) = range {
+            req = req.set("Range", r);
+        }
+        let resp = req.call()?;
+        let suite = resp
+            .header("Location")
+            .filter(|_| matches!(resp.status(), 301 | 302 | 303 | 307 | 308));
+        match suite {
+            Some(l) if sauts < MAX_REDIRECTIONS => {
+                url = joindre(&url, l.trim());
+                sauts += 1;
+            }
+            // Trop de redirections : le 3xx est rendu tel quel.
+            _ => return Ok((resp, url)),
+        }
+    }
+}
+
+/// En-têtes à envoyer à `url` : Cookie seulement au même hôte que `origine`, Referer réduit à
+/// son origine (`https://hôte/`) si `url` est sur un autre hôte que lui.
+fn entetes_pour<'a>(
+    headers: &'a [(String, String)],
+    origine: &str,
+    url: &str,
+) -> Vec<(&'a str, String)> {
+    let h = hote(url);
+    headers
+        .iter()
+        .filter_map(|(k, v)| {
+            if k.eq_ignore_ascii_case("cookie") {
+                (h == hote(origine)).then(|| (k.as_str(), v.clone()))
+            } else if k.eq_ignore_ascii_case("referer") && hote(v) != h {
+                let schema = v.split_once("://").map_or("https", |(s, _)| s);
+                Some((k.as_str(), format!("{schema}://{}/", hote(v))))
+            } else {
+                Some((k.as_str(), v.clone()))
+            }
+        })
+        .collect()
+}
+
+/// Hôte (et port) d'une URL, en minuscules, sans identifiants.
+fn hote(url: &str) -> String {
+    let r = url.split_once("://").map_or(url, |(_, r)| r);
+    let a = r.split(['/', '?', '#']).next().unwrap_or("");
+    a.rsplit('@').next().unwrap_or(a).to_ascii_lowercase()
+}
+
+/// `Location` relatif à `base` → URL absolue.
+fn joindre(base: &str, loc: &str) -> String {
+    if loc.contains("://") {
+        return loc.to_string();
+    }
+    let (schema, reste) = base.split_once("://").unwrap_or(("http", base));
+    if let Some(l) = loc.strip_prefix("//") {
+        return format!("{schema}://{l}");
+    }
+    let fin_hote = reste.find(['/', '?', '#']).unwrap_or(reste.len());
+    let racine = format!("{schema}://{}", &reste[..fin_hote]);
+    if loc.starts_with('/') {
+        return format!("{racine}{loc}");
+    }
+    let chemin = reste[fin_hote..].split(['?', '#']).next().unwrap_or("");
+    let dossier = chemin.rsplit_once('/').map_or("", |(d, _)| d);
+    format!("{racine}{dossier}/{loc}")
+}
+
+/// Réponse compressée (Content-Encoding autre que `identity`) : ses octets ne sont pas le fichier.
+fn encode(r: &ureq::Response) -> bool {
+    r.header("Content-Encoding")
+        .is_some_and(|e| !e.trim().is_empty() && !e.trim().eq_ignore_ascii_case("identity"))
+}
+
+/// Raison courte d'une erreur ureq, sans l'URL (jeton d'un lien signé).
+fn raison(e: &ureq::Error) -> String {
+    match e {
+        ureq::Error::Status(c, _) => format!("HTTP {c}"),
+        ureq::Error::Transport(t) if t.to_string().contains("timed out") => "timeout".into(),
+        ureq::Error::Transport(t) => t.kind().to_string(),
+    }
+}
+
+/// ETag égaux, faibles (`W/`) ou non.
+fn etag_eq(a: &str, b: &str) -> bool {
+    let f = |s: &str| s.trim().trim_start_matches("W/").to_string();
+    f(a) == f(b)
+}
 
 /// Télécharge `url` dans `dir`. `name` : nom déjà choisi (reprise) ; sinon celui du serveur,
 /// rendu unique (« nom (1).ext »). Bloquant : à lancer dans un fil.
@@ -218,7 +343,25 @@ pub fn run(
     ctl: &Arc<Control>,
 ) -> Result<Outcome, String> {
     let agent = agent();
-    let p = probe(&agent, url, &opts.headers)?;
+    // Sonde dans un fil détaché : une pause ou une annulation pendant la connexion (serveur muet)
+    // rend la main tout de suite ; le fil finit seul à son délai.
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let (agent, url, headers) = (agent.clone(), url.to_string(), opts.headers.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(probe(&agent, &url, &headers));
+        });
+    }
+    let p = loop {
+        if ctl.stop.load(Ordering::Relaxed) {
+            return Ok(Outcome::Stopped);
+        }
+        match rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(r) => break r?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => return Err("probe: failed".into()),
+        }
+    };
     if est_page(&p, url) {
         return Err(ERR_PAGE.into());
     }
@@ -267,6 +410,8 @@ enum Step {
 /// ne retient pas la pause).
 struct Shared {
     agent: ureq::Agent,
+    /// URL donnée (portée du cookie) et URL finale après redirections (celle qu'on demande).
+    origine: String,
     url: String,
     file: File,
     probe: Probe,
@@ -316,11 +461,20 @@ fn attempt(
     if ranged {
         if let Some(s) = load(&side) {
             let len = fs::metadata(&part).map(|m| m.len()).ok();
+            // ETag faible (`W/`) ou non : même fichier.
+            let meme = match (&s.etag, &p.etag) {
+                (Some(a), Some(b)) => etag_eq(a, b),
+                (a, b) => a == b,
+            };
             if s.size == p.size
-                && s.etag == p.etag
+                && meme
                 && s.last_modified == p.last_modified
-                && len == p.size
-                && p.size.is_some_and(|t| coherents(&s.segments, t))
+                && p.size.is_some_and(|t| {
+                    // Écriture dans l'ordre (sans préallocation) : le .part peut être plus court,
+                    // tant que tout ce qui est écrit y est.
+                    len.is_some_and(|l| l == t || (l < t && s.segments.iter().all(|g| g.pos <= l)))
+                        && coherents(&s.segments, t)
+                })
             {
                 segments = Some(s.segments);
             } else {
@@ -346,14 +500,22 @@ fn attempt(
             return Err(ERR_ESPACE.into());
         }
     }
+    // Volume sans fichiers creux (exFAT, FAT32) : un gros fichier s'écrit dans l'ordre, sur une
+    // connexion et sans préallocation, sinon chaque écriture loin dans le fichier remplit de
+    // zéros tout ce qui la précède.
+    // raccourci : une seule connexion sur ces volumes ; écrire en avançant avec vol borné si demandé.
+    let sequentiel = match p.size {
+        Some(t) => !selon_fs(nom_fs(&file).as_deref(), t)? && t > SEQUENTIEL_DES,
+        None => false,
+    };
     // Creux avant `set_len` : la taille finale n'occupe pas le disque, rien n'est rempli de zéros.
     rendre_creux(&file);
-    if segments.is_none() {
+    if segments.is_none() && !sequentiel {
         if let Some(n) = p.size {
             file.set_len(n).map_err(|e| format!("preallocate: {e}"))?;
         }
     }
-    let n = if ranged {
+    let n = if ranged && !sequentiel {
         opts.connections.clamp(1, MAX_CONNECTIONS)
     } else {
         1
@@ -375,10 +537,12 @@ fn attempt(
         l.received = 0;
         l.restarted |= restarted;
         l.verifying = false;
+        l.size_unverified = false;
     }
     let sh = Arc::new(Shared {
         agent: agent.clone(),
-        url: url.to_string(),
+        origine: url.to_string(),
+        url: if p.url.is_empty() { url } else { &p.url }.to_string(),
         file,
         probe: p.clone(),
         opts: opts.clone(),
@@ -450,9 +614,12 @@ fn attempt(
             return Err(format!("sha256 mismatch: got {h}"));
         }
     }
-    fs::rename(&part, target).map_err(|e| format!("rename: {e}"))?;
+    let fini = renommer_libre(&part, target)?;
     let _ = fs::remove_file(&side);
-    Ok(Step::Done(Outcome::Done(target.to_path_buf())))
+    if fini != target {
+        ctl.lock().file_name = fini.file_name().map(|n| n.to_string_lossy().into_owned());
+    }
+    Ok(Step::Done(Outcome::Done(fini)))
 }
 
 /// Découpage initial en `n` morceaux d'au moins `min_chunk` (sauf fichier plus petit).
@@ -528,6 +695,7 @@ const LIMIT_DROP: u32 = 2;
 /// Vrai si la connexion s'est retirée elle-même (déjà décomptée de `actifs`).
 fn worker(sh: &Shared, w: usize) -> bool {
     let mut echecs = 0u32;
+    let mut total = 0u32;
     let mut limites = 0u32;
     let mut courant = None;
     while !sh.halted() {
@@ -581,18 +749,27 @@ fn worker(sh: &Shared, w: usize) -> bool {
                 sh.abort.store(true, Ordering::Relaxed);
             }
             Err(FetchErr::Fatal(e)) => {
+                if e == ERR_EXPIRE {
+                    // Tout l'hôte refuse : les connexions retirées avant n'étaient pas « en trop ».
+                    sh.ctl
+                        .lock()
+                        .workers
+                        .iter_mut()
+                        .for_each(|w| w.dropped = false);
+                }
                 sh.set_error(e);
                 sh.abort.store(true, Ordering::Relaxed);
             }
             Err(FetchErr::Retry(e)) | Err(FetchErr::Limit(e, _)) => {
                 let progres = sh.ctl.lock().segments[i].pos > avant;
                 echecs = if progres { 1 } else { echecs + 1 };
+                total += 1;
                 {
                     let mut l = sh.ctl.lock();
                     l.workers[w].retries += 1;
                     l.workers[w].error = Some(e.clone());
                 }
-                if echecs > sh.opts.max_retries {
+                if echecs > sh.opts.max_retries || total > MAX_ECHECS {
                     // Rendre le morceau : une autre connexion pourra le prendre.
                     let mut l = sh.ctl.lock();
                     l.segments[i].worker = None;
@@ -624,19 +801,18 @@ fn classify(e: ureq::Error) -> FetchErr {
                     } else if est_html(r.header("Content-Type")) {
                         FetchErr::Fatal(ERR_PAGE.into())
                     } else {
-                        FetchErr::Fatal(m.clone())
+                        // La sonde avait réussi : lien signé expiré ou accès retiré.
+                        FetchErr::Fatal(ERR_EXPIRE.into())
                     };
                     FetchErr::Limit(m, Box::new(seul))
                 }
+                410 => FetchErr::Fatal(ERR_EXPIRE.into()),
                 408 | 500.. => FetchErr::Retry(m),
                 _ => FetchErr::Fatal(m),
             }
         }
         // Pas le message complet : il contient l'URL (jeton d'un lien signé).
-        ureq::Error::Transport(t) if t.to_string().contains("timed out") => {
-            FetchErr::Retry("timeout".into())
-        }
-        ureq::Error::Transport(t) => FetchErr::Retry(t.kind().to_string()),
+        t => FetchErr::Retry(raison(&t)),
     }
 }
 
@@ -674,14 +850,27 @@ fn fetch(sh: &Shared, w: usize, i: usize) -> Result<(), FetchErr> {
     if end != u64::MAX && pos >= end {
         return Ok(());
     }
-    let mut req = sh.agent.get(&sh.url);
-    for (k, v) in &sh.opts.headers {
-        req = req.set(k, v);
+    let plage = sh.ranged.then(|| format!("bytes={pos}-{}", end - 1));
+    let (resp, _) = requete(
+        &sh.agent,
+        &sh.origine,
+        &sh.url,
+        &sh.opts.headers,
+        plage.as_deref(),
+    )
+    .map_err(classify)?;
+    if (300..400).contains(&resp.status()) {
+        return Err(FetchErr::Fatal("too many redirects".into()));
     }
-    if sh.ranged {
-        req = req.set("Range", &format!("bytes={pos}-{}", end - 1));
+    // Octets compressés : jamais écrits comme fichier. Une plage compressée = pas de plages
+    // (repli sur une connexion), une réponse entière compressée = erreur claire.
+    if encode(&resp) {
+        return Err(if sh.ranged {
+            FetchErr::Limit("Content-Encoding".into(), Box::new(FetchErr::Fallback))
+        } else {
+            FetchErr::Fatal(ERR_ENCODAGE.into())
+        });
     }
-    let resp = req.call().map_err(classify)?;
     // Une page web à la place du fichier (session expirée, anti-robot…) : ne rien écrire.
     if est_html(resp.header("Content-Type")) && !est_html(sh.probe.content_type.as_deref()) {
         return Err(FetchErr::Limit(
@@ -714,9 +903,14 @@ fn fetch(sh: &Shared, w: usize, i: usize) -> Result<(), FetchErr> {
         }
         limite = b + 1;
     }
-    if let (Some(a), Some(b)) = (&sh.probe.etag, resp.header("ETag")) {
-        if a != b {
-            return Err(change());
+    // Une réponse entière est cohérente d'elle-même ; entre plages, un autre ETag (CDN à
+    // plusieurs nœuds) avec la même date et le même total (vérifié plus haut) est le même fichier.
+    if let (true, Some(a), Some(b)) = (sh.ranged, &sh.probe.etag, resp.header("ETag")) {
+        let meme_date = sh.probe.last_modified.is_some()
+            && sh.probe.last_modified.as_deref() == resp.header("Last-Modified");
+        if !etag_eq(a, b) && !meme_date {
+            // Rien ne prouve que c'est le même fichier : tout reprendre sur une connexion.
+            return Err(FetchErr::Fallback);
         }
     }
     let mut r = resp.into_reader();
@@ -741,6 +935,7 @@ fn fetch(sh: &Shared, w: usize, i: usize) -> Result<(), FetchErr> {
                 let mut l = sh.ctl.lock();
                 l.segments[i].end = pos;
                 l.size = Some(pos);
+                l.size_unverified = true;
                 return Ok(());
             }
             return Err(FetchErr::Retry("connection closed early".into()));
@@ -836,6 +1031,116 @@ fn rendre_creux(f: &File) {
     }
 }
 
+/// Au-delà, un fichier sur un volume sans fichiers creux s'écrit dans l'ordre.
+const SEQUENTIEL_DES: u64 = 64 << 20;
+
+/// Le volume (nom du système de fichiers) garde-t-il un fichier creux de `taille` octets ?
+/// Inconnu = oui (Linux, échec de la requête) ; FAT32 refuse 4 Gio et plus.
+fn selon_fs(fs: Option<&str>, taille: u64) -> Result<bool, String> {
+    let Some(fs) = fs.map(str::to_ascii_uppercase) else {
+        return Ok(true);
+    };
+    if fs == "FAT32" && taille >= 1 << 32 {
+        return Err(ERR_FAT32.into());
+    }
+    Ok(matches!(fs.as_str(), "NTFS" | "REFS"))
+}
+
+/// Windows : nom du système de fichiers du volume du fichier (« NTFS », « exFAT »…).
+#[cfg(windows)]
+fn nom_fs(f: &File) -> Option<String> {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetVolumeInformationByHandleW(
+            h: *mut std::ffi::c_void,
+            nom: *mut u16,
+            nom_len: u32,
+            serie: *mut u32,
+            composant: *mut u32,
+            drapeaux: *mut u32,
+            fs: *mut u16,
+            fs_len: u32,
+        ) -> i32;
+    }
+    let mut fs = [0u16; 64];
+    // SAFETY : poignée valide pendant l'appel, tampon de 64 caractères, sorties facultatives nulles.
+    let ok = unsafe {
+        GetVolumeInformationByHandleW(
+            f.as_raw_handle().cast(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            fs.as_mut_ptr(),
+            fs.len() as u32,
+        )
+    };
+    let n = fs.iter().position(|&c| c == 0).unwrap_or(fs.len());
+    (ok != 0).then(|| String::from_utf16_lossy(&fs[..n]))
+}
+
+/// Linux : fichiers creux partout où on écrit (ext4, btrfs, xfs, tmpfs…).
+#[cfg(not(windows))]
+fn nom_fs(_: &File) -> Option<String> {
+    None
+}
+
+/// Renomme le `.part` en `cible` sans jamais remplacer un fichier apparu entre-temps ; sinon
+/// « nom (1).ext »… Renvoie le chemin final.
+fn renommer_libre(part: &Path, cible: &Path) -> Result<PathBuf, String> {
+    let dir = cible.parent().unwrap_or(Path::new("."));
+    let nom = cible
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut c = cible.to_path_buf();
+    loop {
+        match renommer_sans_remplacer(part, &c) {
+            Ok(()) => return Ok(c),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                c = dir.join(unique_name(dir, &nom));
+            }
+            Err(e) => return Err(format!("rename: {e}")),
+        }
+    }
+}
+
+/// Windows : `MoveFileExW` sans `MOVEFILE_REPLACE_EXISTING` (`fs::rename` remplace).
+#[cfg(windows)]
+fn renommer_sans_remplacer(de: &Path, vers: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(de: *const u16, vers: *const u16, drapeaux: u32) -> i32;
+    }
+    let w = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain([0]).collect() };
+    let (a, b) = (w(de), w(vers));
+    // SAFETY : chaînes terminées par 0 ; 0 = pas de remplacement, même volume.
+    if unsafe { MoveFileExW(a.as_ptr(), b.as_ptr(), 0) } != 0 {
+        return Ok(());
+    }
+    let e = io::Error::last_os_error();
+    // ERROR_FILE_EXISTS (80) / ERROR_ALREADY_EXISTS (183)
+    Err(match e.raw_os_error() {
+        Some(80 | 183) => io::ErrorKind::AlreadyExists.into(),
+        _ => e,
+    })
+}
+
+/// Unix : lien dur (échoue si la cible existe) puis suppression du `.part` ; système de fichiers
+/// sans liens durs → contrôle puis `rename` (petite fenêtre de course, acceptée).
+#[cfg(not(windows))]
+fn renommer_sans_remplacer(de: &Path, vers: &Path) -> io::Result<()> {
+    match fs::hard_link(de, vers) {
+        Ok(()) => fs::remove_file(de),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
+        Err(_) if vers.exists() => Err(io::ErrorKind::AlreadyExists.into()),
+        Err(_) => fs::rename(de, vers),
+    }
+}
+
 /// Linux : `set_len` donne déjà un fichier creux.
 #[cfg(not(windows))]
 fn rendre_creux(_: &File) {}
@@ -907,7 +1212,7 @@ fn save(sh: &Shared, side: &Path) {
         return;
     }
     let s = Saved {
-        url: sh.url.clone(),
+        url: sh.origine.clone(),
         size: sh.probe.size,
         etag: sh.probe.etag.clone(),
         last_modified: sh.probe.last_modified.clone(),
@@ -1052,6 +1357,38 @@ mod tests {
         assert!(est_html(Some(" Text/HTML; charset=UTF-8")));
         assert!(!est_html(Some("application/octet-stream")));
         assert!(!est_html(None));
+    }
+
+    #[test]
+    fn volumes_sans_creux() {
+        // Audit M12 : exFAT/FAT32 → écriture dans l'ordre ; FAT32 refuse 4 Gio et plus.
+        assert_eq!(selon_fs(None, 1 << 40), Ok(true));
+        assert_eq!(selon_fs(Some("NTFS"), 1 << 40), Ok(true));
+        assert_eq!(selon_fs(Some("ReFS"), 1 << 40), Ok(true));
+        assert_eq!(selon_fs(Some("exFAT"), 1 << 40), Ok(false));
+        assert_eq!(selon_fs(Some("FAT32"), (1 << 32) - 1), Ok(false));
+        assert_eq!(selon_fs(Some("FAT32"), 1 << 32), Err(ERR_FAT32.into()));
+    }
+
+    #[test]
+    fn redirections_et_entetes() {
+        assert_eq!(joindre("https://a.b/x/y?q", "/z"), "https://a.b/z");
+        assert_eq!(joindre("https://a.b/x/y?q", "z.bin"), "https://a.b/x/z.bin");
+        assert_eq!(joindre("https://a.b/x", "//c.d/e"), "https://c.d/e");
+        assert_eq!(joindre("https://a.b/x", "http://c.d/e"), "http://c.d/e");
+        assert_eq!(hote("https://u:p@A.b:8080/x?y"), "a.b:8080");
+        let h = vec![
+            ("Cookie".to_string(), "s=1".to_string()),
+            ("Referer".to_string(), "https://a.b/page?t=1".to_string()),
+        ];
+        let meme = entetes_pour(&h, "https://a.b/f", "https://a.b/g");
+        assert_eq!(meme.len(), 2);
+        assert_eq!(meme[1].1, "https://a.b/page?t=1");
+        let autre = entetes_pour(&h, "https://a.b/f", "https://cdn.c/g");
+        assert_eq!(autre, vec![("Referer", "https://a.b/".to_string())]);
+        assert!(etag_eq("W/\"x\"", "\"x\""));
+        // Audit L22 : une connexion détachée ne garde pas son socket plus de 10 s.
+        assert!(LECTURE_MAX <= Duration::from_secs(10));
     }
 
     #[test]

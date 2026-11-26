@@ -39,6 +39,22 @@ struct Cfg {
     actives: AtomicU32,
     /// Après la sonde : en-têtes envoyés, puis plus rien (serveur muet).
     stall: bool,
+    /// La sonde elle-même ne reçoit rien (serveur muet dès la connexion).
+    stall_probe: bool,
+    /// `Content-Encoding: gzip` sur toutes les réponses, ou seulement sur les 206.
+    gzip: bool,
+    gzip_206: bool,
+    /// À partir de cette requête (0 = jamais) : 403 en texte (lien signé expiré).
+    expire_after: u32,
+    /// ETag faible `W/` après la sonde ; ETag différent à chaque requête (CDN).
+    etag_weak: bool,
+    etag_varie: bool,
+    /// Pas de Last-Modified.
+    no_lm: bool,
+    /// En-têtes reçus, une ligne « chemin | en-tête » chacun.
+    vus: Mutex<Vec<String>>,
+    /// Base d'un autre serveur (redirection vers un autre hôte).
+    ailleurs: Mutex<String>,
 }
 
 fn virtuel_octet(p: u64) -> u8 {
@@ -80,6 +96,7 @@ fn handle(c: &Cfg, mut s: TcpStream) -> std::io::Result<()> {
         if h.is_empty() {
             break;
         }
+        c.vus.lock().unwrap().push(format!("{chemin} | {h}"));
         if let Some((k, v)) = h.split_once(':') {
             if k.eq_ignore_ascii_case("range") {
                 range = v.trim().strip_prefix("bytes=").map(str::to_string);
@@ -91,6 +108,17 @@ fn handle(c: &Cfg, mut s: TcpStream) -> std::io::Result<()> {
             b"HTTP/1.1 302 Found\r\nLocation: /file.bin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         );
     }
+    if chemin == "/redirect_ext" {
+        let l = format!("{}/file.bin", c.ailleurs.lock().unwrap());
+        return s.write_all(
+            format!("HTTP/1.1 302 Found\r\nLocation: {l}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes(),
+        );
+    }
+    if chemin.starts_with("/absent") {
+        return s.write_all(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+    }
     let n_req = c.requests.fetch_add(1, Ordering::SeqCst);
     let ouvertes = c.actives.fetch_add(1, Ordering::SeqCst) + 1;
     let _o = Ouverte(&c.actives);
@@ -99,13 +127,33 @@ fn handle(c: &Cfg, mut s: TcpStream) -> std::io::Result<()> {
             b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\nContent-Length: 5\r\nConnection: close\r\n\r\nnope!",
         );
     }
+    if c.stall_probe && n_req == 0 {
+        std::thread::sleep(Duration::from_secs(20));
+        return Ok(());
+    }
+    if c.expire_after > 0 && n_req >= c.expire_after {
+        return s.write_all(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 6\r\nConnection: close\r\n\r\nexpire",
+        );
+    }
     let data = c.data.lock().unwrap().clone();
-    let etag = c.etag.lock().unwrap().clone();
+    let mut etag = format!("\"{}\"", c.etag.lock().unwrap());
+    if c.etag_weak && n_req > 0 {
+        etag = format!("W/{etag}");
+    }
+    if c.etag_varie {
+        etag = format!("\"n{n_req}\"");
+    }
     let total = if c.virtuel > 0 {
         c.virtuel
     } else {
         data.len() as u64
     };
+    if total == 0 && c.ranges && range.is_some() {
+        return s.write_all(
+            b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+    }
     let plage = range.as_deref().filter(|_| c.ranges).and_then(|r| {
         let (a, b) = r.split_once('-')?;
         let a: u64 = a.parse().ok()?;
@@ -141,7 +189,13 @@ fn handle(c: &Cfg, mut s: TcpStream) -> std::io::Result<()> {
     if c.ranges {
         tete += "Accept-Ranges: bytes\r\n";
     }
-    tete += &format!("ETag: \"{etag}\"\r\nLast-Modified: Wed, 25 Nov 2026 10:00:00 GMT\r\nConnection: close\r\n\r\n");
+    if c.gzip || (c.gzip_206 && plage.is_some()) {
+        tete += "Content-Encoding: gzip\r\n";
+    }
+    if !c.no_lm {
+        tete += "Last-Modified: Wed, 25 Nov 2026 10:00:00 GMT\r\n";
+    }
+    tete += &format!("ETag: {etag}\r\nConnection: close\r\n\r\n");
     s.write_all(tete.as_bytes())?;
     if c.stall && n_req > 0 {
         std::thread::sleep(Duration::from_secs(20));
@@ -279,6 +333,8 @@ fn serveur_sans_plages() {
     let (p, ctl) = telecharge(&url, &d, &opts(8));
     verifie(&p, &data);
     assert_eq!(ctl.snapshot().size, Some(700_000));
+    // Fin du flux = taille : rien ne prouve qu'il n'a pas été coupé.
+    assert!(ctl.snapshot().size_unverified);
 }
 
 #[test]
@@ -575,4 +631,179 @@ fn place_insuffisante() {
     assert_eq!(e, engine::ERR_ESPACE);
     let part = engine::part_path(&d.join("file.bin"));
     assert_eq!(std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0), 0);
+}
+
+/// Arrêt demandé pendant que `run` tourne ; renvoie le résultat et le délai de retour.
+fn arret_pendant(url: &str, d: &Path, apres: Duration) -> (Result<Outcome, String>, Duration) {
+    let ctl = Arc::new(Control::default());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (u, dd, cc) = (url.to_string(), d.to_path_buf(), ctl.clone());
+    std::thread::spawn(move || {
+        let _ = tx.send(engine::run(&u, &dd, None, &opts(4), &cc));
+    });
+    std::thread::sleep(apres);
+    let t = Instant::now();
+    ctl.request_stop();
+    let r = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("arrêt en < 2 s");
+    (r, t.elapsed())
+}
+
+#[test]
+fn pause_pendant_la_sonde() {
+    // Audit H5 : la sonde attendait 30 s un serveur muet, la pause finissait en « Échec ».
+    let (_c, url, _) = serveur(1 << 20, |c| c.stall_probe = true);
+    let d = dossier("sonde_muette");
+    let (r, t) = arret_pendant(&url, &d, Duration::from_millis(300));
+    assert_eq!(r, Ok(Outcome::Stopped));
+    assert!(t < Duration::from_secs(1), "{t:?}");
+}
+
+#[test]
+fn erreurs_sans_url() {
+    // Audit L2 : le jeton d'un lien signé n'apparaît jamais dans le message.
+    let (_c, url, _) = serveur(1000, |_| {});
+    let url = url.replace("/file.bin", "/absent.bin?token=SECRET123");
+    let d = dossier("sans_url");
+    let e = engine::run(&url, &d, None, &opts(2), &Arc::new(Control::default())).unwrap_err();
+    assert!(!e.contains("SECRET") && !e.contains("127.0.0.1"), "{e}");
+    assert!(e.contains("404"), "{e}");
+}
+
+#[test]
+fn reponses_compressees() {
+    // Audit M3 : jamais d'octets gzip enregistrés comme fichier.
+    let (c, url, _) = serveur(1 << 20, |c| c.gzip = true);
+    let d = dossier("gzip");
+    let e = engine::run(&url, &d, None, &opts(4), &Arc::new(Control::default())).unwrap_err();
+    assert_eq!(e, engine::ERR_ENCODAGE);
+    assert!(!d.join("file.bin").exists());
+    assert!(c
+        .vus
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|l| !l.to_ascii_lowercase().contains("accept-encoding")
+            || l.ends_with("Accept-Encoding: identity")));
+    // Plages compressées seulement : une connexion, fichier exact.
+    let (_c, url, data) = serveur(1 << 20, |c| c.gzip_206 = true);
+    let (p, ctl) = telecharge(&url, &d, &opts(4));
+    verifie(&p, &data);
+    assert!(!ctl.snapshot().ranges);
+}
+
+#[test]
+fn cookie_et_referer_apres_redirection() {
+    // Audit M4 : cookie gardé sur le même hôte, jamais envoyé à un autre ; Referer réduit.
+    let (c, url, data) = serveur(1 << 20, |_| {});
+    let d = dossier("cookies");
+    let mut o = opts(4);
+    o.headers = vec![
+        ("Cookie".into(), "session=S1".into()),
+        ("Referer".into(), "http://page.example/a/b?q=1".into()),
+    ];
+    let (p, _) = telecharge(&url.replace("/file.bin", "/redirect"), &d, &o);
+    verifie(&p, &data);
+    let vus = c.vus.lock().unwrap().clone();
+    let vers_fichier = |h: &str| {
+        vus.iter()
+            .filter(|l| l.starts_with("/file.bin | ") && l.ends_with(h))
+            .count()
+    };
+    let requetes = vus
+        .iter()
+        .filter(|l| l.starts_with("/file.bin | Host"))
+        .count();
+    assert!(requetes >= 4, "{requetes}");
+    assert_eq!(vers_fichier("Cookie: session=S1"), requetes);
+    assert_eq!(vers_fichier("Referer: http://page.example/"), requetes);
+    // URL finale mémorisée : une seule redirection (la sonde).
+    assert_eq!(
+        vus.iter()
+            .filter(|l| l.starts_with("/redirect | Host"))
+            .count(),
+        1
+    );
+    // Autre hôte : pas de cookie.
+    let (autre, url2, data2) = serveur(1 << 20, |_| {});
+    *c.ailleurs.lock().unwrap() = url2
+        .replace("/file.bin", "")
+        .replace("127.0.0.1", "localhost");
+    let (p, _) = telecharge(&url.replace("/file.bin", "/redirect_ext"), &d, &o);
+    verifie(&p, &data2);
+    let vus = autre.vus.lock().unwrap().clone();
+    assert!(vus
+        .iter()
+        .any(|l| l.ends_with("Referer: http://page.example/")));
+    assert!(!vus.iter().any(|l| l.contains("session=S1")), "{vus:?}");
+}
+
+#[test]
+fn lien_expire() {
+    // Audit M5 : 403 partout après une sonde réussie = lien expiré, pas « connexions en trop ».
+    let (_c, url, _) = serveur(2 << 20, |c| {
+        c.expire_after = 3;
+        c.rate = 4 << 20;
+    });
+    let d = dossier("expire");
+    let ctl = Arc::new(Control::default());
+    let e = engine::run(&url, &d, None, &opts(4), &ctl).unwrap_err();
+    assert_eq!(e, engine::ERR_EXPIRE);
+    assert!(ctl.snapshot().workers.iter().all(|w| !w.dropped));
+}
+
+#[test]
+fn etag_faible_ou_variable() {
+    // Audit M6 : `W/` et ETag propre à un nœud de CDN (même date) ne font pas échouer.
+    let (_c, url, data) = serveur(1 << 20, |c| c.etag_weak = true);
+    let d = dossier("etag_faible");
+    let (p, ctl) = telecharge(&url, &d, &opts(4));
+    verifie(&p, &data);
+    assert!(ctl.snapshot().ranges);
+    let (_c, url, data) = serveur(1 << 20, |c| c.etag_varie = true);
+    let (p, ctl) = telecharge(&url, &d, &opts(4));
+    verifie(&p, &data);
+    assert!(ctl.snapshot().ranges);
+    // Sans date pour confirmer : repli sur une connexion, fichier exact.
+    let (_c, url, data) = serveur(1 << 20, |c| {
+        c.etag_varie = true;
+        c.no_lm = true;
+    });
+    let (p, ctl) = telecharge(&url, &d, &opts(4));
+    verifie(&p, &data);
+    assert!(!ctl.snapshot().ranges);
+}
+
+#[test]
+fn fichier_vide() {
+    // Audit L1 : 416 + `bytes */0` = fichier de 0 octet, pas une erreur.
+    let (_c, url, _) = serveur(0, |_| {});
+    let d = dossier("vide");
+    let (p, _) = telecharge(&url, &d, &opts(4));
+    assert_eq!(std::fs::metadata(&p).unwrap().len(), 0);
+    assert!(!engine::part_path(&p).exists());
+}
+
+#[test]
+fn renommage_sans_ecraser() {
+    // Audit L4 : un fichier apparu sous le même nom pendant le téléchargement est gardé.
+    let (_c, url, data) = serveur(512 << 10, |c| c.rate = 1 << 20);
+    let d = dossier("sans_ecraser");
+    let ctl = Arc::new(Control::default());
+    let r = std::thread::scope(|s| {
+        let f = s.spawn(|| engine::run(&url, &d, None, &opts(1), &ctl));
+        while !engine::part_path(&d.join("file.bin")).exists() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::write(d.join("file.bin"), b"a moi").unwrap();
+        f.join().unwrap()
+    });
+    let Ok(Outcome::Done(p)) = r else {
+        panic!("{r:?}")
+    };
+    assert_eq!(p.file_name().unwrap(), "file (1).bin");
+    assert_eq!(ctl.snapshot().file_name.as_deref(), Some("file (1).bin"));
+    verifie(&p, &data);
+    assert_eq!(std::fs::read(d.join("file.bin")).unwrap(), b"a moi");
 }
