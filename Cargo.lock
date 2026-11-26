@@ -1163,11 +1163,12 @@ dependencies = [
 
 [[package]]
 name = "fluxdl"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "arboard",
  "eframe",
  "image",
+ "libc",
  "librqbit",
  "png",
  "rfd",

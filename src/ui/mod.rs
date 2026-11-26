@@ -85,7 +85,6 @@ enum Tab {
 struct Job {
     ctl: Arc<Control>,
     handle: Option<JoinHandle<Result<Outcome, String>>>,
-    cancel: bool,
     /// Débit total lissé et par connexion (octets/s).
     speed: f64,
     speeds: Vec<f64>,
@@ -98,7 +97,6 @@ impl Job {
         Job {
             ctl,
             handle,
-            cancel: false,
             speed: 0.0,
             speeds: Vec::new(),
             history: VecDeque::new(),
@@ -174,6 +172,8 @@ enum Modale {
     Association,
     /// Le lien mène à une page web, pas à un fichier : l'ouvrir dans le navigateur.
     Page(String),
+    /// Annuler un téléchargement : effacer aussi le fichier partiel ? (oui par défaut)
+    Annuler { id: u64, supprimer: bool },
 }
 
 /// Phase du comparatif (1 = une connexion, 2 = N) et son contrôle.
@@ -197,6 +197,8 @@ pub struct App {
     settings: Settings,
     entries: Vec<Entry>,
     jobs: HashMap<u64, Job>,
+    /// Annulés, déjà retirés de la file, dont le fil finit : (job, entrée, effacer les partiels).
+    orphelins: Vec<(Job, Entry, bool)>,
     tab: Tab,
     url: String,
     sha: String,
@@ -259,6 +261,7 @@ impl App {
             settings: Settings::default(),
             entries: Vec::new(),
             jobs: HashMap::new(),
+            orphelins: Vec::new(),
             tab: Tab::Downloads,
             url: String::new(),
             sha: String::new(),
@@ -310,10 +313,7 @@ impl App {
             .store(app.settings.clipboard_watch, Ordering::Relaxed);
         app.presse = Some(crate::presse::lancer(ctx.clone(), app.presse_actif.clone()));
         for e in &mut app.entries {
-            // Interrompu par un arrêt ou un plantage : reprend tout seul.
-            if e.status == Status::Running {
-                e.status = Status::Queued;
-            }
+            store::au_lancement(e);
         }
         app.next_id = app.entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
         maj::nettoyer();
@@ -382,6 +382,16 @@ impl App {
         }
         if video::site_video(&url) {
             return self.ouvrir_video(url);
+        }
+        // Déjà dans la file : la montrer plutôt que télécharger deux fois le même fichier.
+        if let Some(e) = self
+            .entries
+            .iter()
+            .find(|e| e.url == url && !matches!(e.status, Status::Done | Status::Canceled))
+        {
+            self.selected = Some(e.id);
+            self.tab = Tab::Downloads;
+            return;
         }
         let sha = std::mem::take(&mut self.sha).trim().to_string();
         let e = self.nouvelle(url, Kind::Http);
@@ -520,6 +530,7 @@ impl App {
     /// Fin des téléchargements terminés, démarrage des suivants, noms et tailles à jour.
     fn schedule(&mut self, now: f64) {
         let mut page = None;
+        let mut fini = false;
         for e in &mut self.entries {
             let Some(j) = self.jobs.get_mut(&e.id) else {
                 continue;
@@ -543,12 +554,9 @@ impl App {
                 .take()
                 .map(|h| h.join().unwrap_or_else(|_| Err("panic".into())));
             j.speed = 0.0;
+            fini = true;
             e.status = match r {
                 Some(Ok(Outcome::Done(_))) => Status::Done,
-                Some(Ok(Outcome::Stopped)) if j.cancel => {
-                    delete_parts(e, true);
-                    Status::Canceled
-                }
                 Some(Ok(Outcome::Stopped)) => Status::Paused,
                 Some(Err(m)) => {
                     if m == engine::ERR_PAGE {
@@ -558,6 +566,18 @@ impl App {
                 }
                 None => e.status.clone(),
             };
+        }
+        // Annulés : effacer les partiels une fois leur fil fini (il sauve encore l'état en partant).
+        self.orphelins.retain(|(j, e, effacer)| {
+            if j.handle.as_ref().is_some_and(|h| !h.is_finished()) {
+                return true;
+            }
+            delete_parts(e, *effacer);
+            false
+        });
+        // Fin, pause ou échec : la file est écrite tout de suite.
+        if fini {
+            self.last_save = f64::NEG_INFINITY;
         }
         // Page web au lieu d'un fichier : explication et bouton vers le navigateur.
         if let Some(url) = page.filter(|_| self.modale.is_none()) {
@@ -1107,6 +1127,10 @@ impl App {
             tuile_fichier(&p, tuile, type_de(e, &nom));
             let (x0, x1) = (tuile.right() + 14.0, r.right() - 16.0);
             let actes: &[(Icone, &str, Act)] = match &e.status {
+                Status::Failed(m) if m == store::ERR_PARTIEL => &[
+                    (Icone::Actualiser, "Start over", Act::Recommencer),
+                    (Icone::Fermer, "Remove from list", Act::Remove),
+                ],
                 Status::Running | Status::Queued => &[
                     (Icone::Pause, "Pause", Act::Pause),
                     (Icone::Dossier, "Open folder", Act::Folder),
@@ -1256,19 +1280,26 @@ impl App {
             // Un torrent qui partage s'arrête « fini » (voir torrent::telecharger).
             Act::Pause => match self.jobs.get(&id).filter(|j| j.handle.is_some()) {
                 Some(j) => j.ctl.request_stop(),
-                None => self.entries[i].status = Status::Paused,
+                None => {
+                    self.entries[i].status = Status::Paused;
+                    self.last_save = f64::NEG_INFINITY;
+                }
             },
             Act::Resume => self.entries[i].status = Status::Queued,
-            Act::Cancel => match self.jobs.get_mut(&id).filter(|j| j.handle.is_some()) {
-                Some(j) => {
-                    j.cancel = true;
-                    j.ctl.request_stop();
+            Act::Recommencer => {
+                let e = &mut self.entries[i];
+                delete_parts(e, true);
+                e.done = 0;
+                e.status = Status::Queued;
+            }
+            Act::Cancel => {
+                if self.modale.is_none() {
+                    self.modale = Some(Modale::Annuler {
+                        id,
+                        supprimer: true,
+                    });
                 }
-                None => {
-                    delete_parts(&self.entries[i], true);
-                    self.entries[i].status = Status::Canceled;
-                }
-            },
+            }
             Act::Video => {
                 let url = self.entries.remove(i).url;
                 self.jobs.remove(&id);
@@ -1283,6 +1314,29 @@ impl App {
                     self.selected = None;
                 }
             }
+        }
+    }
+
+    /// Annulation confirmée : l'entrée quitte la file (écrite tout de suite) ; son fil s'arrête
+    /// en < 1 s et les partiels sont effacés quand il a fini (`orphelins`).
+    fn annuler(&mut self, id: u64, effacer: bool) {
+        let Some(i) = self.entries.iter().position(|e| e.id == id) else {
+            return;
+        };
+        let e = self.entries.remove(i);
+        self.born.remove(&id);
+        if self.selected == Some(id) {
+            self.selected = None;
+        }
+        match self.jobs.remove(&id).filter(|j| j.handle.is_some()) {
+            Some(j) => {
+                j.ctl.request_stop();
+                self.orphelins.push((j, e, effacer));
+            }
+            None => delete_parts(&e, effacer),
+        }
+        if self.capture.is_none() {
+            store::save(QUEUE, &self.entries);
         }
     }
 
@@ -1387,6 +1441,22 @@ impl App {
             return;
         };
         let lv = j.ctl.snapshot();
+        let retirees = lv.workers.iter().filter(|w| w.dropped).count();
+        if retirees > 0 {
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} {retirees}/{}.",
+                    t(
+                        l,
+                        "The host refuses extra connections: connections closed automatically:"
+                    ),
+                    lv.workers.len()
+                ))
+                .font(regulier(12.5))
+                .color(ATTENTION),
+            );
+        }
         let avis: Vec<&str> = [
             (lv.restarted, "Remote file changed: restarted from zero."),
             (
@@ -1401,6 +1471,18 @@ impl App {
         for m in avis {
             ui.add_space(10.0);
             ui.label(egui::RichText::new(m).font(regulier(12.5)).color(ATTENTION));
+        }
+        // Fichier creux : l'Explorateur montre la taille finale tout de suite, pas l'espace pris.
+        if e.kind == Kind::Http && lv.ranges && e.status != Status::Done {
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new(t(
+                    l,
+                    "The .part file already shows its final size; disk space is only used as data arrives.",
+                ))
+                .font(regulier(12.0))
+                .color(TEXTE3),
+            );
         }
         ui.add_space(18.0);
         // Chiffres clés : grand nombre, unité discrète.
@@ -1522,6 +1604,7 @@ impl App {
                         l,
                         "Done early? Take half. This connection finished its own range and took half of the largest remaining one.",
                     ),
+                    (t(l, "retries, last error:"), t(l, "Closed: the host refuses this extra connection.")),
                 )
             });
         ui.add_space(20.0);
@@ -1720,7 +1803,14 @@ impl App {
                 carte_fichier(ui, &lv, 10.0);
                 ui.add_space(10.0);
                 ui.spacing_mut().item_spacing.y = 2.0;
-                connexions(ui, &lv, &[], t(l, "stolen"), t(l, "Done early? Take half."));
+                connexions(
+                    ui,
+                    &lv,
+                    &[],
+                    t(l, "stolen"),
+                    t(l, "Done early? Take half."),
+                    ("", ""),
+                );
             });
             ui.add_space(16.0);
         }
@@ -2255,6 +2345,8 @@ enum Act {
     Folder,
     Pause,
     Resume,
+    /// Fichier partiel introuvable : repartir de zéro.
+    Recommencer,
     Cancel,
     Remove,
 }
@@ -2449,17 +2541,25 @@ impl eframe::App for App {
             return;
         }
         // Arrêt propre : l'état de chaque téléchargement est sauvé, il reprendra au lancement.
-        for j in self.jobs.values() {
+        for j in self
+            .jobs
+            .values()
+            .chain(self.orphelins.iter().map(|o| &o.0))
+        {
             j.ctl.request_stop();
         }
         let fin = std::time::Instant::now() + Duration::from_secs(2);
         while self
             .jobs
             .values()
+            .chain(self.orphelins.iter().map(|o| &o.0))
             .any(|j| j.handle.as_ref().is_some_and(|h| !h.is_finished()))
             && std::time::Instant::now() < fin
         {
             std::thread::sleep(Duration::from_millis(20));
+        }
+        for (_, e, effacer) in &self.orphelins {
+            delete_parts(e, *effacer);
         }
         store::save(QUEUE, &self.entries);
         store::save(SETTINGS, &self.settings);

@@ -9,13 +9,22 @@ A free, open-source multi-connection download manager (Windows + Linux, single e
 - The file is split into up to 32 ranges downloaded in parallel (default 8).
 - **Done early? Take half.** A connection that finishes its range takes the upper half of the
   largest remaining one, so no connection sits idle (minimum chunk: 1 MiB).
-- Resume: data goes to a preallocated `.part` file; a small `.part.json` state file (ranges
+- Resume: data goes to a `.part` file at its final size; a small `.part.json` state file (ranges
   done) is written atomically every 0.5 s after the data is flushed to disk, so a crash or a
   power cut loses at most half a second. On resume the size and validators are checked: if the
   remote file changed, the download restarts cleanly.
-- Every range response must be a `206` with the expected `Content-Range`; a server that answers
-  `200` falls back to a single connection, never mixing bytes. Servers without ranges or with
-  an unknown size use one connection.
+- The `.part` file is sparse (NTFS sparse flag on Windows): Explorer shows the final size right
+  away, but disk space is only used as data arrives, and Windows never has to fill gigabytes of
+  zeros before a write far into the file. Free space is checked before starting.
+- Every range response must be a `206` whose `Content-Range` starts where asked, ends within the
+  range and has the expected total; nothing is ever written past the file size. A connection
+  that gets `200`, a wrong range, an HTML page or `403`/`429` gives its range back; if the host
+  keeps refusing extra connections they are closed automatically (the reason shows in the
+  detail panel) and the others carry on. A server that ignores ranges for every connection falls
+  back to a single connection. Servers without ranges or with an unknown size use one connection.
+- Pause and cancel return within a second even if the server stalls. Cancel asks whether to
+  delete the partial file. At launch, a download whose `.part` was deleted is not recreated:
+  it shows "Partial file not found" with Start over / Remove.
 - Per-connection retries with exponential backoff, redirects (8 max), HTTPS through rustls,
   optional SHA-256 check and global speed limit.
 - Benchmark tab: the same link with 1 connection, then N, to a temporary file deleted after.

@@ -3,6 +3,30 @@
 use crate::store::Lang;
 
 const FR: &[(&str, &str)] = &[
+    ("Cancel this download?", "Annuler ce téléchargement ?"),
+    ("It leaves the list.", "Il sera retiré de la liste."),
+    ("Also delete the partial file", "Supprimer aussi le fichier partiel"),
+    ("Keep downloading", "Continuer"),
+    ("Cancel download", "Annuler le téléchargement"),
+    ("Partial file not found.", "Fichier partiel introuvable."),
+    ("Start over", "Recommencer"),
+    (
+        "Not enough free disk space for this file.",
+        "Pas assez de place sur le disque pour ce fichier.",
+    ),
+    ("retries, last error:", "essais, dernière erreur :"),
+    (
+        "Closed: the host refuses this extra connection.",
+        "Fermée : l'hôte refuse cette connexion en plus.",
+    ),
+    (
+        "The host refuses extra connections: connections closed automatically:",
+        "L'hôte refuse les connexions en plus : connexions fermées automatiquement :",
+    ),
+    (
+        "The .part file already shows its final size; disk space is only used as data arrives.",
+        "Le fichier .part affiche déjà sa taille finale ; la place sur le disque n'est prise qu'au fil des données.",
+    ),
     ("Done early? Take half.", "Fini tôt ? Prends la moitié."),
     (
         "A connection that finishes early takes half of the largest remaining range.",

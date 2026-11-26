@@ -83,7 +83,7 @@ fn benchmark(url: &str, args: &[String]) -> Result<(), String> {
         .split(',')
         .filter_map(|n| n.trim().parse::<usize>().ok())
     {
-        let ctl = engine::Control::default();
+        let ctl = std::sync::Arc::new(engine::Control::default());
         let v = engine::measure(url, n, Duration::from_secs(secs), &ctl)?;
         let l = ctl.snapshot();
         println!(

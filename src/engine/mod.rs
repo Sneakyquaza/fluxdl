@@ -3,9 +3,12 @@
 //! Le fichier est découpé en morceaux (`Segment`) téléchargés en parallèle par N connexions.
 //! Une connexion qui finit tôt prend la moitié du plus gros morceau restant (vol de travail) :
 //! aucune connexion ne reste à rien faire tant qu'il reste au moins 2 × `min_chunk`.
-//! Reprise : fichier `.part` préalloué + état `.part.json` (morceaux faits) écrit de façon
-//! atomique toutes les 500 ms, après `sync_data` du `.part` : un `kill -9` ou une coupure de
-//! courant ne fait perdre que la dernière demi-seconde.
+//! Reprise : fichier `.part` à sa taille finale + état `.part.json` (morceaux faits) écrit de
+//! façon atomique toutes les 500 ms, après `sync_data` du `.part` : un `kill -9` ou une coupure
+//! de courant ne fait perdre que la dernière demi-seconde.
+//! Le `.part` est creux (Windows : `FSCTL_SET_SPARSE` ; Linux : `set_len` l'est déjà) : sans ça,
+//! NTFS remplit de zéros, dans l'appel d'écriture même, tout ce qui précède une écriture loin
+//! dans le fichier (des Go), ce qui bloquait les connexions, la pause et l'annulation.
 
 mod probe;
 pub use probe::{name_from_disposition, name_from_url, probe, sanitize};
@@ -14,14 +17,17 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 pub const MAX_CONNECTIONS: usize = 32;
 /// Taille d'une lecture réseau ; un vol laisse toujours au moins ça au volé (voir `claim`).
 const BUF: usize = 64 * 1024;
 const SAVE_EVERY: Duration = Duration::from_millis(500);
+/// Pause ou annulation : attente maximale des connexions avant de rendre la main ; une connexion
+/// bloquée (serveur muet) finit seule ensuite, sans plus rien écrire.
+const STOP_GRACE: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -89,6 +95,10 @@ pub struct WorkerStat {
     pub bytes: u64,
     pub segment: Option<usize>,
     pub retries: u32,
+    /// Dernière raison d'échec (« HTTP 429 », « timeout »…), pour le panneau de détail.
+    pub error: Option<String>,
+    /// Retirée : l'hôte refuse les connexions en plus (403/429/page/plage ignorée).
+    pub dropped: bool,
 }
 
 /// État en direct, lu par l'UI (`Control::snapshot`).
@@ -195,6 +205,8 @@ fn with_suffix(p: &Path, s: &str) -> PathBuf {
 
 /// Erreur de `run` quand le lien mène à une page web (l'UI propose alors yt-dlp).
 pub const ERR_PAGE: &str = "This link is a web page, not a file.";
+/// Erreur de `run` : pas assez de place sur le disque pour ce qui reste à télécharger.
+pub const ERR_ESPACE: &str = "Not enough free disk space for this file.";
 
 /// Télécharge `url` dans `dir`. `name` : nom déjà choisi (reprise) ; sinon celui du serveur,
 /// rendu unique (« nom (1).ext »). Bloquant : à lancer dans un fil.
@@ -203,20 +215,20 @@ pub fn run(
     dir: &Path,
     name: Option<&str>,
     opts: &Options,
-    ctl: &Control,
+    ctl: &Arc<Control>,
 ) -> Result<Outcome, String> {
     let agent = agent();
     let p = probe(&agent, url, &opts.headers)?;
     if est_page(&p, url) {
         return Err(ERR_PAGE.into());
     }
+    fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let name = match name {
         Some(n) => n.to_string(),
-        None => unique_name(dir, &p.file_name),
+        None => reserve_name(dir, &p.file_name)?,
     };
     let target = dir.join(&name);
     ctl.lock().file_name = Some(name);
-    fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     match attempt(&agent, url, &p, &target, opts, ctl, false)? {
         // Un serveur a répondu 200 à une plage : tout reprendre sur une seule connexion.
         Step::Fallback => match attempt(&agent, url, &p, &target, opts, ctl, true)? {
@@ -251,28 +263,39 @@ enum Step {
     Fallback,
 }
 
-/// Données partagées par les connexions d'une tentative.
-struct Shared<'a> {
-    agent: &'a ureq::Agent,
-    url: &'a str,
-    file: &'a File,
-    probe: &'a Probe,
-    opts: &'a Options,
-    ctl: &'a Control,
+/// Données partagées par les connexions d'une tentative (fils détachés : une connexion bloquée
+/// ne retient pas la pause).
+struct Shared {
+    agent: ureq::Agent,
+    url: String,
+    file: File,
+    probe: Probe,
+    opts: Options,
+    ctl: Arc<Control>,
     ranged: bool,
     started: Instant,
     /// Arrêt de toutes les connexions (erreur fatale ou repli).
     abort: AtomicBool,
     fallback: AtomicBool,
     error: Mutex<Option<String>>,
+    /// Connexions encore en vie.
+    actifs: AtomicUsize,
 }
 
-impl Shared<'_> {
+impl Shared {
     fn halted(&self) -> bool {
         self.ctl.stop.load(Ordering::Relaxed) || self.abort.load(Ordering::Relaxed)
     }
     fn set_error(&self, e: String) {
         *self.error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+    }
+    /// Se retirer s'il reste une autre connexion (jamais la dernière, même à plusieurs à la fois).
+    fn retirer(&self) -> bool {
+        self.actifs
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |a| {
+                (a > 1).then(|| a - 1)
+            })
+            .is_ok()
     }
 }
 
@@ -282,7 +305,7 @@ fn attempt(
     p: &Probe,
     target: &Path,
     opts: &Options,
-    ctl: &Control,
+    ctl: &Arc<Control>,
     force_single: bool,
 ) -> Result<Step, String> {
     let part = part_path(target);
@@ -297,6 +320,7 @@ fn attempt(
                 && s.etag == p.etag
                 && s.last_modified == p.last_modified
                 && len == p.size
+                && p.size.is_some_and(|t| coherents(&s.segments, t))
             {
                 segments = Some(s.segments);
             } else {
@@ -314,6 +338,16 @@ fn attempt(
         .truncate(segments.is_none())
         .open(&part)
         .map_err(|e| format!("{}: {e}", part.display()))?;
+    if let Some(n) = p.size {
+        let deja: u64 = segments.iter().flatten().map(|s| s.pos - s.start).sum();
+        if espace_libre(target.parent().unwrap_or(Path::new(".")))
+            .is_some_and(|l| l < n.saturating_sub(deja))
+        {
+            return Err(ERR_ESPACE.into());
+        }
+    }
+    // Creux avant `set_len` : la taille finale n'occupe pas le disque, rien n'est rempli de zéros.
+    rendre_creux(&file);
     if segments.is_none() {
         if let Some(n) = p.size {
             file.set_len(n).map_err(|e| format!("preallocate: {e}"))?;
@@ -342,31 +376,45 @@ fn attempt(
         l.restarted |= restarted;
         l.verifying = false;
     }
-    let sh = Shared {
-        agent,
-        url,
-        file: &file,
-        probe: p,
-        opts,
-        ctl,
+    let sh = Arc::new(Shared {
+        agent: agent.clone(),
+        url: url.to_string(),
+        file,
+        probe: p.clone(),
+        opts: opts.clone(),
+        ctl: ctl.clone(),
         ranged,
         started: Instant::now(),
         abort: AtomicBool::new(false),
         fallback: AtomicBool::new(false),
         error: Mutex::new(None),
-    };
-    std::thread::scope(|s| {
-        let shr = &sh;
-        let fils: Vec<_> = (0..n).map(|w| s.spawn(move || worker(shr, w))).collect();
-        let mut dernier = Instant::now();
-        while !fils.iter().all(|f| f.is_finished()) {
-            std::thread::sleep(Duration::from_millis(20));
-            if ranged && dernier.elapsed() >= SAVE_EVERY {
-                save(&sh, &side);
-                dernier = Instant::now();
-            }
-        }
+        actifs: AtomicUsize::new(n),
     });
+    let fils: Vec<_> = (0..n)
+        .map(|w| {
+            let sh = sh.clone();
+            std::thread::spawn(move || {
+                if !worker(&sh, w) {
+                    sh.actifs.fetch_sub(1, Ordering::SeqCst);
+                }
+            })
+        })
+        .collect();
+    let mut dernier = Instant::now();
+    let mut arret = None;
+    while !fils.iter().all(|f| f.is_finished()) {
+        std::thread::sleep(Duration::from_millis(20));
+        // Pause / annulation : rendre la main vite, même si une connexion attend un serveur muet.
+        if ctl.stop.load(Ordering::Relaxed)
+            && arret.get_or_insert_with(Instant::now).elapsed() >= STOP_GRACE
+        {
+            break;
+        }
+        if ranged && dernier.elapsed() >= SAVE_EVERY {
+            save(&sh, &side);
+            dernier = Instant::now();
+        }
+    }
     if sh.fallback.load(Ordering::Relaxed) && !ctl.stop.load(Ordering::Relaxed) {
         return Ok(Step::Fallback);
     }
@@ -382,8 +430,16 @@ fn attempt(
             None => Err("incomplete download".into()),
         };
     }
-    file.sync_all().map_err(|e| format!("sync: {e}"))?;
-    drop(file);
+    // Toutes les connexions ont fini (pas d'arrêt) : plus personne n'écrit.
+    let len = sh.file.metadata().map(|m| m.len()).ok();
+    if let Some(t) = ctl.lock().size {
+        debug_assert_eq!(len, Some(t), "longueur du .part");
+        if len != Some(t) {
+            return Err(format!("file length {} instead of {t}", len.unwrap_or(0)));
+        }
+    }
+    sh.file.sync_all().map_err(|e| format!("sync: {e}"))?;
+    drop(sh);
     if let Some(attendu) = &opts.expected_sha256 {
         ctl.lock().verifying = true;
         let h = sha256_file(&part).map_err(|e| format!("sha256: {e}"))?;
@@ -461,25 +517,64 @@ enum FetchErr {
     Retry(String),
     Fatal(String),
     Fallback,
+    /// L'hôte limite les connexions (403/429/503, page HTML, plage ignorée ou fausse) : raison,
+    /// et ce que vaut l'erreur pour la dernière connexion en vie.
+    Limit(String, Box<FetchErr>),
 }
 
-fn worker(sh: &Shared, w: usize) {
+/// Échecs « hôte qui limite » de suite avant qu'une connexion en trop se retire.
+const LIMIT_DROP: u32 = 2;
+
+/// Vrai si la connexion s'est retirée elle-même (déjà décomptée de `actifs`).
+fn worker(sh: &Shared, w: usize) -> bool {
     let mut echecs = 0u32;
+    let mut limites = 0u32;
     let mut courant = None;
     while !sh.halted() {
         let i = match courant {
             Some(i) => i,
             None => match claim(sh, w) {
                 Some(i) => i,
-                None => return,
+                None => return false,
             },
         };
         courant = Some(i);
         let avant = sh.ctl.lock().segments[i].pos;
-        match fetch(sh, w, i) {
+        let r = match fetch(sh, w, i) {
+            Err(FetchErr::Limit(raison, seul)) => {
+                limites += 1;
+                if sh.actifs.load(Ordering::SeqCst) <= 1 {
+                    // Dernière connexion : l'erreur compte pour de bon (page, 403, repli…), sauf
+                    // un 200 après des 206 réussis : passager, on ne jette pas ce qui est fait.
+                    match *seul {
+                        FetchErr::Fallback if sh.ctl.lock().done() > 0 => {
+                            Err(FetchErr::Retry(raison))
+                        }
+                        seul => Err(seul),
+                    }
+                } else if limites >= LIMIT_DROP && sh.retirer() {
+                    // L'hôte refuse les connexions en plus : rendre le morceau aux autres.
+                    let mut l = sh.ctl.lock();
+                    l.segments[i].worker = None;
+                    l.workers[w].segment = None;
+                    l.workers[w].retries += 1;
+                    l.workers[w].error = Some(raison);
+                    l.workers[w].dropped = true;
+                    return true;
+                } else {
+                    Err(FetchErr::Retry(raison))
+                }
+            }
+            r => r,
+        };
+        match r {
             Ok(()) => {
-                courant = None;
+                // Réponse plus courte que demandé : continuer le même morceau.
+                if sh.ctl.lock().segments[i].remaining() == 0 {
+                    courant = None;
+                }
                 echecs = 0;
+                limites = 0;
             }
             Err(FetchErr::Fallback) => {
                 sh.fallback.store(true, Ordering::Relaxed);
@@ -489,10 +584,14 @@ fn worker(sh: &Shared, w: usize) {
                 sh.set_error(e);
                 sh.abort.store(true, Ordering::Relaxed);
             }
-            Err(FetchErr::Retry(e)) => {
+            Err(FetchErr::Retry(e)) | Err(FetchErr::Limit(e, _)) => {
                 let progres = sh.ctl.lock().segments[i].pos > avant;
                 echecs = if progres { 1 } else { echecs + 1 };
-                sh.ctl.lock().workers[w].retries += 1;
+                {
+                    let mut l = sh.ctl.lock();
+                    l.workers[w].retries += 1;
+                    l.workers[w].error = Some(e.clone());
+                }
                 if echecs > sh.opts.max_retries {
                     // Rendre le morceau : une autre connexion pourra le prendre.
                     let mut l = sh.ctl.lock();
@@ -500,7 +599,7 @@ fn worker(sh: &Shared, w: usize) {
                     l.workers[w].segment = None;
                     drop(l);
                     sh.set_error(e);
-                    return;
+                    return false;
                 }
                 // Attente exponentielle : 250 ms, 500 ms… 8 s au plus, interrompue par un arrêt.
                 let fin = Instant::now() + Duration::from_millis(250 << (echecs - 1).min(5));
@@ -510,16 +609,54 @@ fn worker(sh: &Shared, w: usize) {
             }
         }
     }
+    false
 }
 
 fn classify(e: ureq::Error) -> FetchErr {
     match e {
-        ureq::Error::Status(c, _) if c == 408 || c == 429 || c >= 500 => {
-            FetchErr::Retry(format!("HTTP {c}"))
+        ureq::Error::Status(c, r) => {
+            let m = format!("HTTP {c}");
+            match c {
+                // Hôte qui limite les connexions par IP ou par lien signé.
+                401 | 403 | 429 | 503 | 509 => {
+                    let seul = if c == 429 || c == 503 {
+                        FetchErr::Retry(m.clone())
+                    } else if est_html(r.header("Content-Type")) {
+                        FetchErr::Fatal(ERR_PAGE.into())
+                    } else {
+                        FetchErr::Fatal(m.clone())
+                    };
+                    FetchErr::Limit(m, Box::new(seul))
+                }
+                408 | 500.. => FetchErr::Retry(m),
+                _ => FetchErr::Fatal(m),
+            }
         }
-        ureq::Error::Status(c, _) => FetchErr::Fatal(format!("HTTP {c}")),
-        e => FetchErr::Retry(e.to_string()),
+        // Pas le message complet : il contient l'URL (jeton d'un lien signé).
+        ureq::Error::Transport(t) if t.to_string().contains("timed out") => {
+            FetchErr::Retry("timeout".into())
+        }
+        ureq::Error::Transport(t) => FetchErr::Retry(t.kind().to_string()),
     }
+}
+
+/// Erreur de lecture du corps, courte (« timeout »).
+fn io_raison(e: &io::Error) -> String {
+    match e.kind() {
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => "timeout".into(),
+        _ => e.to_string(),
+    }
+}
+
+/// `bytes a-b/total` → (a, b, total) ; total `*` → None.
+fn content_range(cr: &str) -> Option<(u64, u64, Option<u64>)> {
+    let (plage, total) = cr.trim().strip_prefix("bytes ")?.split_once('/')?;
+    let (a, b) = plage.split_once('-')?;
+    Some((
+        a.trim().parse().ok()?,
+        b.trim().parse().ok()?,
+        total.trim().parse().ok(),
+    ))
 }
 
 /// Télécharge le morceau `i` depuis sa position jusqu'à sa fin (qui peut reculer en cours de
@@ -537,7 +674,7 @@ fn fetch(sh: &Shared, w: usize, i: usize) -> Result<(), FetchErr> {
     if end != u64::MAX && pos >= end {
         return Ok(());
     }
-    let mut req = sh.agent.get(sh.url);
+    let mut req = sh.agent.get(&sh.url);
     for (k, v) in &sh.opts.headers {
         req = req.set(k, v);
     }
@@ -547,25 +684,35 @@ fn fetch(sh: &Shared, w: usize, i: usize) -> Result<(), FetchErr> {
     let resp = req.call().map_err(classify)?;
     // Une page web à la place du fichier (session expirée, anti-robot…) : ne rien écrire.
     if est_html(resp.header("Content-Type")) && !est_html(sh.probe.content_type.as_deref()) {
-        return Err(FetchErr::Fatal(ERR_PAGE.into()));
+        return Err(FetchErr::Limit(
+            "HTML page".into(),
+            Box::new(FetchErr::Fatal(ERR_PAGE.into())),
+        ));
     }
     let change = || FetchErr::Fatal("remote file changed".into());
+    // Fin (exclue) de ce que la réponse couvre : jamais lire ni écrire au-delà.
+    let mut limite = end;
     if sh.ranged {
         if resp.status() != 206 {
-            return Err(FetchErr::Fallback);
+            // 200 = fichier entier depuis 0 : ne rien écrire à notre position.
+            return Err(FetchErr::Limit(
+                format!("HTTP {} instead of 206", resp.status()),
+                Box::new(FetchErr::Fallback),
+            ));
         }
         let cr = resp.header("Content-Range").unwrap_or("");
-        let debut = cr
-            .strip_prefix("bytes ")
-            .and_then(|r| r.split('-').next())
-            .and_then(|v| v.trim().parse::<u64>().ok());
-        let total = cr.rsplit('/').next().and_then(|t| t.trim().parse().ok());
+        let Some((a, b, total)) = content_range(cr) else {
+            let m = format!("bad Content-Range: {cr}");
+            return Err(FetchErr::Limit(m.clone(), Box::new(FetchErr::Retry(m))));
+        };
         if total != sh.probe.size {
             return Err(change());
         }
-        if debut != Some(pos) {
-            return Err(FetchErr::Retry(format!("bad Content-Range: {cr}")));
+        if a != pos || b < a || b >= end {
+            let m = format!("bad Content-Range: {cr}");
+            return Err(FetchErr::Limit(m.clone(), Box::new(FetchErr::Retry(m))));
         }
+        limite = b + 1;
     }
     if let (Some(a), Some(b)) = (&sh.probe.etag, resp.header("ETag")) {
         if a != b {
@@ -581,9 +728,13 @@ fn fetch(sh: &Shared, w: usize, i: usize) -> Result<(), FetchErr> {
         let n = match r.read(&mut buf) {
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(FetchErr::Retry(e.to_string())),
+            Err(e) => return Err(FetchErr::Retry(io_raison(&e))),
         };
-        let end = sh.ctl.lock().segments[i].end;
+        // Arrêt pendant la lecture : plus rien n'est écrit (l'état a peut-être déjà été sauvé).
+        if sh.halted() {
+            return Ok(());
+        }
+        let end = sh.ctl.lock().segments[i].end.min(limite);
         if n == 0 {
             if end == u64::MAX {
                 // Taille inconnue : la fin du flux fixe la taille.
@@ -594,21 +745,32 @@ fn fetch(sh: &Shared, w: usize, i: usize) -> Result<(), FetchErr> {
             }
             return Err(FetchErr::Retry("connection closed early".into()));
         }
-        let k = (n as u64).min(end - pos) as usize;
-        write_at(sh.file, &buf[..k], pos).map_err(|e| FetchErr::Fatal(format!("write: {e}")))?;
+        let k = (n as u64).min(end.saturating_sub(pos)) as usize;
+        // Jamais au-delà de la taille annoncée.
+        if let Some(t) = sh.probe.size {
+            debug_assert!(pos + k as u64 <= t, "écriture au-delà de la fin");
+            if pos + k as u64 > t {
+                return Err(FetchErr::Fatal("write beyond end of file".into()));
+            }
+        }
+        write_at(&sh.file, &buf[..k], pos).map_err(|e| FetchErr::Fatal(format!("write: {e}")))?;
         pos += k as u64;
         let attente = {
             let mut l = sh.ctl.lock();
             l.segments[i].pos = pos;
             l.received += k as u64;
             l.workers[w].bytes += k as u64;
-            if pos >= l.segments[i].end {
+            if pos >= l.segments[i].end || pos >= limite {
                 return Ok(());
             }
             limit_wait(sh, l.received)
         };
+        // Limite de débit : attente par petits pas, interrompue par un arrêt.
         if let Some(d) = attente {
-            std::thread::sleep(d);
+            let fin = Instant::now() + d;
+            while Instant::now() < fin && !sh.halted() {
+                std::thread::sleep((fin - Instant::now()).min(Duration::from_millis(50)));
+            }
         }
     }
 }
@@ -621,6 +783,100 @@ fn limit_wait(sh: &Shared, recu: u64) -> Option<Duration> {
     }
     let prevu = Duration::from_secs_f64(recu as f64 / debit as f64);
     prevu.checked_sub(sh.started.elapsed())
+}
+
+/// Morceaux repris cohérents : ils couvrent `[0, taille)` sans trou ni chevauchement, chaque
+/// position dans ses bornes. Sinon l'état est faux : reprise de zéro.
+fn coherents(segs: &[Segment], taille: u64) -> bool {
+    let mut v: Vec<_> = segs.iter().collect();
+    v.sort_by_key(|s| (s.start, s.end));
+    let mut attendu = 0;
+    for s in v {
+        if s.start != attendu || s.pos < s.start || s.pos > s.end {
+            return false;
+        }
+        attendu = s.end;
+    }
+    attendu == taille
+}
+
+/// Windows : `.part` creux. Sans ça, NTFS remplit de zéros dans l'appel d'écriture tout ce qui
+/// précède une écriture loin dans le fichier. Échec (FAT/exFAT) ignoré.
+/// raccourci : sur exFAT (clé USB) le remplissage reste ; écrire dans l'ordre si un jour demandé.
+#[cfg(windows)]
+fn rendre_creux(f: &File) {
+    use std::os::windows::io::AsRawHandle;
+    const FSCTL_SET_SPARSE: u32 = 0x0009_00C4;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn DeviceIoControl(
+            h: *mut std::ffi::c_void,
+            code: u32,
+            inb: *const std::ffi::c_void,
+            insize: u32,
+            outb: *mut std::ffi::c_void,
+            outsize: u32,
+            ret: *mut u32,
+            ov: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+    let mut n = 0u32;
+    // SAFETY : poignée valide pendant l'appel, aucun tampon (entrée nulle = rendre creux).
+    unsafe {
+        DeviceIoControl(
+            f.as_raw_handle().cast(),
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut n,
+            std::ptr::null_mut(),
+        );
+    }
+}
+
+/// Linux : `set_len` donne déjà un fichier creux.
+#[cfg(not(windows))]
+fn rendre_creux(_: &File) {}
+
+/// Octets libres pour l'utilisateur sur le disque de `dir` (None = inconnu).
+#[cfg(windows)]
+fn espace_libre(dir: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            dir: *const u16,
+            libre: *mut u64,
+            total: *mut u64,
+            tout: *mut u64,
+        ) -> i32;
+    }
+    let w: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+    let mut libre = 0u64;
+    // SAFETY : chaîne terminée par 0, sorties facultatives nulles.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            w.as_ptr(),
+            &mut libre,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(libre)
+}
+
+#[cfg(unix)]
+fn espace_libre(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY : chaîne C valide, `statvfs` remplit la structure.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some(st.f_bavail as u64 * st.f_frsize as u64)
 }
 
 #[cfg(unix)]
@@ -651,7 +907,7 @@ fn save(sh: &Shared, side: &Path) {
         return;
     }
     let s = Saved {
-        url: sh.url.to_string(),
+        url: sh.url.clone(),
         size: sh.probe.size,
         etag: sh.probe.etag.clone(),
         last_modified: sh.probe.last_modified.clone(),
@@ -674,6 +930,23 @@ pub fn write_atomic(p: &Path, data: &[u8]) -> io::Result<()> {
 
 fn load(side: &Path) -> Option<Saved> {
     serde_json::from_slice(&fs::read(side).ok()?).ok()
+}
+
+/// Nom libre réservé en créant son `.part` (`create_new`) : deux téléchargements lancés en même
+/// temps n'écrivent jamais dans le même fichier.
+fn reserve_name(dir: &Path, name: &str) -> Result<String, String> {
+    loop {
+        let n = unique_name(dir, name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(part_path(&dir.join(&n)))
+        {
+            Ok(_) => return Ok(n),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", dir.display())),
+        }
+    }
 }
 
 /// « nom.ext », sinon « nom (1).ext »… libre (ni fichier fini ni `.part`).
@@ -712,7 +985,12 @@ pub fn hex(b: &[u8]) -> String {
 
 /// Comparatif : télécharge `url` avec `connections` connexions dans un dossier temporaire
 /// pendant `max` au plus, puis efface tout. Renvoie le débit moyen en octets/s.
-pub fn measure(url: &str, connections: usize, max: Duration, ctl: &Control) -> Result<f64, String> {
+pub fn measure(
+    url: &str,
+    connections: usize,
+    max: Duration,
+    ctl: &Arc<Control>,
+) -> Result<f64, String> {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let dir = std::env::temp_dir().join(format!(
         "{}-bench-{}-{}",

@@ -28,6 +28,29 @@ struct Cfg {
     drop_after: u64,
     served: AtomicU64,
     requests: AtomicU32,
+    /// Fichier virtuel de cette taille (octet = `virtuel_octet(position)`), sans `data`.
+    virtuel: u64,
+    /// Requêtes impaires (après la sonde) : 200 + fichier entier malgré la plage.
+    full_odd: bool,
+    /// Réponses à venir dont le Content-Range commence un octet trop loin.
+    bad_cr: AtomicU32,
+    /// Connexions simultanées permises (0 = libre) ; au-delà : 403 en HTML.
+    max_conns: u32,
+    actives: AtomicU32,
+    /// Après la sonde : en-têtes envoyés, puis plus rien (serveur muet).
+    stall: bool,
+}
+
+fn virtuel_octet(p: u64) -> u8 {
+    (p ^ (p >> 9) ^ (p >> 21) ^ (p >> 33)) as u8
+}
+
+/// Décompte des connexions ouvertes du serveur.
+struct Ouverte<'a>(&'a AtomicU32);
+impl Drop for Ouverte<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn serve(cfg: Arc<Cfg>) -> String {
@@ -69,9 +92,20 @@ fn handle(c: &Cfg, mut s: TcpStream) -> std::io::Result<()> {
         );
     }
     let n_req = c.requests.fetch_add(1, Ordering::SeqCst);
+    let ouvertes = c.actives.fetch_add(1, Ordering::SeqCst) + 1;
+    let _o = Ouverte(&c.actives);
+    if c.max_conns > 0 && n_req > 0 && ouvertes > c.max_conns {
+        return s.write_all(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\nContent-Length: 5\r\nConnection: close\r\n\r\nnope!",
+        );
+    }
     let data = c.data.lock().unwrap().clone();
     let etag = c.etag.lock().unwrap().clone();
-    let total = data.len() as u64;
+    let total = if c.virtuel > 0 {
+        c.virtuel
+    } else {
+        data.len() as u64
+    };
     let plage = range.as_deref().filter(|_| c.ranges).and_then(|r| {
         let (a, b) = r.split_once('-')?;
         let a: u64 = a.parse().ok()?;
@@ -82,12 +116,17 @@ fn handle(c: &Cfg, mut s: TcpStream) -> std::io::Result<()> {
         };
         Some((a, b.min(total - 1)))
     });
-    let plage = plage.filter(|_| !(c.lie && n_req > 0));
+    let plage = plage.filter(|_| !(c.lie && n_req > 0) && !(c.full_odd && n_req % 2 == 1));
     let mut tete = String::new();
     let (a, b) = match plage {
         Some((a, b)) => {
+            let decale = c
+                .bad_cr
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |d| d.checked_sub(1))
+                .is_ok() as u64;
             tete += &format!(
-                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {a}-{b}/{total}\r\n"
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{b}/{total}\r\n",
+                a + decale
             );
             (a, b + 1)
         }
@@ -104,6 +143,10 @@ fn handle(c: &Cfg, mut s: TcpStream) -> std::io::Result<()> {
     }
     tete += &format!("ETag: \"{etag}\"\r\nLast-Modified: Wed, 25 Nov 2026 10:00:00 GMT\r\nConnection: close\r\n\r\n");
     s.write_all(tete.as_bytes())?;
+    if c.stall && n_req > 0 {
+        std::thread::sleep(Duration::from_secs(20));
+        return Ok(());
+    }
     let debit = if a == 0 && c.slow_first > 0 {
         c.slow_first
     } else {
@@ -121,7 +164,11 @@ fn handle(c: &Cfg, mut s: TcpStream) -> std::io::Result<()> {
             return s.shutdown(std::net::Shutdown::Both);
         }
         let q = (p + 16 * 1024).min(b);
-        s.write_all(&data[p as usize..q as usize])?;
+        if c.virtuel > 0 {
+            s.write_all(&(p..q).map(virtuel_octet).collect::<Vec<_>>())?;
+        } else {
+            s.write_all(&data[p as usize..q as usize])?;
+        }
         c.served.fetch_add(q - p, Ordering::SeqCst);
         envoye += q - p;
         p = q;
@@ -184,8 +231,8 @@ fn opts(n: usize) -> Options {
     }
 }
 
-fn telecharge(url: &str, d: &Path, o: &Options) -> (PathBuf, Control) {
-    let ctl = Control::default();
+fn telecharge(url: &str, d: &Path, o: &Options) -> (PathBuf, Arc<Control>) {
+    let ctl = Arc::new(Control::default());
     match engine::run(url, d, None, o, &ctl).unwrap() {
         Outcome::Done(p) => (p, ctl),
         Outcome::Stopped => panic!("arrêté"),
@@ -213,7 +260,7 @@ fn plages_et_redirection() {
     assert!(l.segments.len() >= 8);
     // Empreinte fausse : erreur, aucun fichier final.
     o.expected_sha256 = Some("00".into());
-    let e = engine::run(&url, &d, None, &o, &Control::default()).unwrap_err();
+    let e = engine::run(&url, &d, None, &o, &Arc::new(Control::default())).unwrap_err();
     assert!(e.contains("sha256"), "{e}");
 }
 
@@ -304,7 +351,7 @@ fn reprise_apres_crash() {
     let d1 = dossier("crash1");
     let d2 = dossier("crash2");
     let cible = d1.join("file.bin");
-    let ctl = Control::default();
+    let ctl = Arc::new(Control::default());
     std::thread::scope(|s| {
         let f = s.spawn(|| engine::run(&url, &d1, None, &opts(4), &ctl));
         // « kill -9 » : copier l'état puis le .part tels qu'ils sont sur le disque en cours de route.
@@ -327,7 +374,7 @@ fn reprise_apres_crash() {
         assert_eq!(f.join().unwrap(), Ok(Outcome::Stopped));
     });
     let avant = c.served.load(Ordering::SeqCst);
-    let ctl2 = Control::default();
+    let ctl2 = Arc::new(Control::default());
     let r = engine::run(&url, &d2, Some("file.bin"), &opts(4), &ctl2).unwrap();
     let Outcome::Done(p) = r else { panic!() };
     verifie(&p, &data);
@@ -344,7 +391,7 @@ fn etag_change_entre_deux() {
     let taille = 2usize << 20;
     let (c, url, _) = serveur(taille, |c| c.rate = 512 * 1024);
     let d = dossier("etag");
-    let ctl = Control::default();
+    let ctl = Arc::new(Control::default());
     std::thread::scope(|s| {
         let f = s.spawn(|| engine::run(&url, &d, None, &opts(2), &ctl));
         while ctl.snapshot().done() < 512 * 1024 {
@@ -357,7 +404,7 @@ fn etag_change_entre_deux() {
     let neuves = donnees(taille, 99);
     *c.data.lock().unwrap() = Arc::new(neuves.clone());
     *c.etag.lock().unwrap() = "v2".into();
-    let ctl = Control::default();
+    let ctl = Arc::new(Control::default());
     let r = engine::run(&url, &d, Some("file.bin"), &opts(2), &ctl).unwrap();
     let Outcome::Done(p) = r else { panic!() };
     verifie(&p, &neuves);
@@ -379,4 +426,153 @@ fn acceleration_serveur_bride_par_connexion() {
     let t16 = mesure(16, "acc16");
     eprintln!("N=1 : {t1:.2} s, N=16 : {t16:.2} s, ×{:.1}", t1 / t16);
     assert!(t1 / t16 >= 5.0, "×{:.1}", t1 / t16);
+}
+
+#[test]
+fn plage_ignoree_par_certaines_connexions() {
+    // Une requête sur deux reçoit 200 + fichier entier : jamais écrit à la position de la plage.
+    let (_c, url, data) = serveur(3 << 20, |c| c.full_odd = true);
+    let d = dossier("plage_ignoree");
+    let (p, ctl) = telecharge(&url, &d, &opts(6));
+    verifie(&p, &data);
+    let l = ctl.snapshot();
+    assert!(l.ranges, "pas de repli sur une connexion");
+    assert!(l.workers.iter().any(|w| w.error.is_some()));
+}
+
+#[test]
+fn content_range_faux() {
+    let (_c, url, data) = serveur(2 << 20, |c| c.bad_cr = AtomicU32::new(5));
+    let d = dossier("cr_faux");
+    let (p, ctl) = telecharge(&url, &d, &opts(4));
+    verifie(&p, &data);
+    let l = ctl.snapshot();
+    assert!(l.workers.iter().any(|w| w
+        .error
+        .as_deref()
+        .is_some_and(|e| e.contains("Content-Range"))));
+}
+
+#[test]
+fn hote_limite_les_connexions() {
+    // Au-delà de 3 connexions : 403 en HTML. Les connexions en trop se retirent, le reste finit.
+    let (_c, url, data) = serveur(3 << 20, |c| {
+        c.max_conns = 3;
+        c.rate = 4 << 20;
+    });
+    let d = dossier("limite");
+    let (p, ctl) = telecharge(&url, &d, &opts(8));
+    verifie(&p, &data);
+    let l = ctl.snapshot();
+    let retirees = l.workers.iter().filter(|w| w.dropped).count();
+    assert!((1..8).contains(&retirees), "retirées : {retirees}");
+    assert!(l
+        .workers
+        .iter()
+        .filter(|w| w.dropped)
+        .all(|w| w.error.as_deref() == Some("HTTP 403")));
+}
+
+#[test]
+fn serveur_muet_pause_et_annulation_rapides() {
+    let (c, url, _) = serveur(4 << 20, |c| c.stall = true);
+    let d = dossier("muet");
+    let cible = d.join("file.bin");
+    let ctl = Arc::new(Control::default());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (u, dd, cc) = (url.clone(), d.clone(), ctl.clone());
+    std::thread::spawn(move || {
+        let _ = tx.send(engine::run(&u, &dd, None, &opts(4), &cc));
+    });
+    let debut = Instant::now();
+    while c.requests.load(Ordering::SeqCst) < 5 {
+        assert!(debut.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let t = Instant::now();
+    ctl.request_stop();
+    let r = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("arrêt en < 1 s");
+    assert_eq!(r, Ok(Outcome::Stopped));
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    // Annulation : partiels effacés, rien n'est recréé par une connexion encore bloquée.
+    std::fs::remove_file(engine::part_path(&cible)).unwrap();
+    let _ = std::fs::remove_file(engine::state_path(&cible));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!engine::part_path(&cible).exists());
+    assert!(!engine::state_path(&cible).exists());
+}
+
+#[test]
+fn gros_fichier_creux_borne() {
+    // 16 Gio virtuels (> 4 Gio : positions sur 64 bits), débit bridé : quelques Mo par morceau,
+    // puis pause. Le .part a la taille exacte, ne déborde jamais, et n'occupe presque rien.
+    let total = 16u64 << 30;
+    let (_c, url, _) = serveur(0, |c| {
+        c.virtuel = total;
+        c.rate = 4 << 20;
+    });
+    let d = dossier("gros");
+    let cible = d.join("file.bin");
+    let ctl = Arc::new(Control::default());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (u, dd, cc) = (url.clone(), d.clone(), ctl.clone());
+    std::thread::spawn(move || {
+        let _ = tx.send(engine::run(&u, &dd, None, &opts(8), &cc));
+    });
+    let debut = Instant::now();
+    while ctl.snapshot().done() < 8 << 20 {
+        assert!(debut.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    ctl.request_stop();
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        Ok(Outcome::Stopped)
+    );
+    let part = engine::part_path(&cible);
+    let m = std::fs::metadata(&part).unwrap();
+    assert_eq!(m.len(), total);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert!(
+            m.blocks() * 512 < 256 << 20,
+            "{} o sur le disque",
+            m.blocks() * 512
+        );
+    }
+    // Chaque morceau commencé : octets exacts au début et juste avant sa position.
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(&part).unwrap();
+    let l = ctl.snapshot();
+    assert!(l
+        .segments
+        .iter()
+        .all(|s| s.start <= s.pos && s.pos <= s.end && s.end <= total));
+    for s in l.segments.iter().filter(|s| s.pos - s.start >= 4096) {
+        for o in [s.start, s.pos - 4096] {
+            let mut b = vec![0u8; 4096];
+            f.seek(SeekFrom::Start(o)).unwrap();
+            f.read_exact(&mut b).unwrap();
+            assert!(b
+                .iter()
+                .enumerate()
+                .all(|(k, &x)| x == virtuel_octet(o + k as u64)));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn place_insuffisante() {
+    // 1 Pio annoncé : refusé avant d'écrire quoi que ce soit.
+    let (_c, url, _) = serveur(0, |c| c.virtuel = 1 << 50);
+    let d = dossier("place");
+    let e = engine::run(&url, &d, None, &opts(4), &Arc::new(Control::default())).unwrap_err();
+    assert_eq!(e, engine::ERR_ESPACE);
+    let part = engine::part_path(&d.join("file.bin"));
+    assert_eq!(std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0), 0);
 }

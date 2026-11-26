@@ -1390,7 +1390,15 @@ pub fn coche(ui: &mut Ui, on: &mut bool, t: &str, droite: &str) -> Response {
 }
 
 /// Une ligne par connexion : numéro, jauge du morceau courant, mention « volé », débit.
-pub fn connexions(ui: &mut Ui, l: &Live, vitesses: &[f64], vole: &str, aide_vol: &str) {
+/// `erreurs` : (« essais, dernière erreur : », aide d'une connexion retirée).
+pub fn connexions(
+    ui: &mut Ui,
+    l: &Live,
+    vitesses: &[f64],
+    vole: &str,
+    aide_vol: &str,
+    erreurs: (&str, &str),
+) {
     let large = ui.available_width();
     let n = l.workers.len();
     let bv = ui
@@ -1460,18 +1468,39 @@ pub fn connexions(ui: &mut Ui, l: &Live, vitesses: &[f64], vole: &str, aide_vol:
                 .on_hover_text(aide_vol);
         }
         let v = vitesses.get(w).copied().unwrap_or(0.0);
+        // Retirée par l'hôte (403, 429…) : sa raison à la place du débit.
+        let (texte_d, cd) = match &st.error {
+            Some(e) if st.dropped => (raison_courte(e), DANGER),
+            _ if actif => (format!("{}/s", super::octets(v as u64)), TEXTE2),
+            _ => ("—".into(), TEXTE3),
+        };
         ui.painter().text(
             pos2(r.right(), r.center().y),
             Align2::RIGHT_CENTER,
-            if actif {
-                format!("{}/s", super::octets(v as u64))
-            } else {
-                "—".into()
-            },
+            texte_d,
             regulier(12.0),
-            if actif { TEXTE2 } else { TEXTE3 },
+            cd,
         );
+        if let Some(e) = &st.error {
+            let aide = format!("{} {} {e}", st.retries, erreurs.0);
+            rep.on_hover_text(if st.dropped {
+                format!("{}\n{aide}", erreurs.1)
+            } else {
+                aide
+            });
+        }
     }
+}
+
+/// « HTTP 403 » → « 403 », « bad Content-Range: … » → « range », « timeout » tel quel.
+fn raison_courte(e: &str) -> String {
+    if let Some(c) = e.strip_prefix("HTTP ") {
+        return c.split(' ').next().unwrap_or(c).to_string();
+    }
+    if e.starts_with("bad Content-Range") {
+        return "range".into();
+    }
+    e.split(' ').next().unwrap_or(e).to_string()
 }
 
 /// Courbe du débit total : vitre creuse, aire vert d'eau → bleu translucide, ligne brillante,

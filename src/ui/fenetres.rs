@@ -170,6 +170,21 @@ impl App {
                 }
                 return false;
             }
+            Modale::Annuler { id, mut supprimer } => {
+                titre_modale(ui, Icone::Fermer, t(l, "Cancel this download?"));
+                paragraphe(ui, t(l, "It leaves the list."));
+                ui.add_space(8.0);
+                coche(ui, &mut supprimer, t(l, "Also delete the partial file"), "");
+                match boutons(ui, t(l, "Keep downloading"), t(l, "Cancel download"), true) {
+                    Some(true) => {
+                        self.annuler(id, supprimer);
+                        return true;
+                    }
+                    Some(false) => return true,
+                    None => self.modale = Some(Modale::Annuler { id, supprimer }),
+                }
+                return false;
+            }
             Modale::Page(url) => {
                 titre_modale(ui, Icone::Lien, t(l, "This link is a web page"));
                 match self.page_web(ui, &url, true) {

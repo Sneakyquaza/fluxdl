@@ -101,6 +101,28 @@ pub struct Entry {
     pub cookies: Option<String>,
 }
 
+/// Erreur d'un téléchargement commencé dont le `.part` a disparu (effacé à la main).
+pub const ERR_PARTIEL: &str = "Partial file not found.";
+
+/// Au lancement : un fichier HTTP commencé (nom choisi, `.part` réservé) ne reprend tout seul que
+/// si son `.part` est encore là ; sinon « fichier partiel introuvable » (Recommencer / Retirer) :
+/// jamais un gros fichier recréé sans l'utilisateur.
+pub fn au_lancement(e: &mut Entry) {
+    let commence = e.kind == Kind::Http
+        && matches!(e.status, Status::Running | Status::Queued | Status::Paused);
+    if let Some(n) = e.name.as_ref().filter(|_| commence) {
+        let cible = std::path::Path::new(&e.dir).join(n);
+        if !dlcore::engine::part_path(&cible).exists() {
+            e.status = Status::Failed(ERR_PARTIEL.into());
+            return;
+        }
+    }
+    // Interrompu par un arrêt ou un plantage : reprend tout seul.
+    if e.status == Status::Running {
+        e.status = Status::Queued;
+    }
+}
+
 pub fn data_dir() -> PathBuf {
     let base = if cfg!(windows) {
         std::env::var_os("APPDATA").map(PathBuf::from)
@@ -158,4 +180,46 @@ fn system_lang() -> Lang {
         }
     }
     Lang::En
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partiel_efface_pas_recree() {
+        let d = std::env::temp_dir().join(format!("{APP_NAME}-lancement-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let entree = |name: Option<&str>, status| Entry {
+            id: 1,
+            url: "https://h/f.rar".into(),
+            dir: d.display().to_string(),
+            name: name.map(str::to_string),
+            sha256: None,
+            connections: 8,
+            status,
+            size: Some(62 << 30),
+            done: 1 << 30,
+            kind: Kind::Http,
+            referrer: None,
+            cookies: None,
+        };
+        // .part effacé à la main : ni reprise ni fichier recréé.
+        for st in [Status::Running, Status::Queued, Status::Paused] {
+            let mut e = entree(Some("gros.rar"), st);
+            au_lancement(&mut e);
+            assert_eq!(e.status, Status::Failed(ERR_PARTIEL.into()));
+        }
+        assert!(!d.join("gros.rar.part").exists());
+        // .part présent : reprend.
+        std::fs::write(d.join("la.rar.part"), b"").unwrap();
+        let mut e = entree(Some("la.rar"), Status::Running);
+        au_lancement(&mut e);
+        assert_eq!(e.status, Status::Queued);
+        // Jamais commencé (pas de nom) : part normalement.
+        let mut e = entree(None, Status::Queued);
+        au_lancement(&mut e);
+        assert_eq!(e.status, Status::Queued);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
