@@ -1149,40 +1149,35 @@ impl App {
 
     fn empty_list(&self, ui: &mut Ui) {
         let l = self.settings.lang;
-        ui.add_space(48.0);
-        ui.vertical_centered(|ui| {
-            let (r, _) = ui.allocate_exact_size(Vec2::splat(56.0), Sense::hover());
-            let p = ui.painter();
-            orbe(p, r.center(), 28.0, GEL_VERT);
-            icone_relief(
-                p,
-                Rect::from_center_size(r.center(), Vec2::splat(24.0)),
-                Icone::Telecharger,
-            );
-            ui.add_space(8.0);
-            // Centré, renvoyé à la ligne dans la largeur disponible (moins une marge).
-            let w = ui.available_width();
-            for (s, police, h) in [
-                (t(l, "No downloads yet"), demi(17.0), 24.0),
-                (
-                    t(
+        ui.add_space(24.0);
+        // Sur une carte de verre : texte bleu nuit lisible (le blanc ombré sur l'eau claire
+        // n'avait qu'un contraste de 1,6:1).
+        carte(ui, Margin::symmetric(24, 22), |ui| {
+            ui.set_width(ui.available_width());
+            ui.vertical_centered(|ui| {
+                let (r, _) = ui.allocate_exact_size(Vec2::splat(56.0), Sense::hover());
+                let p = ui.painter();
+                orbe(p, r.center(), 28.0, GEL_VERT);
+                icone_relief(
+                    p,
+                    Rect::from_center_size(r.center(), Vec2::splat(24.0)),
+                    Icone::Telecharger,
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(t(l, "No downloads yet"))
+                        .font(demi(17.0))
+                        .color(TITRE),
+                );
+                ui.label(
+                    egui::RichText::new(t(
                         l,
                         "Paste a link above. Each file is split across up to 32 parallel connections.",
-                    ),
-                    moyen(13.5),
-                    20.0,
-                ),
-            ] {
-                let r = texte_ciel(
-                    ui.painter(),
-                    pos2(ui.max_rect().center().x, ui.cursor().top() + 2.0),
-                    Align2::CENTER_TOP,
-                    s,
-                    police,
-                    (w - 32.0).max(80.0),
+                    ))
+                    .font(moyen(13.5))
+                    .color(TEXTE),
                 );
-                ui.allocate_exact_size(vec2(w, r.height().max(h - 4.0) + 4.0), Sense::hover());
-            }
+            });
         });
     }
 
@@ -2244,6 +2239,7 @@ impl App {
                 version: "0.3.0".into(),
                 exe: f("fluxdl.exe", 15_000_000),
                 sha256: f("fluxdl.exe.sha256", 80),
+                signature: f("fluxdl.exe.sig", 129),
             })),
             "settings_extension_fr" => self.defile = Some(300.0),
             "video_formats_fr" => {

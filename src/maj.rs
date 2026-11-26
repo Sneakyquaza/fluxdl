@@ -1,6 +1,7 @@
 //! Mise à jour depuis les GitHub Releases de `Sneakyquaza/fluxdl` : dernière version lue sur
 //! un autre fil (lancement puis toutes les 6 h), `fluxdl.exe` téléchargé et vérifié (sha256) à
-//! côté de l'exécutable, fichiers échangés (Windows permet de renommer l'exe lancé), relance
+//! côté de l'exécutable, signature Ed25519 vérifiée (clé publique figée ici : un compte
+//! GitHub compromis ne suffit pas à pousser un exe), fichiers échangés (Windows permet de renommer l'exe lancé), relance
 //! après la fermeture propre. Jamais d'installation sans un clic. Linux : annonce seulement.
 
 use crate::github::{self, suffixe, Erreur, Fichier};
@@ -13,6 +14,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEPOT: &str = "Sneakyquaza/fluxdl";
 pub const PAGE_RELEASES: &str = "https://github.com/Sneakyquaza/fluxdl/releases/latest";
 const NOM_EXE: &str = "fluxdl.exe";
+/// Clé publique Ed25519 des releases (clé privée hors du dépôt ; `examples/signer.rs`).
+const CLE_PUBLIQUE: &str = "0f1e4a29d6fa9ac9a0b5689df2767a0903946cfaeb22e78dd3dd2fd15e52afb8";
 /// Remplacement de l'exe lancé : Windows seulement (les releases ne publient que l'exe Windows).
 pub const AUTO: bool = cfg!(windows);
 
@@ -22,6 +25,8 @@ pub struct Annonce {
     pub version: String,
     pub exe: Fichier,
     pub sha256: Fichier,
+    /// `fluxdl.exe.sig` : signature de « fluxdl.exe VERSION SHA256 ».
+    pub signature: Fichier,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -105,6 +110,11 @@ impl Maj {
             let res = github::texte(&a.sha256.browser_download_url)
                 .and_then(|t| github::empreinte(&t, NOM_EXE))
                 .and_then(|sha| {
+                    let sig = github::texte(&a.signature.browser_download_url)?;
+                    verifier(&a.version, &sha, &sig, CLE_PUBLIQUE)?;
+                    Ok(sha)
+                })
+                .and_then(|sha| {
                     github::telecharger(&a.exe, &sha, &nouveau, &non, |faits| {
                         // Interface réveillée à chaque pour cent reçu, pas à chaque bloc.
                         if faits - dernier > a.exe.size / 100 {
@@ -148,8 +158,12 @@ pub fn annonce(r: &github::Release) -> Result<Annonce, Erreur> {
     else {
         return Err("The latest release has no Windows executable.");
     };
-    if !github::url_permise(&exe.browser_download_url)
-        || !github::url_permise(&sha.browser_download_url)
+    let Some(sig) = r.fichier(&format!("{NOM_EXE}.sig")) else {
+        return Err("The latest release is not signed.");
+    };
+    if ![exe, sha, sig]
+        .iter()
+        .all(|f| github::url_permise(&f.browser_download_url))
     {
         return Err("Download link refused (outside GitHub).");
     }
@@ -157,7 +171,31 @@ pub fn annonce(r: &github::Release) -> Result<Annonce, Erreur> {
         version: r.tag_name.trim_start_matches('v').to_string(),
         exe: exe.clone(),
         sha256: sha.clone(),
+        signature: sig.clone(),
     })
+}
+
+/// Signature Ed25519 (hexadécimal) de « fluxdl.exe VERSION SHA256 » par la clé `cle` (hex).
+fn verifier(version: &str, sha: &str, sig: &str, cle: &str) -> Result<(), Erreur> {
+    let de_hex = |s: &str| -> Option<Vec<u8>> {
+        let s = s.trim();
+        s.len()
+            .is_multiple_of(2)
+            .then(|| {
+                (0..s.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+                    .collect()
+            })
+            .flatten()
+    };
+    let (Some(sig), Some(cle)) = (de_hex(sig), de_hex(cle)) else {
+        return Err("Bad signature: update refused.");
+    };
+    let message = format!("{NOM_EXE} {version} {}", sha.to_ascii_lowercase());
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, cle)
+        .verify(message.as_bytes(), &sig)
+        .map_err(|_| "Bad signature: update refused.")
 }
 
 /// Argument de la relance : la nouvelle version attend que l'ancienne rende le verrou.
@@ -222,6 +260,8 @@ mod tests {
                "https://github.com/Sneakyquaza/fluxdl/releases/download/v0.2.0/fluxdl.exe.sha256"},
               {"name":"fluxdl-linux","size":11,"browser_download_url":
                "https://github.com/Sneakyquaza/fluxdl/releases/download/v0.2.0/fluxdl-linux"},
+              {"name":"fluxdl.exe.sig","size":129,"browser_download_url":
+               "https://github.com/Sneakyquaza/fluxdl/releases/download/v0.2.0/fluxdl.exe.sig"},
               {"name":"fluxdl.exe","size":12345678,"browser_download_url":
                "https://github.com/Sneakyquaza/fluxdl/releases/download/v0.2.0/fluxdl.exe"}]}"#;
         let r: github::Release = serde_json::from_slice(json).unwrap();
@@ -245,6 +285,31 @@ mod tests {
         );
         let r: github::Release = serde_json::from_str(&pirate).unwrap();
         assert!(annonce(&r).is_err());
+        // Release non signée : refusée.
+        let sans_sig = String::from_utf8_lossy(json).replace("fluxdl.exe.sig\"", "y\"");
+        let r: github::Release = serde_json::from_str(&sans_sig).unwrap();
+        assert_eq!(annonce(&r), Err("The latest release is not signed."));
+    }
+
+    /// Audit M13 : seule la clé figée dans l'exe peut signer une mise à jour.
+    #[test]
+    fn signature_des_releases() {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let pk8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let k = Ed25519KeyPair::from_pkcs8(pk8.as_ref()).unwrap();
+        let cle = dlcore::engine::hex(k.public_key().as_ref());
+        let sha = "ab".repeat(32);
+        let sig = dlcore::engine::hex(
+            k.sign(format!("fluxdl.exe 0.3.0 {sha}").as_bytes())
+                .as_ref(),
+        );
+        assert_eq!(verifier("0.3.0", &sha, &sig, &cle), Ok(()));
+        // Autre version, autre empreinte, signature abîmée, autre clé (dont celle de l'appli).
+        assert!(verifier("0.3.1", &sha, &sig, &cle).is_err());
+        assert!(verifier("0.3.0", &"cd".repeat(32), &sig, &cle).is_err());
+        assert!(verifier("0.3.0", &sha, &sig.replace('a', "b"), &cle).is_err());
+        assert!(verifier("0.3.0", &sha, "zz", &cle).is_err());
+        assert!(verifier("0.3.0", &sha, &sig, CLE_PUBLIQUE).is_err());
     }
 
     #[test]

@@ -595,6 +595,31 @@ pub fn mettre_a_jour_ytdlp() {
 mod tests {
     use super::*;
 
+    /// Audit H1 : jamais de fichier de config ni de greffon lu (un `yt-dlp.conf` déposé dans
+    /// Téléchargements contenait `--exec`) ; dossier courant sûr.
+    #[test]
+    fn sans_config_ni_greffon() {
+        let notre = dossier_outils().join(format!("yt-dlp{EXE}"));
+        for (yt, greffons) in [(notre, true), (PathBuf::from("/usr/bin/yt-dlp"), false)] {
+            let o = Outils {
+                ytdlp: Some(yt.clone()),
+                ffmpeg: None,
+            };
+            let mut c = commande(&yt);
+            args_communs(&mut c, &o);
+            let a: Vec<_> = c
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(a.first().map(String::as_str), Some("--ignore-config"));
+            assert_eq!(a.iter().any(|x| x == "--no-plugin-dirs"), greffons);
+            assert_eq!(
+                c.get_current_dir(),
+                Some(crate::store::data_dir().as_path())
+            );
+        }
+    }
+
     /// Sortie réelle de `yt-dlp -J` (Wikimedia Commons, Big Buck Bunny 4K, 2026-11-26) :
     /// formats image + son ensemble, une source sans hauteur, une taille négative (mpd).
     const COMMONS: &[u8] = include_bytes!("../tests/fixtures/ytdlp_commons.json");

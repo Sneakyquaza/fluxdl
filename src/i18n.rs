@@ -4,6 +4,14 @@ use crate::store::Lang;
 
 const FR: &[(&str, &str)] = &[
     (
+        "The latest release is not signed.",
+        "La dernière version publiée n'est pas signée.",
+    ),
+    (
+        "Bad signature: update refused.",
+        "Signature invalide : mise à jour refusée.",
+    ),
+    (
         "Waiting: it starts as soon as one of the running downloads finishes.",
         "En attente : il démarre dès qu'un des téléchargements en cours se termine.",
     ),

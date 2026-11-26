@@ -1178,13 +1178,21 @@ pub fn bouton_secondaire(ui: &mut Ui, t: &str, i: Option<Icone>, taille: Vec2) -
     rep
 }
 
-/// Anneau bleu autour d'un élément qui a le focus clavier.
+/// Anneau autour d'un élément qui a le focus clavier : blanc puis bleu, visible sur le verre
+/// comme sur un bouton bleu ou vert.
 fn anneau_focus(ui: &Ui, rep: &Response, r: Rect, rayon: f32) {
     if rep.has_focus() {
-        ui.painter().rect_stroke(
-            r.expand(2.0),
-            rayon + 2.0,
-            Stroke::new(1.5, ACCENT),
+        let p = ui.painter();
+        p.rect_stroke(
+            r.expand(1.0),
+            rayon + 1.0,
+            Stroke::new(1.5, Color32::WHITE),
+            StrokeKind::Outside,
+        );
+        p.rect_stroke(
+            r.expand(2.5),
+            rayon + 2.5,
+            Stroke::new(2.0, ACCENT),
             StrokeKind::Outside,
         );
     }
@@ -1414,6 +1422,7 @@ pub fn coche(ui: &mut Ui, on: &mut bool, t: &str, droite: &str) -> Response {
         rep.mark_changed();
     }
     let h = survol(ui, &rep);
+    anneau_focus(ui, &rep, r, 6.0);
     let p = ui.painter();
     selection(p, r, 6.0, 0.45 * h);
     let b = Rect::from_center_size(pos2(r.left() + 14.0, r.center().y), Vec2::splat(16.0));

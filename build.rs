@@ -97,8 +97,29 @@ fn main() {
     let ico = sortie.join("fluxdl.ico");
     ecrire_ico(&ico);
     let ico = ico.display().to_string().replace('\\', "/");
+    // Manifeste : sans élévation, Windows 10/11, chemins longs (> 260 caractères).
+    let manifeste = sortie.join("fluxdl.manifest");
+    std::fs::write(
+        &manifeste,
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security><requestedPrivileges><requestedExecutionLevel level="asInvoker" uiAccess="false"/></requestedPrivileges></security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application><supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/></application>
+  </compatibility>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings><longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware></windowsSettings>
+  </application>
+</assembly>
+"#,
+    )
+    .expect("fluxdl.manifest");
+    let manifeste = manifeste.display().to_string().replace('\\', "/");
     let texte = format!(
         "1 ICON \"{ico}\"\n\
+         1 24 \"{manifeste}\"\n\
          1 VERSIONINFO\nFILEVERSION {num}\nPRODUCTVERSION {num}\nBEGIN\n\
          BLOCK \"StringFileInfo\"\nBEGIN\nBLOCK \"040904b0\"\nBEGIN\n\
          VALUE \"CompanyName\", \"Sneakyquaza\"\n\

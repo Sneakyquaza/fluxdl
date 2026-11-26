@@ -121,13 +121,27 @@
     @media (prefers-reduced-motion: reduce) { button { transition: none; transform: none; } }
   `;
 
+  const HOST_CSS =
+    "all:initial;position:absolute;z-index:2147483647;top:0;left:0;display:none;pointer-events:auto;";
+
+  // Contre le détournement de clic : le bouton doit être vraiment visible (la page peut
+  // modifier le style de l'hôte, ou rendre la page entière presque transparente) et être
+  // l'élément sous le pointeur.
+  function reallyVisible(e) {
+    if (document.elementFromPoint(e.clientX, e.clientY) !== host) return false;
+    for (let el = host; el; el = el.parentElement) {
+      const cs = getComputedStyle(el);
+      if (Number(cs.opacity) < 0.9 || cs.visibility !== "visible" || (cs.filter && cs.filter !== "none")) return false;
+    }
+    return true;
+  }
+
   function ensureHost() {
     if (host?.isConnected) return;
     host = document.createElement("fluxdl-float");
     // Styles en ligne sur l'hôte : le CSS du site ne peut pas l'atteindre dans l'ombre,
     // et l'hôte hors flux (absolute) ne décale rien.
-    host.style.cssText =
-      "all:initial;position:absolute;z-index:2147483647;top:0;left:0;display:none;pointer-events:auto;";
+    host.style.cssText = HOST_CSS;
     const root = host.attachShadow({ mode: "closed" });
     const style = document.createElement("style");
     style.textContent = CSS;
@@ -153,6 +167,8 @@
     clearTimeout(hideTimer);
     if (current && current.el === target.el && current.url === target.url && host?.style.display !== "none") return;
     ensureHost();
+    // Style de l'hôte réappliqué à chaque affichage (la page a pu le changer).
+    host.style.cssText = HOST_CSS;
     current = target;
     clearTimeout(resetTimer);
     btn.className = "";
@@ -213,6 +229,7 @@
     e.preventDefault();
     e.stopPropagation();
     if (!e.isTrusted || !current || btn.disabled) return; // clic simulé par la page : ignoré
+    if (!reallyVisible(e)) return;
     const url = current.url;
     btn.disabled = true;
     setLabel("…", "fluxdl");
