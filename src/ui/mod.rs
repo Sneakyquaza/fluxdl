@@ -2,9 +2,13 @@
 //! comparatif, réglages.
 
 mod draw;
+mod fenetres;
 
 use crate::i18n::t;
-use crate::store::{self, Entry, Lang, Settings, Status};
+use crate::maj::{self, Maj};
+use crate::serveur::{self, Demande};
+use crate::store::{self, Entry, Kind, Lang, Settings, Status};
+use crate::{torrent, video};
 use dlcore::engine::{self, Control, Live, Options, Outcome, Segment, WorkerStat};
 use dlcore::APP_NAME;
 use draw::*;
@@ -85,6 +89,46 @@ impl Job {
     }
 }
 
+/// Résultat attendu d'un fil (infos vidéo, aperçu de torrent…).
+type Attente<T> = Option<Receiver<T>>;
+
+/// yt-dlp / ffmpeg à télécharger (Windows) : lecture des releases, accord, installation.
+enum EtatOutils {
+    Lecture(Receiver<Result<video::Paquet, &'static str>>),
+    Pret(video::Paquet),
+    /// Reçus / total, fin, arrêt demandé.
+    Installation(
+        Arc<Mutex<(u64, u64)>>,
+        Receiver<Result<(), &'static str>>,
+        Arc<AtomicBool>,
+    ),
+    Erreur(&'static str),
+}
+
+/// Fenêtre modale par-dessus l'appli.
+enum Modale {
+    /// Mise à jour demandée pendant des téléchargements : confirmation.
+    MajActifs(usize),
+    /// Choix du format d'une vidéo (formats lus par yt-dlp dans un fil).
+    Video {
+        url: String,
+        rx: Attente<Result<video::Infos, String>>,
+        infos: Option<Result<video::Infos, String>>,
+        choix: video::Qualite,
+    },
+    /// Outils vidéo manquants ; `url` : vidéo à ouvrir ensuite (vide depuis les réglages).
+    Outils { url: String, etat: EtatOutils },
+    /// Fichiers d'un torrent (lien magnet résolu par les pairs dans un fil).
+    Torrent {
+        source: String,
+        rx: Attente<Result<torrent::Apercu, String>>,
+        apercu: Option<Result<torrent::Apercu, String>>,
+        coches: Vec<bool>,
+    },
+    /// Premier torrent (Windows) : ouvrir les liens magnet et .torrent avec l'appli ?
+    Association,
+}
+
 /// Phase du comparatif (1 = une connexion, 2 = N) et son contrôle.
 type Phase = (u8, Arc<Control>);
 
@@ -124,10 +168,30 @@ pub struct App {
     paste_wait: f64,
     /// Sélecteur de dossier ouvert dans un fil.
     picker: Option<Receiver<String>>,
+    /// Sélecteur de fichier .torrent ouvert dans un fil.
+    picker_torrent: Option<Receiver<String>>,
+    maj: Maj,
+    /// Prochaine recherche silencieuse de mise à jour (toutes les 6 h).
+    maj_prochaine: f64,
+    /// Version écartée par « Plus tard » (bulle cachée jusqu'à la suivante).
+    maj_cachee: Option<String>,
+    /// Installer et redémarrer dès que la nouvelle version est prête (accord donné).
+    maj_auto: bool,
+    /// Exécutable à relancer après la fermeture (mise à jour installée).
+    relance: Option<PathBuf>,
+    modale: Option<Modale>,
+    /// Liens envoyés par l'extension (serveur local) ou par une 2e instance.
+    demandes: Option<Receiver<Demande>>,
+    jeton: Arc<Mutex<String>>,
+    serveur_err: Option<String>,
+    outils: video::Outils,
+    /// Captures : défilement imposé de la page des réglages.
+    defile: Option<f32>,
 }
 
 impl App {
-    pub fn new(ctx: &egui::Context, capture: Option<PathBuf>) -> Self {
+    /// `ouvrir` : lien magnet ou .torrent passé en ligne de commande (association Windows).
+    pub fn new(ctx: &egui::Context, capture: Option<PathBuf>, ouvrir: Option<String>) -> Self {
         let textures = installer_style(ctx);
         let logo = ctx.load_texture(
             "logo",
@@ -159,6 +223,21 @@ impl App {
             born: HashMap::new(),
             paste_wait: 0.0,
             picker: None,
+            picker_torrent: None,
+            maj: Maj::new({
+                let c = ctx.clone();
+                move || c.request_repaint()
+            }),
+            maj_prochaine: 3.0,
+            maj_cachee: None,
+            maj_auto: false,
+            relance: None,
+            modale: None,
+            demandes: None,
+            jeton: Arc::new(Mutex::new(String::new())),
+            serveur_err: None,
+            outils: video::Outils::default(),
+            defile: None,
         };
         if let Some(d) = capture {
             app.demo();
@@ -176,50 +255,204 @@ impl App {
             }
         }
         app.next_id = app.entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+        maj::nettoyer();
+        app.outils = video::trouver();
+        // yt-dlp suit les changements des sites : notre copie se met à jour chaque semaine.
+        let maintenant = secondes();
+        if maintenant.saturating_sub(app.settings.ytdlp_updated) > 7 * 86_400 {
+            video::mettre_a_jour_ytdlp();
+            app.settings.ytdlp_updated = maintenant;
+        }
+        if app.settings.token.is_empty() {
+            app.settings.token = serveur::nouveau_jeton();
+        }
+        app.lancer_serveur(ctx);
+        if let Some(u) = ouvrir {
+            app.ajouter(u, None, None, true);
+        }
         app
     }
 
-    fn add(&mut self) {
-        let url = self.url.trim().to_string();
+    /// Serveur local de l'extension ; serveur coupé = jeton vide (tout est refusé).
+    fn lancer_serveur(&mut self, ctx: &egui::Context) {
+        self.sync_jeton();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let c = ctx.clone();
+        match serveur::lancer(self.settings.port, self.jeton.clone(), tx, move || {
+            c.request_repaint()
+        }) {
+            Ok(_) => self.demandes = Some(rx),
+            Err(e) => self.serveur_err = Some(e.to_string()),
+        }
+    }
+
+    fn sync_jeton(&self) {
+        *self.jeton.lock().unwrap_or_else(|e| e.into_inner()) = if self.settings.server {
+            self.settings.token.clone()
+        } else {
+            String::new()
+        };
+    }
+
+    /// Aiguillage d'un lien : magnet / .torrent → choix des fichiers, site vidéo → choix du
+    /// format, sinon téléchargement multi-connexions. `local` : chemin de .torrent permis.
+    fn ajouter(
+        &mut self,
+        url: String,
+        referrer: Option<String>,
+        cookies: Option<String>,
+        local: bool,
+    ) {
+        let url = url.trim().to_string();
+        if url.starts_with("magnet:") {
+            return self.ouvrir_torrent(url, None);
+        }
+        if local && url.to_ascii_lowercase().ends_with(".torrent") {
+            let nom = Path::new(&url)
+                .file_name()
+                .map_or(url.clone(), |n| n.to_string_lossy().into_owned());
+            if let Ok(o) = std::fs::read(&url) {
+                self.ouvrir_torrent(nom, Some(o));
+            }
+            return;
+        }
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             return;
         }
-        let sha = self.sha.trim().to_string();
+        if video::site_video(&url) {
+            return self.ouvrir_video(url);
+        }
+        let sha = std::mem::take(&mut self.sha).trim().to_string();
+        let e = self.nouvelle(url, Kind::Http);
+        e.sha256 = (!sha.is_empty()).then_some(sha);
+        e.referrer = referrer;
+        e.cookies = cookies;
+    }
+
+    /// Ajoute une entrée en attente, choisie dans la liste.
+    fn nouvelle(&mut self, url: String, kind: Kind) -> &mut Entry {
         self.entries.push(Entry {
             id: self.next_id,
             url,
             dir: self.settings.folder.clone(),
             name: None,
-            sha256: (!sha.is_empty()).then_some(sha),
+            sha256: None,
             connections: self.settings.connections,
             status: Status::Queued,
             size: None,
             done: 0,
+            kind,
+            referrer: None,
+            cookies: None,
         });
         self.selected = Some(self.next_id);
         self.born.insert(self.next_id, self.now);
         self.next_id += 1;
-        self.url.clear();
-        self.sha.clear();
+        self.tab = Tab::Downloads;
+        self.entries.last_mut().expect("entrée ajoutée")
+    }
+
+    /// Vidéo : formats lus par yt-dlp ; outils manquants → accord (Windows) ou message.
+    fn ouvrir_video(&mut self, url: String) {
+        if cfg!(windows) && !self.outils.complets() {
+            let o = self.outils.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(video::preparer(&o));
+            });
+            self.modale = Some(Modale::Outils {
+                url,
+                etat: EtatOutils::Lecture(rx),
+            });
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let o = self.outils.clone();
+        let u = url.clone();
+        std::thread::spawn(move || {
+            let r = if o.ytdlp.is_none() {
+                Err(video::ABSENT.to_string())
+            } else {
+                video::lire_infos(&o, &u)
+            };
+            let _ = tx.send(r);
+        });
+        self.modale = Some(Modale::Video {
+            url,
+            rx: Some(rx),
+            infos: None,
+            choix: video::Qualite::Best,
+        });
+    }
+
+    /// Torrent : liste des fichiers lue dans un fil (un lien magnet interroge les pairs).
+    fn ouvrir_torrent(&mut self, source: String, octets: Option<Vec<u8>>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let s = source.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(torrent::moteur().and_then(|m| m.apercu(&s, octets)));
+        });
+        self.modale = Some(Modale::Torrent {
+            source,
+            rx: Some(rx),
+            apercu: None,
+            coches: Vec::new(),
+        });
+    }
+
+    fn add(&mut self) {
+        let url = std::mem::take(&mut self.url);
+        self.ajouter(url, None, None, true);
     }
 
     fn start(&mut self, i: usize) {
         let e = &mut self.entries[i];
         e.status = Status::Running;
         let ctl = Arc::new(Control::default());
-        let opts = Options {
-            connections: e.connections,
-            speed_limit: (self.settings.speed_limit_mb.max(0.0) * 1e6) as u64,
-            expected_sha256: e.sha256.clone(),
-            ..Default::default()
-        };
         let (url, dir, name, c) = (
             e.url.clone(),
             PathBuf::from(&e.dir),
             e.name.clone(),
             ctl.clone(),
         );
-        let h = std::thread::spawn(move || engine::run(&url, &dir, name.as_deref(), &opts, &c));
+        let h = match e.kind.clone() {
+            Kind::Http => {
+                let mut headers = Vec::new();
+                if let Some(r) = &e.referrer {
+                    headers.push(("Referer".to_string(), r.clone()));
+                }
+                if let Some(k) = &e.cookies {
+                    headers.push(("Cookie".to_string(), k.clone()));
+                }
+                let opts = Options {
+                    connections: e.connections,
+                    speed_limit: (self.settings.speed_limit_mb.max(0.0) * 1e6) as u64,
+                    expected_sha256: e.sha256.clone(),
+                    headers,
+                    ..Default::default()
+                };
+                std::thread::spawn(move || engine::run(&url, &dir, name.as_deref(), &opts, &c))
+            }
+            Kind::Video { quality, estimate } => {
+                let o = self.outils.clone();
+                std::thread::spawn(move || {
+                    video::telecharger(&o, &url, &dir, quality, estimate, &c)
+                })
+            }
+            Kind::Torrent {
+                hash,
+                files,
+                started,
+            } => {
+                let partage = torrent::Partage {
+                    ratio: self.settings.seed_ratio,
+                };
+                std::thread::spawn(move || {
+                    let o = std::fs::read(torrent::garde(&hash)).map_err(|e| e.to_string())?;
+                    torrent::moteur()?.telecharger(o, &dir, files, started, partage, None, &c)
+                })
+            }
+        };
         self.jobs.insert(e.id, Job::new(ctl, Some(h)));
     }
 
@@ -236,6 +469,10 @@ impl App {
             }
             e.size = l.size.or(e.size);
             e.done = l.done();
+            // Le torrent a démarré : ses fichiers sont à nous, la reprise peut les réécrire.
+            if let Kind::Torrent { started, .. } = &mut e.kind {
+                *started |= l.size.is_some();
+            }
             if !j.handle.as_ref().is_some_and(|h| h.is_finished()) {
                 continue;
             }
@@ -247,7 +484,7 @@ impl App {
             e.status = match r {
                 Some(Ok(Outcome::Done(_))) => Status::Done,
                 Some(Ok(Outcome::Stopped)) if j.cancel => {
-                    delete_parts(e);
+                    delete_parts(e, true);
                     Status::Canceled
                 }
                 Some(Ok(Outcome::Stopped)) => Status::Paused,
@@ -255,10 +492,11 @@ impl App {
                 None => e.status.clone(),
             };
         }
+        // Un torrent qui partage après la fin ne prend pas de place dans la file.
         let mut actifs = self
             .entries
             .iter()
-            .filter(|e| e.status == Status::Running)
+            .filter(|e| e.status == Status::Running && !self.partage(e.id))
             .count();
         for i in 0..self.entries.len() {
             if actifs < MAX_ACTIFS && self.entries[i].status == Status::Queued {
@@ -266,6 +504,11 @@ impl App {
                 actifs += 1;
             }
         }
+    }
+
+    /// Torrent fini qui partage encore.
+    fn partage(&self, id: u64) -> bool {
+        self.jobs.get(&id).is_some_and(|j| j.ctl.lock().seeding)
     }
 
     fn persist(&mut self, now: f64) {
@@ -601,10 +844,25 @@ impl App {
             } else {
                 -10.0
             };
-            let sha = Rect::from_min_size(
-                pos2(st.left() - 10.0 - lc - 12.0 - 132.0, r.top()),
-                vec2(132.0, 30.0),
+            // Ouvrir un .torrent : bouton rond à gauche de la somme de contrôle.
+            let bt = Rect::from_min_size(
+                pos2(st.left() - 10.0 - lc - 12.0 - 30.0, r.top()),
+                vec2(30.0, 30.0),
             );
+            if bouton_icone_ici(
+                ui,
+                bt,
+                egui::Id::unique("ouvrir-torrent"),
+                Icone::Aimant,
+                t(l, "Open a .torrent file"),
+            )
+            .clicked()
+                && self.picker_torrent.is_none()
+            {
+                self.picker_torrent = Some(choose_torrent(&self.settings.folder));
+            }
+            let sha =
+                Rect::from_min_size(pos2(bt.left() - 8.0 - 112.0, r.top()), vec2(112.0, 30.0));
             champ(ui, sha, &mut self.sha, "SHA-256", None, regulier(12.5))
                 .on_hover_text(t(l, "Optional checksum, verified after download."));
             // Dossier : clic = sélecteur natif.
@@ -675,7 +933,7 @@ impl App {
     fn entry_card(&self, ui: &mut Ui, e: &Entry) -> Option<Act> {
         let l = self.settings.lang;
         let job = self.jobs.get(&e.id);
-        let (etat, ce) = self.status_label(&e.status);
+        let (etat, ce) = self.status_label(e);
         let mut action = None;
         let apparition = self
             .born
@@ -699,13 +957,17 @@ impl App {
             let nom = e.name.clone().unwrap_or_else(|| e.url.clone());
             let tuile =
                 Rect::from_min_size(pos2(r.left() + 16.0, r.top() + 16.0), Vec2::splat(40.0));
-            tuile_fichier(&p, tuile, TypeFichier::de(&nom));
+            tuile_fichier(&p, tuile, type_de(e, &nom));
             let (x0, x1) = (tuile.right() + 14.0, r.right() - 16.0);
-            let actes: &[(Icone, &str, Act)] = match e.status {
+            let actes: &[(Icone, &str, Act)] = match &e.status {
                 Status::Running | Status::Queued => &[
                     (Icone::Pause, "Pause", Act::Pause),
                     (Icone::Dossier, "Open folder", Act::Folder),
                     (Icone::Fermer, "Cancel", Act::Cancel),
+                ],
+                Status::Failed(m) if m == engine::ERR_PAGE => &[
+                    (Icone::Lecture, "Try as video", Act::Video),
+                    (Icone::Fermer, "Remove from list", Act::Remove),
                 ],
                 Status::Paused | Status::Failed(_) => &[
                     (Icone::Lecture, "Resume", Act::Resume),
@@ -745,7 +1007,7 @@ impl App {
             let ym = r.top() + 66.0;
             let pr = pastille(ui, pos2(x0, ym), etat, ce);
             let gauche = match (&e.status, e.size) {
-                (Status::Failed(m), _) => m.clone(),
+                (Status::Failed(m), _) => crate::i18n::tr(l, m).to_string(),
                 (_, Some(s)) if e.status == Status::Done => octets(s),
                 // En cours, le pourcentage cède la place au débit et au temps restant.
                 (Status::Running, Some(s)) => format!("{} / {}", octets(e.done.min(s)), octets(s)),
@@ -764,7 +1026,32 @@ impl App {
             };
             let mut xd = x1;
             if let Some(j) = job.filter(|_| e.status == Status::Running) {
-                if let (Some(s), true) = (e.size, j.speed > 1.0) {
+                let lv = j.ctl.lock();
+                // Torrent : pairs et envoi en plus.
+                if matches!(e.kind, Kind::Torrent { .. }) {
+                    let pairs = format!("{} {}", lv.peers, compte(l, lv.peers as usize, "peers"));
+                    xd -= texte(
+                        ui,
+                        pos2(xd, ym),
+                        Align2::RIGHT_CENTER,
+                        &pairs,
+                        regulier(12.5),
+                        TEXTE3,
+                    ) + 14.0;
+                    let up = format!("↑ {}/s", octets(lv.up_speed as u64));
+                    xd -= texte(
+                        ui,
+                        pos2(xd, ym),
+                        Align2::RIGHT_CENTER,
+                        &up,
+                        regulier(12.5),
+                        TEXTE3,
+                    ) + 14.0;
+                }
+                drop(lv);
+                // Torrent : pas de temps restant (la place va aux pairs et à l'envoi).
+                let eta = matches!(e.kind, Kind::Http | Kind::Video { .. });
+                if let (Some(s), true, true) = (e.size, j.speed > 1.0, eta) {
                     let eta = format!(
                         "{} {}",
                         duree((s - e.done.min(s)) as f64 / j.speed),
@@ -797,9 +1084,12 @@ impl App {
         action
     }
 
-    fn status_label(&self, s: &Status) -> (&'static str, Color32) {
+    fn status_label(&self, e: &Entry) -> (&'static str, Color32) {
         let l = self.settings.lang;
-        match s {
+        if e.status == Status::Running && self.partage(e.id) {
+            return (t(l, "Seeding"), SUCCES);
+        }
+        match &e.status {
             Status::Queued => (t(l, "Queued"), TEXTE2),
             Status::Running => (t(l, "Downloading"), ACCENT),
             Status::Paused => (t(l, "Paused"), ATTENTION),
@@ -814,6 +1104,7 @@ impl App {
         match a {
             Act::Select => self.selected = Some(id),
             Act::Folder => open_folder(Path::new(&self.entries[i].dir)),
+            // Un torrent qui partage s'arrête « fini » (voir torrent::telecharger).
             Act::Pause => match self.jobs.get(&id).filter(|j| j.handle.is_some()) {
                 Some(j) => j.ctl.request_stop(),
                 None => self.entries[i].status = Status::Paused,
@@ -825,11 +1116,17 @@ impl App {
                     j.ctl.request_stop();
                 }
                 None => {
-                    delete_parts(&self.entries[i]);
+                    delete_parts(&self.entries[i], true);
                     self.entries[i].status = Status::Canceled;
                 }
             },
+            Act::Video => {
+                let url = self.entries.remove(i).url;
+                self.jobs.remove(&id);
+                self.ouvrir_video(url);
+            }
             Act::Remove => {
+                delete_parts(&self.entries[i], false);
                 self.entries.remove(i);
                 self.born.remove(&id);
                 self.jobs.remove(&id);
@@ -897,21 +1194,24 @@ impl App {
         let nom = e.name.clone().unwrap_or_else(|| e.url.clone());
         let (r, _) = ui.allocate_exact_size(vec2(w, 46.0), Sense::hover());
         let tuile = Rect::from_min_size(r.min, Vec2::splat(46.0));
-        tuile_fichier(ui.painter(), tuile, TypeFichier::de(&nom));
+        tuile_fichier(ui.painter(), tuile, type_de(e, &nom));
         let x0 = tuile.right() + 14.0;
         let g = ligne(ui, nom, demi(16.5), TEXTE, r.right() - x0);
         ui.painter()
             .galley(pos2(x0, r.top() + 12.0 - g.size().y / 2.0 + 1.0), g, TEXTE);
-        let (etat, ce) = self.status_label(&e.status);
+        let (etat, ce) = self.status_label(e);
         let pr = pastille(ui, pos2(x0, r.top() + 35.0), etat, ce);
-        let hote = e
-            .url
-            .split("://")
-            .nth(1)
-            .unwrap_or(&e.url)
-            .split('/')
-            .next()
-            .unwrap_or("");
+        let hote = if matches!(e.kind, Kind::Torrent { .. }) {
+            "BitTorrent"
+        } else {
+            e.url
+                .split("://")
+                .nth(1)
+                .unwrap_or(&e.url)
+                .split('/')
+                .next()
+                .unwrap_or("")
+        };
         let g = ligne(
             ui,
             hote,
@@ -941,7 +1241,7 @@ impl App {
         let avis: Vec<&str> = [
             (lv.restarted, "Remote file changed: restarted from zero."),
             (
-                !lv.ranges && e.status == Status::Running,
+                !lv.ranges && e.status == Status::Running && e.kind == Kind::Http,
                 "Server refuses ranges: 1 connection.",
             ),
         ]
@@ -1016,6 +1316,16 @@ impl App {
             }
         }
         ui.add_space(22.0);
+        if matches!(e.kind, Kind::Torrent { .. }) {
+            return self.detail_torrent(ui, e, j, &lv);
+        }
+        if matches!(e.kind, Kind::Video { .. }) {
+            self.section(ui, t(l, "Progress"), t(l, "downloaded by yt-dlp"));
+            ui.add_space(4.0);
+            carte_fichier(ui, &lv, 12.0);
+            ui.add_space(20.0);
+            return self.detail_courbe(ui, e, j);
+        }
         let rs = self.section(ui, t(l, "File map"), t(l, "stolen range"));
         // Légende : le repère ▾ dessiné comme dans la carte.
         let lg = ui
@@ -1066,6 +1376,12 @@ impl App {
                 )
             });
         ui.add_space(20.0);
+        self.detail_courbe(ui, e, j);
+    }
+
+    /// Courbe du débit, en bas du panneau de détail.
+    fn detail_courbe(&self, ui: &mut Ui, e: &Entry, j: &Job) {
+        let l = self.settings.lang;
         let h: Vec<f32> = j.history.iter().copied().collect();
         let pic = h.iter().copied().fold(0.0, f32::max);
         self.section(
@@ -1083,6 +1399,50 @@ impl App {
             max,
             (ui.available_height() - 4.0).clamp(70.0, 200.0),
         );
+    }
+
+    /// Torrent : carte des pièces (à la place des connexions), pairs, envoi, ratio.
+    fn detail_torrent(&self, ui: &mut Ui, e: &Entry, j: &Job, lv: &Live) {
+        let l = self.settings.lang;
+        let n = lv.pieces.len();
+        self.section(ui, t(l, "Pieces"), &format!("{n} {}", t(l, "blocks")));
+        ui.add_space(4.0);
+        carte_pieces(ui, &lv.pieces, 16.0);
+        ui.add_space(22.0);
+        self.section(
+            ui,
+            t(l, "Peers"),
+            if lv.seeding { t(l, "Seeding") } else { "" },
+        );
+        ui.add_space(8.0);
+        let ratio = lv.uploaded as f64 / lv.size.unwrap_or(0).max(1) as f64;
+        let lignes = [
+            (t(l, "Connected peers"), lv.peers.to_string()),
+            (t(l, "Upload"), format!("{}/s", octets(lv.up_speed as u64))),
+            (t(l, "Uploaded"), octets(lv.uploaded)),
+            (t(l, "Ratio"), format!("{ratio:.2}")),
+        ];
+        for (k, v) in lignes {
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
+            texte(
+                ui,
+                r.left_center(),
+                Align2::LEFT_CENTER,
+                k,
+                regulier(13.0),
+                TEXTE2,
+            );
+            texte(
+                ui,
+                r.right_center(),
+                Align2::RIGHT_CENTER,
+                &v,
+                demi(13.5),
+                TEXTE,
+            );
+        }
+        ui.add_space(16.0);
+        self.detail_courbe(ui, e, j);
     }
 
     fn benchmark(&mut self, ui: &mut Ui) {
@@ -1326,8 +1686,11 @@ impl App {
         ui.set_max_width(w);
         self.page_title(ui, t(l, "Settings"), None);
         ui.add_space(20.0);
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
+        let mut defile = egui::ScrollArea::vertical().auto_shrink([false, false]);
+        if let Some(y) = self.defile {
+            defile = defile.vertical_scroll_offset(y);
+        }
+        defile
             .show(ui, |ui| {
                 ui.set_max_width(w);
                 carte(ui, Margin::symmetric(20, 6), |ui| {
@@ -1386,6 +1749,7 @@ impl App {
                     );
                 });
                 ui.add_space(20.0);
+                self.reglages_v2(ui);
                 carte(ui, Margin::symmetric(20, 6), |ui| {
                     ui.set_width(ui.available_width());
                     titre_section(ui, t(l, "Interface"));
@@ -1455,25 +1819,85 @@ impl App {
         let f = *frame;
         let dir = dir.clone();
         // Assez d'images entre le changement de vue et la capture pour finir les animations.
-        let vues: [(u32, Tab, Lang, &str); 4] = [
-            (30, Tab::Downloads, Lang::En, "downloads"),
-            (60, Tab::Benchmark, Lang::En, "benchmark"),
-            (90, Tab::Settings, Lang::En, "settings"),
-            (120, Tab::Downloads, Lang::Fr, "downloads_fr"),
+        let vues: [(Tab, Lang, &str); 9] = [
+            (Tab::Downloads, Lang::En, "downloads"),
+            (Tab::Benchmark, Lang::En, "benchmark"),
+            (Tab::Settings, Lang::En, "settings"),
+            (Tab::Downloads, Lang::Fr, "downloads_fr"),
+            (Tab::Downloads, Lang::Fr, "update_banner_fr"),
+            (Tab::Settings, Lang::Fr, "settings_extension_fr"),
+            (Tab::Downloads, Lang::Fr, "video_formats_fr"),
+            (Tab::Downloads, Lang::Fr, "torrent_pieces_fr"),
+            (Tab::Downloads, Lang::Fr, "video_tools_fr"),
         ];
-        for (k, tab, lang, nom) in vues {
+        for (i, (tab, lang, nom)) in vues.into_iter().enumerate() {
+            let k = 30 * (i as u32 + 1);
             if f == k - 24 {
                 self.tab = tab;
                 self.settings.lang = lang;
+                self.demo_vue(nom);
             }
             if f == k {
                 ctx.send_viewport_cmd(screenshot(dir.join(format!("{nom}.png"))));
             }
         }
-        if f > 135 {
+        if f > 30 * vues.len() as u32 + 15 {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         ctx.request_repaint();
+    }
+
+    /// Mise en scène propre à une capture (bulle, fenêtre, sélection, défilement).
+    fn demo_vue(&mut self, nom: &str) {
+        self.modale = None;
+        self.defile = None;
+        self.maj.mettre(maj::Etat::Rien);
+        self.selected = Some(1);
+        let f = |nom: &str, size| crate::github::Fichier {
+            name: nom.into(),
+            browser_download_url: format!("https://github.com/x/{nom}"),
+            size,
+        };
+        match nom {
+            "update_banner_fr" => self.maj.mettre(maj::Etat::Dispo(maj::Annonce {
+                version: "0.3.0".into(),
+                exe: f("fluxdl.exe", 15_000_000),
+                sha256: f("fluxdl.exe.sha256", 80),
+            })),
+            "settings_extension_fr" => self.defile = Some(300.0),
+            "video_formats_fr" => {
+                let ch = |q, d, t| (q, d, Some(t));
+                self.modale = Some(Modale::Video {
+                    url: "https://www.youtube.com/watch?v=aqz-KE-bpKQ".into(),
+                    rx: None,
+                    infos: Some(Ok(video::Infos {
+                        titre: "Big Buck Bunny 60fps 4K - Official Blender Foundation Short Film"
+                            .into(),
+                        duree: Some(634.0),
+                        hauteur_max: 4320,
+                        choix: vec![
+                            ch(video::Qualite::Best, true, 2_431_000_000),
+                            ch(video::Qualite::P1080, true, 402_000_000),
+                            ch(video::Qualite::P720, true, 188_000_000),
+                            ch(video::Qualite::M4a, true, 10_300_000),
+                            ch(video::Qualite::Mp3, true, 10_300_000),
+                        ],
+                    })),
+                    choix: video::Qualite::P1080,
+                });
+            }
+            "torrent_pieces_fr" => self.selected = Some(5),
+            "video_tools_fr" => {
+                self.modale = Some(Modale::Outils {
+                    url: String::new(),
+                    etat: EtatOutils::Pret(video::Paquet {
+                        ytdlp: Some((f("yt-dlp.exe", 23_627_865), String::new())),
+                        ffmpeg: Some((f("ffmpeg.zip", 92_386_792), String::new())),
+                    }),
+                });
+            }
+            _ => {}
+        }
     }
 
     /// État de démonstration pour les captures.
@@ -1537,6 +1961,9 @@ impl App {
             status,
             size,
             done,
+            kind: Kind::Http,
+            referrer: None,
+            cookies: None,
         };
         self.entries = vec![
             entree(
@@ -1573,12 +2000,80 @@ impl App {
             ),
         ];
         self.jobs.insert(1, job);
+        // Torrent en cours : carte des pièces (reçues par paquets, comme en vrai).
+        let tt = 3_950 * mo;
+        let pieces: Vec<u8> = (0..torrent::CASES)
+            .map(|i| {
+                let x = i as f32;
+                let v = (x * 0.37).sin() + (x * 0.11).cos() + if i < 70 { 1.2 } else { -0.4 };
+                if v > 0.6 {
+                    255
+                } else if v > 0.1 {
+                    140
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let recu = (tt as f64 * pieces.iter().map(|&v| v as f64).sum::<f64>()
+            / (255.0 * pieces.len() as f64)) as u64;
+        let lt = Live {
+            file_name: Some("debian-13.2.0-amd64-DVD-1.iso".into()),
+            size: Some(tt),
+            segments: vec![Segment {
+                start: 0,
+                pos: recu,
+                end: tt,
+                worker: Some(0),
+                stolen: false,
+            }],
+            workers: vec![WorkerStat::default()],
+            peers: 37,
+            uploaded: 412 * mo,
+            up_speed: 1.8e6,
+            pieces,
+            ..Default::default()
+        };
+        let mut jt = Job::new(Arc::new(Control::with_live(lt)), None);
+        jt.speed = 24.6e6;
+        jt.history = (0..120)
+            .map(|i| job_speed_curve(i as f32) * 0.26e6)
+            .collect();
+        let mut tor = entree(
+            5,
+            "magnet:?xt=urn:btih:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+            Some("debian-13.2.0-amd64-DVD-1.iso"),
+            Status::Running,
+            Some(tt),
+            recu,
+        );
+        tor.kind = Kind::Torrent {
+            hash: "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c".into(),
+            files: None,
+            started: true,
+        };
+        let mut vid = entree(
+            6,
+            "https://www.youtube.com/watch?v=aqz-KE-bpKQ",
+            Some("Big Buck Bunny 60fps 4K"),
+            Status::Done,
+            Some(402 * mo),
+            402 * mo,
+        );
+        vid.kind = Kind::Video {
+            quality: video::Qualite::P1080,
+            estimate: Some(402 * mo),
+        };
+        self.entries.insert(1, tor);
+        self.entries.insert(3, vid);
+        self.jobs.insert(5, jt);
         self.selected = Some(1);
         self.bench.url = "https://proof.ovh.net/files/100Mb.dat".into();
         self.bench.result = Some(Ok((11.4e6, 86.9e6)));
         self.bench.shown = -10.0;
         self.settings.speed_limit_mb = 50.0;
-        self.next_id = 5;
+        self.settings.token = "3fa2c9d8e1b04f5a8c7d6e5f4a3b2c1d".into();
+        self.next_id = 7;
     }
 }
 
@@ -1591,6 +2086,8 @@ fn job_speed_curve(x: f32) -> f32 {
 #[derive(Clone, Copy)]
 enum Act {
     Select,
+    /// Lien de page web : réessayer avec yt-dlp.
+    Video,
     Folder,
     Pause,
     Resume,
@@ -1636,6 +2133,54 @@ impl eframe::App for App {
                 Err(TryRecvError::Empty) => {}
             }
         }
+        if let Some(rx) = &self.picker_torrent {
+            match rx.try_recv() {
+                Ok(f) => {
+                    self.picker_torrent = None;
+                    self.ajouter(f, None, None, true);
+                }
+                Err(TryRecvError::Disconnected) => self.picker_torrent = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        // Liens de l'extension ou d'une 2e instance (liens magnet, .torrent ouverts).
+        let recus: Vec<Demande> = self
+            .demandes
+            .as_ref()
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default();
+        for d in recus {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            self.ajouter(d.url, d.referrer, d.cookies, d.locale);
+        }
+        // .torrent glissés sur la fenêtre.
+        let poses: Vec<String> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().display().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        });
+        for f in poses {
+            self.ajouter(f, None, None, true);
+        }
+        if self.capture.is_none() {
+            if now >= self.maj_prochaine {
+                self.maj.chercher(true);
+                self.maj_prochaine = now + 6.0 * 3600.0;
+                ctx.request_repaint_after(Duration::from_secs(6 * 3600));
+            }
+            // Accord donné : nouvelle version prête → installée, fermeture propre, relance.
+            if self.maj_auto && matches!(self.maj.etat(), maj::Etat::Pret(..)) {
+                self.maj_auto = false;
+                if let Some(exe) = self.maj.installer() {
+                    self.relance = Some(exe);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        self.suivre_modale();
         self.capture_step(&ctx);
         let ecran = ctx.content_rect();
         fond(&ctx.layer_painter(egui::LayerId::background()), ecran);
@@ -1697,6 +2242,8 @@ impl eframe::App for App {
                 Tab::Benchmark => self.benchmark(ui),
                 Tab::Settings => self.settings_tab(ui),
             });
+        self.modale(&ctx);
+        self.bulle_maj(&ctx);
         self.persist(now);
         // Au repos, aucune image : on ne redessine que si quelque chose bouge ou télécharge
         // (les animations egui demandent elles-mêmes leurs images).
@@ -1706,7 +2253,13 @@ impl eframe::App for App {
             .any(|e| matches!(e.status, Status::Running | Status::Queued))
             || self.bench.handle.is_some()
             || self.picker.is_some()
-            || self.paste_wait > 0.0;
+            || self.picker_torrent.is_some()
+            || self.paste_wait > 0.0
+            || matches!(
+                self.maj.etat(),
+                maj::Etat::Recherche | maj::Etat::Telechargement(..)
+            )
+            || self.modale.is_some();
         if vivant {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
@@ -1731,16 +2284,48 @@ impl eframe::App for App {
         }
         store::save(QUEUE, &self.entries);
         store::save(SETTINGS, &self.settings);
+        if let Some(exe) = &self.relance {
+            maj::relancer(exe);
+        }
     }
 }
 
-/// Efface le `.part` et l'état d'un téléchargement annulé.
-fn delete_parts(e: &Entry) {
-    if let Some(n) = &e.name {
-        let cible = Path::new(&e.dir).join(n);
-        let _ = std::fs::remove_file(engine::part_path(&cible));
-        let _ = std::fs::remove_file(engine::state_path(&cible));
+/// Annulé (`annule`) : efface le `.part` et l'état d'un fichier HTTP, ou les fichiers
+/// partiels d'un torrent. Torrent retiré de la liste : sort de la session, fichiers gardés.
+/// raccourci : les `.part` de yt-dlp restent (noms choisis par yt-dlp) ; à faire si demandé.
+fn delete_parts(e: &Entry, annule: bool) {
+    match &e.kind {
+        Kind::Http if annule => {
+            if let Some(n) = &e.name {
+                let cible = Path::new(&e.dir).join(n);
+                let _ = std::fs::remove_file(engine::part_path(&cible));
+                let _ = std::fs::remove_file(engine::state_path(&cible));
+            }
+        }
+        Kind::Torrent { hash, .. } => {
+            if let Some(m) = torrent::lance() {
+                m.oublier(hash, annule && e.status != Status::Done);
+            }
+            let _ = std::fs::remove_file(torrent::garde(hash));
+        }
+        _ => {}
     }
+}
+
+/// Tuile d'une entrée : vidéo et torrent d'après leur sorte, sinon d'après l'extension.
+fn type_de(e: &Entry, nom: &str) -> TypeFichier {
+    match e.kind {
+        Kind::Video { .. } => TypeFichier::Video,
+        Kind::Torrent { .. } => TypeFichier::Torrent,
+        Kind::Http => TypeFichier::de(nom),
+    }
+}
+
+/// Secondes Unix.
+fn secondes() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn open_folder(d: &Path) {
@@ -1842,6 +2427,56 @@ fn choose_folder(depart: &str) -> Receiver<String> {
         }
     });
     rx
+}
+
+/// Sélecteur de fichier .torrent dans un fil.
+fn choose_torrent(depart: &str) -> Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let depart = depart.to_string();
+    std::thread::spawn(move || {
+        if let Some(f) = pick_torrent(&depart) {
+            let _ = tx.send(f);
+        }
+    });
+    rx
+}
+
+#[cfg(windows)]
+fn pick_torrent(depart: &str) -> Option<String> {
+    rfd::FileDialog::new()
+        .set_directory(depart)
+        .add_filter("Torrent", &["torrent"])
+        .pick_file()
+        .map(|p| p.display().to_string())
+}
+
+#[cfg(not(windows))]
+fn pick_torrent(depart: &str) -> Option<String> {
+    let essais: [(&str, Vec<String>); 2] = [
+        (
+            "zenity",
+            vec![
+                "--file-selection".into(),
+                "--file-filter=*.torrent".into(),
+                format!("--filename={depart}/"),
+            ],
+        ),
+        (
+            "kdialog",
+            vec![
+                "--getopenfilename".into(),
+                depart.into(),
+                "*.torrent".into(),
+            ],
+        ),
+    ];
+    for (prog, args) in essais {
+        if let Ok(o) = std::process::Command::new(prog).args(&args).output() {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            return (o.status.success() && !s.is_empty()).then_some(s);
+        }
+    }
+    None
 }
 
 #[cfg(windows)]

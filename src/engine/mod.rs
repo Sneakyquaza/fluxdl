@@ -35,6 +35,8 @@ pub struct Options {
     pub expected_sha256: Option<String>,
     /// Échecs de suite sans progrès avant qu'une connexion abandonne.
     pub max_retries: u32,
+    /// En-têtes ajoutés à chaque requête (Referer, Cookie venus de l'extension).
+    pub headers: Vec<(String, String)>,
 }
 
 impl Default for Options {
@@ -45,6 +47,7 @@ impl Default for Options {
             speed_limit: 0,
             expected_sha256: None,
             max_retries: 6,
+            headers: Vec::new(),
         }
     }
 }
@@ -57,6 +60,7 @@ pub struct Probe {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub file_name: String,
+    pub content_type: Option<String>,
 }
 
 /// Morceau `[start, end)` dont `[start, pos)` est écrit sur le disque.
@@ -102,6 +106,14 @@ pub struct Live {
     /// Le fichier distant a changé depuis la dernière fois : repris de zéro.
     pub restarted: bool,
     pub verifying: bool,
+    /// Torrents : pairs connectés, octets envoyés, partage en cours après la fin.
+    pub peers: u32,
+    pub uploaded: u64,
+    /// Débit d'envoi (octets/s).
+    pub up_speed: f64,
+    pub seeding: bool,
+    /// Torrents : carte des pièces réduite (0 = rien, 255 = tout reçu) ; vide sinon.
+    pub pieces: Vec<u8>,
 }
 
 impl Live {
@@ -131,7 +143,8 @@ impl Control {
     pub fn request_stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
-    fn lock(&self) -> MutexGuard<'_, Live> {
+    /// État en direct à modifier (yt-dlp et torrents remplissent le même `Live`).
+    pub fn lock(&self) -> MutexGuard<'_, Live> {
         self.live.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -180,6 +193,9 @@ fn with_suffix(p: &Path, s: &str) -> PathBuf {
     PathBuf::from(o)
 }
 
+/// Erreur de `run` quand le lien mène à une page web (l'UI propose alors yt-dlp).
+pub const ERR_PAGE: &str = "This link is a web page, not a file.";
+
 /// Télécharge `url` dans `dir`. `name` : nom déjà choisi (reprise) ; sinon celui du serveur,
 /// rendu unique (« nom (1).ext »). Bloquant : à lancer dans un fil.
 pub fn run(
@@ -190,7 +206,10 @@ pub fn run(
     ctl: &Control,
 ) -> Result<Outcome, String> {
     let agent = agent();
-    let p = probe(&agent, url)?;
+    let p = probe(&agent, url, &opts.headers)?;
+    if est_page(&p, url) {
+        return Err(ERR_PAGE.into());
+    }
     let name = match name {
         Some(n) => n.to_string(),
         None => unique_name(dir, &p.file_name),
@@ -206,6 +225,21 @@ pub fn run(
         },
         Step::Done(o) => Ok(o),
     }
+}
+
+/// Réponse HTML à un lien qui ne finit pas par .htm(l) : une page (vidéo, partage…), pas un
+/// fichier.
+fn est_page(p: &Probe, url: &str) -> bool {
+    let chemin = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    p.content_type
+        .as_deref()
+        .is_some_and(|c| c.trim_start().to_ascii_lowercase().starts_with("text/html"))
+        && !chemin.ends_with(".html")
+        && !chemin.ends_with(".htm")
 }
 
 enum Step {
@@ -500,6 +534,9 @@ fn fetch(sh: &Shared, w: usize, i: usize) -> Result<(), FetchErr> {
         return Ok(());
     }
     let mut req = sh.agent.get(sh.url);
+    for (k, v) in &sh.opts.headers {
+        req = req.set(k, v);
+    }
     if sh.ranged {
         req = req.set("Range", &format!("bytes={pos}-{}", end - 1));
     }
@@ -710,6 +747,21 @@ mod tests {
         // Petit fichier : pas de morceau sous `min_chunk`.
         assert_eq!(split(3 << 20, 32, 1 << 20).len(), 3);
         assert_eq!(split(0, 8, 1 << 20).len(), 1);
+    }
+
+    #[test]
+    fn page_web_ou_fichier() {
+        let p = |c: &str| Probe {
+            content_type: Some(c.into()),
+            ..Default::default()
+        };
+        assert!(est_page(
+            &p("text/html; charset=utf-8"),
+            "https://www.youtube.com/watch?v=x"
+        ));
+        assert!(!est_page(&p("text/html"), "https://a.b/doc/page.html?x=1"));
+        assert!(!est_page(&p("application/zip"), "https://a.b/f"));
+        assert!(!est_page(&Probe::default(), "https://a.b/f"));
     }
 
     #[test]

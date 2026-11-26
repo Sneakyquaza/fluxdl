@@ -3,12 +3,16 @@
 
 use super::Probe;
 
-pub fn probe(agent: &ureq::Agent, url: &str) -> Result<Probe, String> {
-    let resp = agent
-        .get(url)
-        .set("Range", "bytes=0-0")
-        .call()
-        .map_err(|e| format!("probe: {e}"))?;
+pub fn probe(
+    agent: &ureq::Agent,
+    url: &str,
+    headers: &[(String, String)],
+) -> Result<Probe, String> {
+    let mut req = agent.get(url).set("Range", "bytes=0-0");
+    for (k, v) in headers {
+        req = req.set(k, v);
+    }
+    let resp = req.call().map_err(|e| format!("probe: {e}"))?;
     let entete = |n: &str| resp.header(n).map(str::to_string);
     let (size, ranges) = if resp.status() == 206 {
         // « bytes 0-0/12345 » ; « */ » inconnu : pas de découpage possible.
@@ -37,6 +41,7 @@ pub fn probe(agent: &ureq::Agent, url: &str) -> Result<Probe, String> {
         etag: entete("ETag"),
         last_modified: entete("Last-Modified"),
         file_name,
+        content_type: entete("Content-Type"),
     })
 }
 

@@ -1,0 +1,59 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title data-i18n="optTitle">fluxdl</title>
+  <link rel="stylesheet" href="ui.css">
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main>
+    <div class="header">
+      <img src="icons/icon48.png" alt="">
+      <h1 data-i18n="optTitle"></h1>
+    </div>
+
+    <section id="accessCard" class="card" hidden>
+      <h2 data-i18n="optAccessTitle"></h2>
+      <p class="hint" data-i18n="optGrantHint"></p>
+      <p><button type="button" id="grant" data-i18n="optGrantAccess"></button></p>
+      <p id="accessMsg" class="msg"></p>
+    </section>
+
+    <section class="card">
+      <h2 data-i18n="optConnection"></h2>
+      <label class="field">
+        <span data-i18n="optPort"></span>
+        <input type="number" id="port" min="1024" max="65535" step="1">
+      </label>
+      <label class="field" for="token"><span data-i18n="optToken"></span></label>
+      <div class="row">
+        <input type="password" id="token" autocomplete="off" spellcheck="false">
+        <button type="button" id="toggleToken" class="secondary" data-i18n="optShow"></button>
+      </div>
+      <p class="hint" data-i18n="optTokenHint"></p>
+      <p class="actions">
+        <button type="button" id="test" class="go" data-i18n="optTest"></button>
+      </p>
+      <div class="status">
+        <span id="orb" class="orb"></span>
+        <span id="testMsg"></span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2 data-i18n="optCookiesTitle"></h2>
+      <label class="switch">
+        <span data-i18n="optCookies"></span>
+        <input type="checkbox" id="sendCookies">
+        <span class="track"></span>
+      </label>
+      <p class="hint" data-i18n="optCookiesHint"></p>
+      <p id="cookieMsg" class="msg"></p>
+    </section>
+  </main>
+
+  <script src="common.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>

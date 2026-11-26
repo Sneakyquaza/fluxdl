@@ -562,6 +562,9 @@ pub enum Icone {
     Coller,
     Lien,
     Eclair,
+    Aimant,
+    Actualiser,
+    Copier,
 }
 
 fn trait_(p: &egui::Painter, pts: &[Pos2], s: Stroke) {
@@ -647,6 +650,35 @@ pub fn icone(p: &egui::Painter, r: Rect, i: Icone, c: Color32) {
                 p.add(m);
             }
         }
+        Icone::Aimant => aimant(p, q, s),
+        Icone::Actualiser => {
+            // Arc de 300° et sa pointe de flèche.
+            let pts: Vec<Pos2> = (0..=20)
+                .map(|i| {
+                    let a = -1.2 + i as f32 * 0.25;
+                    q(8.0 + 5.2 * a.cos(), 8.0 + 5.2 * a.sin())
+                })
+                .collect();
+            trait_(p, &pts, s);
+            p.add(Shape::convex_polygon(
+                vec![q(11.0, 0.8), q(14.6, 4.6), q(9.6, 5.6)],
+                c,
+                Stroke::NONE,
+            ));
+        }
+        Icone::Copier => {
+            p.rect_stroke(
+                Rect::from_min_max(q(5.5, 5.5), q(14.0, 14.5)),
+                2.0 * k,
+                s,
+                StrokeKind::Middle,
+            );
+            trait_(
+                p,
+                &[q(10.5, 2.5), q(3.5, 2.5), q(2.5, 3.5), q(2.5, 11.0)],
+                s,
+            );
+        }
         Icone::Eclair => {
             p.add(Shape::convex_polygon(
                 vec![q(9.5, 1.5), q(3.5, 9.0), q(8.0, 9.0)],
@@ -659,6 +691,21 @@ pub fn icone(p: &egui::Painter, r: Rect, i: Icone, c: Color32) {
                 Stroke::NONE,
             ));
         }
+    }
+}
+
+/// Aimant en U (liens magnet, torrents) : `q` place un point du carré de 16.
+fn aimant(p: &egui::Painter, q: impl Fn(f32, f32) -> Pos2, s: Stroke) {
+    let mut pts = vec![q(3.0, 2.5), q(3.0, 8.5)];
+    pts.extend((1..12).map(|i| {
+        let a = std::f32::consts::PI * (1.0 - i as f32 / 12.0);
+        q(8.0 + 5.0 * a.cos(), 8.5 + 5.0 * a.sin())
+    }));
+    pts.extend([q(13.0, 8.5), q(13.0, 2.5)]);
+    trait_(p, &pts, s);
+    // Pôles : deux barrettes.
+    for x in [3.0, 13.0] {
+        p.line_segment([q(x - 2.0, 5.0), q(x + 2.0, 5.0)], s);
     }
 }
 
@@ -684,6 +731,7 @@ pub enum TypeFichier {
     Video,
     Disque,
     Document,
+    Torrent,
     Autre,
 }
 
@@ -701,6 +749,7 @@ impl TypeFichier {
             "iso" | "img" | "dmg" | "vhd" | "vhdx" | "qcow2" | "vmdk" => TypeFichier::Disque,
             "pdf" | "doc" | "docx" | "odt" | "txt" | "md" | "epub" | "rtf" | "xls" | "xlsx"
             | "ppt" | "pptx" | "csv" => TypeFichier::Document,
+            "torrent" => TypeFichier::Torrent,
             _ => TypeFichier::Autre,
         }
     }
@@ -711,6 +760,7 @@ impl TypeFichier {
             TypeFichier::Video => rgb(0xe8, 0x4a, 0x78),
             TypeFichier::Disque => rgb(0x12, 0xae, 0xa8),
             TypeFichier::Document => rgb(0x2a, 0x7c, 0xe0),
+            TypeFichier::Torrent => rgb(0x2b, 0xa8, 0x5a),
             TypeFichier::Autre => rgb(0x6a, 0x6c, 0xe6),
         }
     }
@@ -787,6 +837,7 @@ pub fn tuile_fichier(p: &egui::Painter, r: Rect, t: TypeFichier) {
                     );
                 }
             }
+            TypeFichier::Torrent => aimant(p, q, s),
             TypeFichier::Autre => page(p),
         }
     }
@@ -1241,6 +1292,88 @@ pub fn carte_fichier(ui: &mut Ui, l: &Live, hauteur: f32) {
     for (b, c) in bulles {
         bulle_vol(pb, b, c);
     }
+}
+
+/// Carte des pièces d'un torrent : une case par groupe de pièces, gel de la palette des
+/// connexions (selon la position) d'autant plus plein que le groupe est reçu.
+pub fn carte_pieces(ui: &mut Ui, cases: &[u8], hauteur: f32) {
+    let (zone, _) =
+        ui.allocate_exact_size(vec2(ui.available_width(), hauteur + 10.0), Sense::hover());
+    let r = Rect::from_min_max(pos2(zone.left(), zone.top() + 10.0), zone.max);
+    let p = ui.painter();
+    creux(p, r.expand(1.0), 5.0);
+    let n = cases.len().max(1) as f32;
+    let pc = &p.with_clip_rect(r.intersect(p.clip_rect()));
+    for (i, &v) in cases.iter().enumerate() {
+        let (x0, x1) = (
+            r.left() + r.width() * i as f32 / n,
+            r.left() + r.width() * (i + 1) as f32 / n,
+        );
+        let c = teinte(i as f32 / n);
+        let case = Rect::from_x_y_ranges(x0..=x1, r.y_range());
+        if v == 255 {
+            pc.add(vdeg(case, 0.0, mix(c, Color32::WHITE, 0.35), c));
+        } else if v > 0 {
+            pc.rect_filled(case, 0.0, c.gamma_multiply(0.18 + 0.5 * v as f32 / 255.0));
+        } else {
+            pc.rect_filled(case, 0.0, c.gamma_multiply(0.1));
+        }
+    }
+    pc.add(reflet(r, 4.0, 0.75));
+    p.rect_stroke(
+        r.expand(1.0),
+        5.0,
+        Stroke::new(1.0, nuit(70)),
+        StrokeKind::Inside,
+    );
+}
+
+/// Case à cocher brillante (choix des fichiers d'un torrent).
+pub fn coche(ui: &mut Ui, on: &mut bool, t: &str, droite: &str) -> Response {
+    let w = ui.available_width();
+    let (r, mut rep) = ui.allocate_exact_size(vec2(w, 26.0), Sense::click());
+    if rep.clicked() {
+        *on = !*on;
+        rep.mark_changed();
+    }
+    let h = survol(ui, &rep);
+    let p = ui.painter();
+    selection(p, r, 6.0, 0.45 * h);
+    let b = Rect::from_center_size(pos2(r.left() + 14.0, r.center().y), Vec2::splat(16.0));
+    if *on {
+        gel(p, b, 4.0, GEL_BLEU, false, false);
+        trait_(
+            p,
+            &[
+                b.min + vec2(3.8, 8.3),
+                b.min + vec2(6.8, 11.3),
+                b.min + vec2(12.2, 4.8),
+            ],
+            Stroke::new(2.0, Color32::WHITE),
+        );
+    } else {
+        creux(p, b, 4.0);
+        p.rect_stroke(b, 4.0, Stroke::new(1.0, nuit(90)), StrokeKind::Inside);
+    }
+    let dw = p
+        .layout_no_wrap(droite.to_string(), regulier(12.5), TEXTE3)
+        .size()
+        .x;
+    let g = ligne(ui, t, regulier(13.0), TEXTE, r.width() - 40.0 - dw - 12.0);
+    p.galley(
+        pos2(r.left() + 30.0, r.center().y - g.size().y / 2.0),
+        g,
+        TEXTE,
+    );
+    texte(
+        ui,
+        r.right_center() - vec2(8.0, 0.0),
+        Align2::RIGHT_CENTER,
+        droite,
+        regulier(12.5),
+        TEXTE3,
+    );
+    rep
 }
 
 /// Une ligne par connexion : numéro, jauge du morceau courant, mention « volé », débit.

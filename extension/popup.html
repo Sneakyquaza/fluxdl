@@ -1,0 +1,49 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>fluxdl</title>
+  <link rel="stylesheet" href="ui.css">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="header">
+    <img src="icons/icon32.png" alt="">
+    <h1>fluxdl</h1>
+  </div>
+
+  <div class="card">
+    <div class="status">
+      <span id="orb" class="orb"></span>
+      <span id="status" data-i18n="statusChecking"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <label class="switch">
+      <span data-i18n="popupAutoCapture"></span>
+      <input type="checkbox" id="autoCapture">
+      <span class="track"></span>
+    </label>
+    <p class="hint" data-i18n="popupAutoCaptureHint"></p>
+
+    <label class="field">
+      <span data-i18n="popupThreshold"></span>
+      <input type="number" id="thresholdMB" min="1" max="100000" step="1">
+    </label>
+
+    <label class="field">
+      <span data-i18n="popupExtensions"></span>
+      <input type="text" id="extensions" spellcheck="false" data-i18n-placeholder="popupExtensionsHint">
+    </label>
+    <p id="saved" class="msg ok"></p>
+  </div>
+
+  <div class="footer">
+    <button type="button" id="openOptions" class="secondary" data-i18n="popupOptions"></button>
+  </div>
+
+  <script src="common.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
