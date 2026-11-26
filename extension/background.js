@@ -5,11 +5,12 @@
 "use strict";
 
 // Chrome (service worker) charge common.js ici ; Firefox le liste dans le manifeste
-if (typeof importScripts === "function") importScripts("common.js");
+if (typeof importScripts === "function") importScripts("common.js", "sites.js");
 
 const MENU_LINK = "fluxdl-download";
 const MENU_MEDIA = "fluxdl-media";
 const MENU_PAGE = "fluxdl-page";
+const MENU_VIDEO = "fluxdl-video";
 const MAX_URL = 8192;
 const MAX_LINKS = 2000;
 const FALLBACK_STATES = ["down", "unpaired", "noaccess"];
@@ -55,6 +56,13 @@ async function setupMenu() {
     contexts: ["page"],
     documentUrlPatterns: ["http://*/*", "https://*/*"],
   });
+  // Pages des sites vidéo (YouTube, Twitch…) : le lien de la page part comme vidéo
+  api.contextMenus.create({
+    id: MENU_VIDEO,
+    title: t("menuDownloadVideo"),
+    contexts: ["page", "video"],
+    documentUrlPatterns: VIDEO_SITES.flatMap((s) => siteOrigins(s)),
+  });
 }
 
 api.runtime.onInstalled.addListener(setupMenu);
@@ -88,6 +96,59 @@ async function cookiesFor(url, settings) {
   } catch {
     return undefined;
   }
+}
+
+// ---- Vidéos (pages YouTube, Twitch…) ----
+
+// Magasin de cookies de l'onglet (fenêtre privée, conteneur Firefox) : le bon compte
+async function storeIdFor(tab) {
+  if (tab?.cookieStoreId) return tab.cookieStoreId;
+  try {
+    const stores = await api.cookies.getAllCookieStores();
+    return stores.find((s) => s.tabIds.includes(tab?.id))?.id;
+  } catch {
+    return undefined;
+  }
+}
+
+// Cookies de connexion du site, seulement si l'utilisateur l'a permis pour CE site (désactivé par
+// défaut) et que la permission est là ; forme structurée (fichier Netscape écrit par l'appli).
+async function videoCookies(site, tab, settings) {
+  if (!settings.videoCookies?.[site.id] || !api.cookies) return undefined;
+  try {
+    const ok = await api.permissions.contains({ permissions: ["cookies"], origins: siteOrigins(site, site.cookieDomains) });
+    if (!ok) return undefined;
+    const storeId = await storeIdFor(tab);
+    const out = [];
+    for (const domain of site.cookieDomains) {
+      for (const c of await api.cookies.getAll(storeId ? { domain, storeId } : { domain })) {
+        out.push({
+          name: c.name,
+          value: c.value,
+          domain: c.domain,
+          path: c.path || "/",
+          secure: !!c.secure,
+          httpOnly: !!c.httpOnly,
+          expiry: c.session ? 0 : Math.floor(c.expirationDate || 0),
+        });
+      }
+    }
+    return out.length ? out.slice(0, 300) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Lien de la PAGE vidéo → appli (choix du format) ; pas de repli navigateur (rien à télécharger)
+async function sendVideo(url, site, tab) {
+  const settings = await getSettings();
+  const body = { url, kind: "video" };
+  const jar = await videoCookies(site, tab, settings);
+  if (jar) body.video_cookies = jar;
+  const res = await callApp("/add", body, settings);
+  if (FALLBACK_STATES.includes(res.state)) notify(t(res.state === "down" ? "notifVideoNotRunning" : "statusNotPaired"));
+  else if (res.state !== "ok") notify(errorMessage(res));
+  return res.state;
 }
 
 async function sendToApp(url, extra, settings) {
@@ -181,6 +242,15 @@ async function pickerData(id) {
 }
 
 api.contextMenus.onClicked.addListener(async (info, tab) => {
+  if (info.menuItemId === MENU_VIDEO) {
+    const site = videoPageSite(info.pageUrl);
+    if (!site) {
+      notify(t("notifNotVideoPage"));
+      return;
+    }
+    if ((await sendVideo(info.pageUrl, site, tab)) === "ok") notify(t("notifVideoSent"));
+    return;
+  }
   if (info.menuItemId === MENU_PAGE) {
     if (tab?.id >= 0) openPicker(tab);
     return;
@@ -220,6 +290,13 @@ async function handleMessage(msg, sender) {
       const referrer = typeof msg.referrer === "string" ? msg.referrer : "";
       const res = await sendToApp(msg.url, { referrer }, await getSettings());
       return { state: res.state, status: res.status };
+    }
+    case "fluxdl-video": {
+      // Bouton près du lecteur : page de vidéo d'un site connu, du même site que l'onglet
+      if (!fromTab || typeof msg.url !== "string" || msg.url.length > MAX_URL) return { error: "url" };
+      const site = videoPageSite(msg.url);
+      if (!site || videoSiteOf(sender.url) !== site) return { error: "url" };
+      return { state: await sendVideo(msg.url, site, sender.tab) };
     }
     case "fluxdl-pair": {
       if (!fromOwnPage(sender)) return { error: "sender" };

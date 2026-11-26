@@ -16,9 +16,11 @@ impl App {
             }) => {
                 if let Some(r) = rx.as_ref().and_then(|r| r.try_recv().ok()) {
                     if let Ok(i) = &r {
-                        // Premier choix disponible par défaut.
-                        if let Some(c) = i.choix.iter().find(|c| c.1) {
-                            *choix = c.0;
+                        // Qualité par défaut des réglages si disponible, sinon la première.
+                        if !i.choix.iter().any(|c| c.0 == *choix && c.1) {
+                            if let Some(c) = i.choix.iter().find(|c| c.1) {
+                                *choix = c.0;
+                            }
                         }
                     }
                     *infos = Some(r);
@@ -280,6 +282,9 @@ impl App {
                 rx,
                 infos,
                 mut choix,
+                mut de,
+                mut a,
+                mut debut,
             } => {
                 titre_modale(ui, Icone::Lecture, t(l, "Download a video"));
                 match &infos {
@@ -321,21 +326,112 @@ impl App {
                             }
                         }
                         ui.add_space(6.0);
+                        let petit = |ui: &mut Ui, s: &str| {
+                            ui.label(egui::RichText::new(s).font(regulier(12.0)).color(TEXTE3));
+                        };
+                        // Live : depuis le début (YouTube) ; sinon passage « de … à … ».
+                        let mut section = None;
+                        let mut section_ok = true;
+                        if i.en_direct {
+                            if video::debut_possible(&url) {
+                                coche(ui, &mut debut, t(l, "Live: from its beginning"), "");
+                                petit(ui, t(l, "Off: recorded from now. Recording runs until the live ends or until Pause."));
+                            } else {
+                                petit(ui, t(l, "Live: recorded from now until it ends or until Pause (this site cannot start from the beginning)."));
+                            }
+                        } else {
+                            let ff = self.outils.ffmpeg.is_some();
+                            let (r, _) =
+                                ui.allocate_exact_size(vec2(LARGEUR, 34.0), Sense::hover());
+                            let y = r.center().y;
+                            let col = if ff { TEXTE } else { TEXTE3 };
+                            let mut x = r.left() + 2.0;
+                            x += texte(
+                                ui,
+                                pos2(x, y),
+                                Align2::LEFT_CENTER,
+                                t(l, "Section only: from"),
+                                moyen(13.0),
+                                col,
+                            ) + 8.0;
+                            let zone = |ui: &mut Ui, x: f32, v: &mut String, indice: &str| {
+                                let z =
+                                    Rect::from_min_size(pos2(x, r.top() + 1.0), vec2(96.0, 32.0));
+                                ui.add_enabled_ui(ff, |ui| {
+                                    champ(ui, z, v, indice, None, regulier(13.0))
+                                });
+                                x + 96.0 + 8.0
+                            };
+                            x = zone(ui, x, &mut de, "00:00:00");
+                            x += texte(
+                                ui,
+                                pos2(x, y),
+                                Align2::LEFT_CENTER,
+                                t(l, "to"),
+                                moyen(13.0),
+                                col,
+                            ) + 8.0;
+                            let fin = i.duree.map_or("hh:mm:ss".into(), |d| video::hms(d as u32));
+                            zone(ui, x, &mut a, &fin);
+                            if !ff {
+                                (de, a) = (String::new(), String::new());
+                                petit(ui, t(l, "Sections need ffmpeg."));
+                            } else if !de.trim().is_empty() || !a.trim().is_empty() {
+                                let debut_s = if de.trim().is_empty() {
+                                    Some(0)
+                                } else {
+                                    video::temps(&de)
+                                };
+                                let fin_s = if a.trim().is_empty() {
+                                    i.duree.map(|d| d.ceil() as u32)
+                                } else {
+                                    video::temps(&a)
+                                };
+                                match (debut_s, fin_s) {
+                                    (Some(d), Some(f))
+                                        if f > d && i.duree.is_none_or(|t| d < t.ceil() as u32) =>
+                                    {
+                                        section = Some((d, f));
+                                        petit(ui, t(l, "Cut at the nearest keyframe. A section is restarted, not resumed, after Pause."));
+                                    }
+                                    _ => {
+                                        section_ok = false;
+                                        erreur(
+                                            ui,
+                                            t(l, "Times as hh:mm:ss, the end after the start."),
+                                        );
+                                    }
+                                }
+                            } else {
+                                petit(ui, t(l, "Empty: the whole video. Long videos can be paused and resumed."));
+                            }
+                        }
+                        if self.jarres.contains_key(&url) {
+                            petit(ui, t(l, "With your login cookies for this site (members, subscribers): kept in memory only, given to yt-dlp in a private temporary file deleted right after."));
+                        }
                         let aide = t(
                             l,
                             "Downloaded by yt-dlp; picture and sound are merged by ffmpeg.",
                         );
                         ui.label(egui::RichText::new(aide).font(regulier(12.0)).color(TEXTE3));
-                        match boutons(ui, t(l, "Cancel"), t(l, "Download"), true) {
+                        match boutons(ui, t(l, "Cancel"), t(l, "Download"), section_ok) {
                             Some(true) => {
-                                let estimate =
-                                    i.choix.iter().find(|c| c.0 == choix).and_then(|c| c.2);
+                                let estimate = i
+                                    .choix
+                                    .iter()
+                                    .find(|c| c.0 == choix)
+                                    .and_then(|c| c.2)
+                                    .filter(|_| section.is_none() && !i.en_direct);
                                 let titre = i.titre.clone();
+                                let login = self.jarres.contains_key(&url);
                                 let e = self.nouvelle(
                                     url.clone(),
                                     Kind::Video {
                                         quality: choix,
                                         estimate,
+                                        section,
+                                        from_start: debut && i.en_direct,
+                                        login,
                                     },
                                 );
                                 e.name = Some(titre);
@@ -356,6 +452,9 @@ impl App {
                         rx,
                         infos,
                         choix,
+                        de,
+                        a,
+                        debut,
                     });
                 }
             }
@@ -1057,6 +1156,22 @@ impl App {
                     video::mettre_a_jour_ytdlp();
                     self.settings.ytdlp_updated = secondes();
                 }
+            });
+            separateur(ui);
+            let aide = t(
+                l,
+                "Pre-selected; used without asking while fluxdl is minimized.",
+            );
+            reglage(ui, t(l, "Default video quality"), aide, |ui| {
+                segmente(
+                    ui,
+                    &mut self.settings.video_quality,
+                    &[
+                        (video::Qualite::Best, t(l, "Best")),
+                        (video::Qualite::P1080, "1080p"),
+                        (video::Qualite::P720, "720p"),
+                    ],
+                );
             });
         });
         ui.add_space(20.0);

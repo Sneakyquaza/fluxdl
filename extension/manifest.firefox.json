@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "__MSG_extName__",
   "description": "__MSG_extDescription__",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "default_locale": "en",
   "icons": {
     "16": "icons/icon16.png",
@@ -28,6 +28,7 @@
   "background": {
     "scripts": [
       "common.js",
+      "sites.js",
       "background.js"
     ]
   },
@@ -38,6 +39,7 @@
         "https://*/*"
       ],
       "js": [
+        "sites.js",
         "content.js"
       ],
       "run_at": "document_idle"

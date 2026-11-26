@@ -3,7 +3,9 @@
 //! une 2e instance de l'appli) ou absent, `Host` local (contre le DNS rebinding), débit limité.
 //! `Origin` absent accepté : Firefox peut l'omettre pour une extension ; une page web, elle,
 //! l'envoie toujours dès qu'elle ajoute l'en-tête du jeton (requête CORS), donc refusée.
-//! `GET /ping` → version ; `POST /add` {url, referrer?, filename?, cookies?} → file d'attente,
+//! `GET /ping` → version ; `POST /add` {url, referrer?, filename?, cookies?} → file d'attente ;
+//! {url, kind: "video", video_cookies?: [{name, value, domain, path, secure, httpOnly, expiry}]}
+//! → page vidéo pour yt-dlp ;
 //! réponse donnée après la décision de l'appli : 200 `added` / `already_active` (le navigateur
 //! peut abandonner sa copie), 409 `already_done` / `refused`, 503 `timeout` (rien d'ajouté).
 //! `POST /focus` (2e instance seulement) : montre la fenêtre.
@@ -50,12 +52,25 @@ pub struct Demande {
     /// sur « added ») ; page web, erreur ou délai → refus, le navigateur garde son téléchargement.
     #[serde(default)]
     pub probe: bool,
+    /// `"video"` : lien d'une PAGE vidéo (YouTube, Twitch…), lu par yt-dlp (choix du format).
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Vidéo : cookies de connexion du site (option par site de l'extension, désactivée par
+    /// défaut) ; gardés en mémoire seulement, jamais dans queue.json ni dans un journal.
+    #[serde(default)]
+    pub video_cookies: Option<Vec<crate::cookies::Cookie>>,
     /// Vrai si la demande vient de l'appli elle-même (fichier .torrent local permis).
     #[serde(skip)]
     pub locale: bool,
     /// Réponse attendue par le serveur (absente : rien à répondre).
     #[serde(skip)]
     pub decision: Option<Arc<Decision>>,
+}
+
+impl Demande {
+    pub fn video(&self) -> bool {
+        self.kind.as_deref() == Some("video")
+    }
 }
 
 impl PartialEq for Demande {
@@ -66,7 +81,15 @@ impl PartialEq for Demande {
             &self.filename,
             &self.cookies,
             self.locale,
-        ) == (&o.url, &o.referrer, &o.filename, &o.cookies, o.locale)
+            (&self.kind, &self.video_cookies),
+        ) == (
+            &o.url,
+            &o.referrer,
+            &o.filename,
+            &o.cookies,
+            o.locale,
+            (&o.kind, &o.video_cookies),
+        )
     }
 }
 
@@ -421,6 +444,15 @@ pub fn traiter(
             if !permis || u.len() > 16 << 10 {
                 return avec(rep(400, r#"{"error":"bad url"}"#));
             }
+            // Vidéo : page http(s) seulement ; cookies structurés seulement pour une vidéo.
+            let video = d.video();
+            let page = u.starts_with("http://") || u.starts_with("https://");
+            if d.kind.as_deref().is_some_and(|k| k != "video")
+                || (video && !page)
+                || (!video && d.video_cookies.is_some())
+            {
+                return avec(rep(400, r#"{"error":"bad kind"}"#));
+            }
             let mut r = avec(rep(200, r#"{"ok":true}"#));
             r.demande = Some(d);
             r
@@ -683,6 +715,42 @@ mod tests {
             &mut Appairage::default(),
             Instant::now(),
         )
+    }
+
+    /// Tâche vidéo : page + cookies structurés ; mauvaise sorte ou cookies hors vidéo refusés.
+    #[test]
+    fn tache_video() {
+        let corps = r#"{"url":"https://www.youtube.com/watch?v=abc","kind":"video","video_cookies":[
+            {"name":"SAPISID","value":"v","domain":".youtube.com","path":"/","secure":true,"httpOnly":false,"expiry":1900000000},
+            {"name":"PREF","value":"w","domain":"www.youtube.com"}]}"#;
+        let r = envoyer(&ext(J), "POST", "/add", corps);
+        assert_eq!(r.code, 200);
+        let d = r.demande.unwrap();
+        assert!(d.video());
+        let c = d.video_cookies.unwrap();
+        assert_eq!((c.len(), c[1].path.as_str(), c[1].expiry), (2, "/", 0.0));
+        assert!(c[0].secure && !c[0].http_only);
+        let sans = envoyer(
+            &ext(J),
+            "POST",
+            "/add",
+            r#"{"url":"https://www.twitch.tv/videos/1","kind":"video"}"#,
+        );
+        assert!(sans.demande.unwrap().video_cookies.is_none());
+        for mauvais in [
+            r#"{"url":"https://a.b/f.zip","kind":"autre"}"#,
+            r#"{"url":"magnet:?xt=urn:btih:abc","kind":"video"}"#,
+            r#"{"url":"https://a.b/f.zip","video_cookies":[]}"#,
+        ] {
+            assert_eq!(
+                envoyer(&ext(J), "POST", "/add", mauvais).code,
+                400,
+                "{mauvais}"
+            );
+        }
+        // Un simple lien reste un fichier.
+        let f = envoyer(&ext(J), "POST", "/add", r#"{"url":"https://a.b/f.zip"}"#);
+        assert!(!f.demande.unwrap().video());
     }
 
     #[test]

@@ -81,5 +81,15 @@
   "pairDenied": {"message": "Refusé dans fluxdl."},
   "pairBusy": {"message": "Une autre demande attend dans fluxdl. Réessayez dans une minute."},
   "pairExpired": {"message": "Pas de réponse de fluxdl (1 minute). Réessayez."},
-  "pairOld": {"message": "Cette version de fluxdl ne sait pas appairer toute seule : mettez-la à jour, ou collez le jeton."}
+  "pairOld": {"message": "Cette version de fluxdl ne sait pas appairer toute seule : mettez-la à jour, ou collez le jeton."},
+  "menuDownloadVideo": {"message": "Télécharger cette vidéo avec fluxdl"},
+  "notifVideoNotRunning": {"message": "fluxdl n'est pas lancé : lancez-le puis cliquez à nouveau."},
+  "notifNotVideoPage": {"message": "Ouvrez la page d'une vidéo (pas l'accueil ni une liste), puis réessayez."},
+  "notifVideoSent": {"message": "Vidéo envoyée à fluxdl."},
+  "videoButtonLabel": {"message": "Télécharger cette vidéo avec fluxdl"},
+  "floatNotRunning": {"message": "fluxdl fermé"},
+  "optVideoTitle": {"message": "Vidéos (YouTube, Twitch…)"},
+  "optVideoHint": {"message": "Sur la page d'une vidéo, un bouton « ⬇ fluxdl » apparaît dans le coin du lecteur (et « Télécharger cette vidéo avec fluxdl » dans le menu du clic droit) : fluxdl reçoit le lien de la page et vous laisse choisir la qualité. Il suit l'interrupteur « Bouton fluxdl au survol » ci-dessus."},
+  "optVideoCookies": {"message": "Envoyer mes cookies de connexion pour ce site"},
+  "optVideoCookiesHint": {"message": "Désactivé par défaut. Nécessaire seulement pour les vidéos et VOD réservées aux abonnés ou aux membres. Seuls les cookies de ce site vont à fluxdl, sur ce PC (jamais sur Internet) : gardés en mémoire, écrits dans un fichier temporaire privé pour yt-dlp et effacés dès qu'il a fini. Qui a ces cookies est connecté à votre place : désactivez sur un PC partagé."}
 }

@@ -4,3 +4,5 @@ main { max-width: 520px; margin: 0 auto; }
 .card { padding: 16px 18px; margin-bottom: 14px; }
 .actions { margin: 12px 0 8px; }
 .switch.spaced { margin-top: 10px; }
+.site { margin-top: 12px; }
+.site h3 { margin: 0 0 6px; font-size: 13px; }

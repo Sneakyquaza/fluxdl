@@ -33,6 +33,9 @@ pub struct Settings {
     pub clipboard_watch: bool,
     /// Bulle « Installer l'extension » déjà montrée (ou guide déjà ouvert).
     pub extension_asked: bool,
+    /// Vidéo envoyée par l'extension fenêtre réduite : ajoutée sans question dans cette qualité
+    /// (fenêtre visible : choix du format, cette qualité cochée d'avance).
+    pub video_quality: crate::video::Qualite,
 }
 
 impl Default for Settings {
@@ -51,6 +54,7 @@ impl Default for Settings {
             ytdlp_updated: 0,
             clipboard_watch: true,
             extension_asked: false,
+            video_quality: crate::video::Qualite::Best,
         }
     }
 }
@@ -70,9 +74,17 @@ pub enum Status {
 pub enum Kind {
     #[default]
     Http,
+    /// `section` : passage (secondes), `from_start` : live depuis son début, `login` : lancé avec
+    /// les cookies de connexion du site (gardés en mémoire seulement, jamais ici).
     Video {
         quality: crate::video::Qualite,
         estimate: Option<u64>,
+        #[serde(default)]
+        section: Option<(u32, u32)>,
+        #[serde(default)]
+        from_start: bool,
+        #[serde(default)]
+        login: bool,
     },
     /// `.torrent` gardé sous `torrents/<hash>.torrent` ; `started` : fichiers déjà à nous
     /// (reprise permise), `files` : fichiers choisis (tous si aucun).

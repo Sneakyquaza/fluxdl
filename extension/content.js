@@ -1,5 +1,6 @@
 // Script de contenu : bouton flottant « ⬇ fluxdl » au survol des liens de fichiers et des
-// vidéos/sons, et collecte des liens pour la page « tout télécharger ».
+// vidéos/sons, bouton près du lecteur sur les pages de vidéo des sites de sites.js (chargé
+// avant ce script), et collecte des liens pour la page « tout télécharger ».
 // Ne lit jamais le stockage (le jeton y est) et ne parle qu'à l'arrière-plan.
 "use strict";
 
@@ -30,6 +31,7 @@
     const c = await send({ type: "fluxdl-config" });
     if (c && Array.isArray(c.exts)) config = { floatButton: !!c.floatButton, exts: c.exts };
     if (!config.floatButton) hide();
+    checkVideoPage();
   }
 
   function isHttp(u) {
@@ -118,6 +120,8 @@
         linear-gradient(180deg, #f07a70, #d63a2f 60%, #e0483d);
     }
     .ar { font-size: 13px; }
+    button.big { height: 30px; padding: 0 14px 0 11px; font-size: 13px; gap: 6px; }
+    button.big .ar { font-size: 15px; }
     @media (prefers-reduced-motion: reduce) { button { transition: none; transform: none; } }
   `;
 
@@ -127,9 +131,9 @@
   // Contre le détournement de clic : le bouton doit être vraiment visible (la page peut
   // modifier le style de l'hôte, ou rendre la page entière presque transparente) et être
   // l'élément sous le pointeur.
-  function reallyVisible(e) {
-    if (document.elementFromPoint(e.clientX, e.clientY) !== host) return false;
-    for (let el = host; el; el = el.parentElement) {
+  function reallyVisible(e, h = host) {
+    if (document.elementFromPoint(e.clientX, e.clientY) !== h) return false;
+    for (let el = h; el; el = el.parentElement) {
       const cs = getComputedStyle(el);
       if (Number(cs.opacity) < 0.9 || cs.visibility !== "visible" || (cs.filter && cs.filter !== "none")) return false;
     }
@@ -154,13 +158,13 @@
     document.documentElement.appendChild(host);
   }
 
-  function setLabel(icon, text) {
-    btn.replaceChildren();
+  function setLabel(icon, text, b = btn) {
+    b.replaceChildren();
     const ar = document.createElement("span");
     ar.className = "ar";
     ar.setAttribute("aria-hidden", "true");
     ar.textContent = icon;
-    btn.append(ar, document.createTextNode(text));
+    b.append(ar, document.createTextNode(text));
   }
 
   function show(target) {
@@ -284,6 +288,118 @@
       if (url) links.push({ url, text: el.title || "", media: true });
     }
     return { links, page: location.href, title: document.title };
+  }
+
+  // ---- Bouton vidéo : pages de vidéo des sites de sites.js (lecteur en blob:) ----
+  // Toujours visible près du lecteur (coin haut droit), sinon en bas à droite de la fenêtre ;
+  // envoie le lien de la PAGE. Navigation sans rechargement (YouTube, Twitch) : événement
+  // yt-navigate-finish, popstate et adresse relue chaque seconde (sites vidéo seulement).
+  const VIDEO_HOST_CSS =
+    "all:initial;position:fixed;z-index:2147483646;top:0;left:0;display:none;pointer-events:auto;";
+  let vHost = null;
+  let vBtn = null;
+  let vSite = null;
+  let vUrl = "";
+  let vReset = 0;
+
+  function videoIdle() {
+    vBtn.className = "big on";
+    vBtn.disabled = false;
+    setLabel("⬇", "fluxdl", vBtn);
+  }
+
+  function ensureVideoHost() {
+    if (vHost?.isConnected) return;
+    vHost = document.createElement("fluxdl-video");
+    vHost.style.cssText = VIDEO_HOST_CSS;
+    const root = vHost.attachShadow({ mode: "closed" });
+    const style = document.createElement("style");
+    style.textContent = CSS;
+    vBtn = document.createElement("button");
+    vBtn.type = "button";
+    vBtn.title = t("videoButtonLabel");
+    vBtn.setAttribute("aria-label", t("videoButtonLabel"));
+    root.append(style, vBtn);
+    vBtn.addEventListener("click", onVideoClick);
+    document.documentElement.appendChild(vHost);
+    videoIdle();
+  }
+
+  function findPlayer(site) {
+    for (const sel of site.player) {
+      for (const el of document.querySelectorAll(sel)) {
+        const r = el.getBoundingClientRect();
+        if (r.width >= 200 && r.height >= 110) return r;
+      }
+    }
+    return null;
+  }
+
+  function placeVideo() {
+    if (!vHost || !vSite) return;
+    const r = findPlayer(vSite);
+    const vw = document.documentElement.clientWidth;
+    const vh = window.innerHeight;
+    const w = vBtn.offsetWidth || 96;
+    const h = 30;
+    let x = vw - w - 20;
+    let y = vh - h - 20;
+    // Lecteur assez visible : dans son coin haut droit
+    if (r && r.top >= -40 && r.top + 12 + h < vh && r.right - w - 12 > 0) {
+      x = Math.min(r.right - w - 12, vw - w - 4);
+      y = Math.max(4, r.top + 12);
+    }
+    vHost.style.left = Math.round(x) + "px";
+    vHost.style.top = Math.round(y) + "px";
+  }
+
+  function checkVideoPage() {
+    const site = config.floatButton ? videoPageSite(location.href) : null;
+    if (!site) {
+      if (vHost) vHost.style.display = "none";
+      vSite = null;
+      vUrl = "";
+      return;
+    }
+    ensureVideoHost();
+    // Style réappliqué (la page a pu le changer), nouvelle vidéo = bouton remis à neuf
+    vHost.style.cssText = VIDEO_HOST_CSS;
+    if (vUrl !== location.href) {
+      clearTimeout(vReset);
+      videoIdle();
+    }
+    vSite = site;
+    vUrl = location.href;
+    vHost.style.display = "block";
+    placeVideo();
+  }
+
+  async function onVideoClick(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!e.isTrusted || !vSite || vBtn.disabled) return; // clic simulé par la page : ignoré
+    if (!reallyVisible(e, vHost)) return;
+    vBtn.disabled = true;
+    setLabel("…", "fluxdl", vBtn);
+    const res = await send({ type: "fluxdl-video", url: location.href, title: document.title });
+    const state = res?.state;
+    if (state === "ok") {
+      vBtn.className = "big on ok";
+      setLabel("✓", t("floatSent"), vBtn);
+    } else {
+      vBtn.className = "big on err";
+      setLabel("✕", t(state === "down" ? "floatNotRunning" : "floatError"), vBtn);
+    }
+    clearTimeout(vReset);
+    vReset = setTimeout(videoIdle, 2500);
+  }
+
+  if (videoSiteOf(location.href)) {
+    document.addEventListener("yt-navigate-finish", checkVideoPage);
+    window.addEventListener("popstate", checkVideoPage);
+    window.addEventListener("resize", placeVideo, { passive: true });
+    window.addEventListener("scroll", placeVideo, { passive: true });
+    setInterval(checkVideoPage, 1000);
   }
 
   api.runtime.onMessage.addListener((msg, sender, sendResponse) => {

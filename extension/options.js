@@ -125,10 +125,10 @@ async function init() {
     );
   });
 
-  $("sendCookies").addEventListener("change", (e) => {
+  $("sendCookies").addEventListener("change", async (e) => {
     if (!e.target.checked) {
-      saveSettings({ sendCookies: false });
-      api.permissions.remove({ permissions: ["cookies"] }).catch(() => {});
+      await saveSettings({ sendCookies: false });
+      dropCookiePermission();
       $("cookieMsg").textContent = "";
       return;
     }
@@ -164,7 +164,68 @@ async function init() {
     });
   }
 
+  videoSites(s);
   refreshAccess();
+}
+
+// Permission « cookies » rendue quand plus rien ne s'en sert (fichiers ni sites vidéo)
+async function dropCookiePermission() {
+  const s = await getSettings();
+  if (s.sendCookies || Object.values(s.videoCookies || {}).some(Boolean)) return;
+  api.permissions.remove({ permissions: ["cookies"] }).catch(() => {});
+}
+
+// Un interrupteur « cookies de connexion » par site vidéo (désactivé par défaut)
+async function videoSites(s) {
+  for (const site of VIDEO_SITES) {
+    const perms = { permissions: ["cookies"], origins: siteOrigins(site, site.cookieDomains) };
+    let granted = false;
+    try {
+      granted = await api.permissions.contains(perms);
+    } catch {
+      // API indisponible
+    }
+    const box = document.createElement("div");
+    box.className = "site";
+    const h = document.createElement("h3");
+    h.textContent = site.name;
+    const label = document.createElement("label");
+    label.className = "switch";
+    const text = document.createElement("span");
+    text.textContent = t("optVideoCookies");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.id = "videoCookies-" + site.id;
+    input.checked = !!s.videoCookies?.[site.id] && granted;
+    const track = document.createElement("span");
+    track.className = "track";
+    label.append(text, input, track);
+    box.append(h, label);
+    $("videoSites").append(box);
+    const save = async (on) => {
+      const cur = (await getSettings()).videoCookies || {};
+      await saveSettings({ videoCookies: { ...cur, [site.id]: on } });
+      input.checked = on;
+    };
+    input.addEventListener("change", (e) => {
+      if (!e.target.checked) {
+        save(false).then(dropCookiePermission);
+        showMsg("videoMsg", t("saved"), true);
+        return;
+      }
+      // Demandée dans le clic : accès aux cookies de CE site seulement
+      api.permissions.request(perms).then(
+        (ok) => {
+          save(ok);
+          showMsg("videoMsg", ok ? t("saved") : t("optPermDenied"), ok);
+        },
+        () => {
+          save(false);
+          showMsg("videoMsg", t("optPermDenied"), false);
+        }
+      );
+    });
+  }
 }
 
 init();

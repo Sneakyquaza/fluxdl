@@ -81,5 +81,15 @@
   "pairDenied": {"message": "Refused in fluxdl."},
   "pairBusy": {"message": "Another request is waiting in fluxdl. Try again in a minute."},
   "pairExpired": {"message": "No answer from fluxdl (1 minute). Try again."},
-  "pairOld": {"message": "This version of fluxdl can't pair automatically: update it, or paste the token."}
+  "pairOld": {"message": "This version of fluxdl can't pair automatically: update it, or paste the token."},
+  "menuDownloadVideo": {"message": "Download this video with fluxdl"},
+  "notifVideoNotRunning": {"message": "fluxdl is not running: start it, then click again."},
+  "notifNotVideoPage": {"message": "Open the page of a video (not the home page or a list), then try again."},
+  "notifVideoSent": {"message": "Video sent to fluxdl."},
+  "videoButtonLabel": {"message": "Download this video with fluxdl"},
+  "floatNotRunning": {"message": "fluxdl closed"},
+  "optVideoTitle": {"message": "Videos (YouTube, Twitch…)"},
+  "optVideoHint": {"message": "On a video page, a “⬇ fluxdl” button appears in the corner of the player (and “Download this video with fluxdl” in the right-click menu): fluxdl gets the page link and lets you pick the quality. It follows the “Show the fluxdl button on hover” switch above."},
+  "optVideoCookies": {"message": "Send my login cookies for this site"},
+  "optVideoCookiesHint": {"message": "Off by default. Needed only for subscriber-only or members-only videos and VODs. Only this site's cookies go to fluxdl on this PC (never to the Internet): kept in memory, written to a private temporary file for yt-dlp and deleted as soon as it finishes. Anyone with these cookies is logged in as you: turn this off on a shared PC."}
 }

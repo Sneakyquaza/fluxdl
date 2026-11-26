@@ -3,6 +3,22 @@
 Manifest V3 extension for Chrome, Edge and Firefox that sends downloads to the fluxdl app
 running on `127.0.0.1`. Plain JavaScript, no build step, no remote code.
 
+## Video pages (0.2.4)
+
+- `sites.js` lists the video sites (YouTube, Twitch): hosts, which paths are video pages, which
+  cookie domains yt-dlp needs and where the player is. Adding a site = one entry there.
+- On a video page a "⬇ fluxdl" button sits in the player's top-right corner (bottom-right of
+  the window when the player is scrolled away) and the page's right-click menu has "Download
+  this video with fluxdl". Both send `{url: <page>, kind: "video"}`; the app opens its format
+  window. Single-page navigation is followed (`yt-navigate-finish`, `popstate`, and the address
+  re-read every second on those sites only).
+- Options → Videos: "Send my login cookies for this site", per site, off by default. When on,
+  that site's cookies (`cookieDomains`, from the tab's cookie store) are added as
+  `video_cookies: [{name, value, domain, path, secure, httpOnly, expiry}]`. The app writes them
+  to a temporary Netscape file for yt-dlp and deletes it right after; they are never saved.
+- Tests: `tests/extension/video.cjs` (Playwright Chromium, fake app, fake "watch" page on
+  localhost through a test-only site entry).
+
 ## Answers from the app (0.2.3)
 
 - `POST /add` now answers after fluxdl decided: `added` or `already_active` (200, the browser
@@ -61,11 +77,12 @@ running on `127.0.0.1`. Plain JavaScript, no build step, no remote code.
 | Permission | Why |
 | --- | --- |
 | `downloads` | Watch browser downloads for auto-capture, cancel/erase them once fluxdl took over, and fall back to a browser download when fluxdl isn't running. |
-| `contextMenus` | The three right-click entries. |
+| `contextMenus` | The right-click entries (and "Download this video with fluxdl" on video sites). |
 | `storage` | Settings (port, token, capture rules). `storage.session` keeps the picker's link list for the tab it opens. |
 | `notifications` | "fluxdl not running", errors. |
 | host `http://127.0.0.1/*` | Talk to the fluxdl app on this computer (optional on Firefox: granted in the options). |
 | content script on `http://*/*`, `https://*/*` | **New in 0.2.1.** Needed for the hover button and to list a page's links for the picker. It only reads link and media addresses when you hover or ask for the picker, and sends nothing anywhere except to the extension's background. This is why the browser now says the extension can "read and change data on websites". |
 | optional `cookies` + `<all_urls>` | Only requested when you turn on **Send cookies**. |
+| optional `cookies` + one video site | Only requested when you turn on **Send my login cookies for this site** (e.g. `*://*.youtube.com/*`). |
 
 No `tabs`, `scripting`, `activeTab` or `webRequest` permission is used.

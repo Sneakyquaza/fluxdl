@@ -477,6 +477,44 @@ const FR: &[(&str, &str)] = &[
     ),
     ("Deny", "Refuser"),
     ("Allow", "Autoriser"),
+    ("Live: from its beginning", "Live depuis le début"),
+    (
+        "Off: recorded from now. Recording runs until the live ends or until Pause.",
+        "Sinon : enregistré à partir de maintenant, jusqu'à la fin du live ou jusqu'à Pause.",
+    ),
+    (
+        "Live: recorded from now until it ends or until Pause (this site cannot start from the beginning).",
+        "Live : enregistré à partir de maintenant, jusqu'à sa fin ou jusqu'à Pause (ce site ne permet pas de partir du début).",
+    ),
+    ("Section only: from", "Seulement de"),
+    ("to", "à"),
+    ("Sections need ffmpeg.", "Un passage demande ffmpeg."),
+    (
+        "Cut at the nearest keyframe. A section is restarted, not resumed, after Pause.",
+        "Coupé à l'image clé la plus proche. Après Pause, un passage recommence au début.",
+    ),
+    (
+        "Times as hh:mm:ss, the end after the start.",
+        "Heures au format hh:mm:ss, la fin après le début.",
+    ),
+    (
+        "Empty: the whole video. Long videos can be paused and resumed.",
+        "Vide : toute la vidéo. Une longue vidéo peut être mise en pause puis reprise.",
+    ),
+    (
+        "With your login cookies for this site (members, subscribers): kept in memory only, given to yt-dlp in a private temporary file deleted right after.",
+        "Avec tes cookies de connexion pour ce site (membres, abonnés) : gardés en mémoire seulement, donnés à yt-dlp dans un fichier temporaire privé effacé juste après.",
+    ),
+    ("Default video quality", "Qualité vidéo par défaut"),
+    (
+        "Pre-selected; used without asking while fluxdl is minimized.",
+        "Cochée d'avance ; utilisée sans question quand fluxdl est réduit.",
+    ),
+    ("Best", "Meilleure"),
+    (
+        "Login cookies are gone (fluxdl was restarted): click the fluxdl button on the video page again to resume.",
+        "Cookies de connexion perdus (fluxdl a redémarré) : clique à nouveau sur le bouton fluxdl de la page de la vidéo pour reprendre.",
+    ),
 ];
 
 pub fn t(lang: Lang, en: &'static str) -> &'static str {

@@ -55,6 +55,28 @@ A free, open-source multi-connection download manager (Windows + Linux, single e
   files (asked on the first torrent, toggle in Settings, current user only).
 - **Browser extension** (below).
 
+### New in 0.2.4
+- **YouTube and Twitch from the browser.** On a video page (youtube.com/watch, /live/, /shorts/,
+  youtu.be, twitch.tv/videos/…, Twitch clips, a live Twitch channel) the extension shows a
+  "⬇ fluxdl" button in the corner of the player, and "Download this video with fluxdl" in the
+  right-click menu. It sends the **page** link (the player itself plays a `blob:` stream that
+  can't be downloaded); fluxdl opens the quality window. YouTube and Twitch change pages
+  without reloading: the button follows (YouTube's navigation event, back/forward, and the
+  address re-read once a second on those sites only).
+- **Subscriber-only / members-only videos and VODs.** Options → Videos → "Send my login cookies
+  for this site", one switch per site, **off by default**. Only that site's cookies are sent
+  (YouTube: `youtube.com`, which is all yt-dlp reads; Twitch: `twitch.tv`), only to fluxdl on
+  `127.0.0.1`, from the tab's own cookie store (private window, Firefox container).
+  See [Login cookies for videos](#login-cookies-for-videos).
+- **Format window**: "Section only: from … to …" (hh:mm:ss, needs ffmpeg, cut at the nearest
+  keyframe; the file name gets the times) and, for a YouTube live in progress, "Live: from its
+  beginning" (`--live-from-start`). Other lives (Twitch) are recorded from now until they end
+  or until Pause.
+- **Settings → Videos → Default video quality**: pre-selected in the format window, and used
+  without asking for a video sent by the extension while fluxdl is minimized.
+- Pause on a long VOD stops yt-dlp; Resume continues its `.part` (`--continue`). A section or a
+  live starts over instead.
+
 ### New in 0.2.3
 - **Install the extension from the app**: Settings → Browser extension → **Install** (also
   offered once in a bubble at first launch). The extension is embedded in the exe. See
@@ -177,6 +199,25 @@ Some sites only serve a file to logged-in users. Enable **Send cookies** in the 
 forward that site's cookies to fluxdl with the link. The browser will ask for access to cookies
 on all sites. Cookies are sent only to fluxdl on `127.0.0.1` (and kept with the download so it
 can resume). Leave this off unless a site needs it.
+
+### Login cookies for videos
+For a subscriber-only Twitch VOD or a members-only YouTube video, yt-dlp must be logged in as
+you. Turn on **Send my login cookies for this site** for that site in the extension options
+(the browser asks for access to that site's cookies only). Then:
+- the extension reads that site's cookies when you click the button or the menu, and sends
+  them to fluxdl on `127.0.0.1` with the page link (never to the Internet);
+- fluxdl keeps them **in memory only** (never in `queue.json`, never in a log), and for each
+  yt-dlp run writes them to a temporary Netscape cookies file in its data folder
+  (`cookies/`, readable by you only: `0600` on Linux, your profile's `%APPDATA%` on Windows),
+  passed with `--cookies` and deleted as soon as yt-dlp exits (also on Pause/Cancel). Files
+  left by a crash are deleted at the next start;
+- pausing and resuming in the same session reuses them. After fluxdl restarts they are gone:
+  a video that needed them says "Login cookies are gone… click the fluxdl button on the video
+  page again", and that click resumes it (the `.part` is kept).
+
+Anyone holding these cookies is logged in as you: leave the switch off on a shared computer.
+YouTube may rotate the cookies of a browser session that yt-dlp used; if YouTube logs you out
+in the browser, log in again.
 
 ## Build
 

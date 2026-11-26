@@ -17,6 +17,10 @@ use std::time::Duration;
 /// Erreur quand yt-dlp manque (Linux : à installer par le système).
 pub const ABSENT: &str = "yt-dlp not found: install yt-dlp and ffmpeg.";
 
+/// Vidéo lancée avec les cookies de connexion, qui ne sont plus là (l'appli a redémarré :
+/// ils ne sont jamais écrits sur le disque).
+pub const ERR_COOKIES: &str = "Login cookies are gone (fluxdl was restarted): click the fluxdl button on the video page again to resume.";
+
 /// Sites vidéo connus : leurs liens vont droit au choix du format.
 const HOTES_VIDEO: [&str; 14] = [
     "youtube.com",
@@ -103,6 +107,8 @@ pub struct Infos {
     pub hauteur_max: u32,
     /// (qualité, disponible, taille estimée).
     pub choix: Vec<(Qualite, bool, Option<u64>)>,
+    /// Live en cours (`is_live`) : pas de section, « depuis le début » possible sur YouTube.
+    pub en_direct: bool,
 }
 
 #[derive(Deserialize)]
@@ -113,6 +119,8 @@ struct Json {
     duration: Option<f64>,
     #[serde(default)]
     formats: Vec<Format>,
+    #[serde(default)]
+    is_live: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -203,6 +211,7 @@ pub fn infos_depuis_json(d: &[u8]) -> Result<Infos, String> {
         duree: j.duration,
         hauteur_max,
         choix,
+        en_direct: j.is_live == Some(true),
     })
 }
 
@@ -237,6 +246,72 @@ pub fn progression(l: &str) -> Option<(u64, Option<u64>)> {
     let recus = n(m.next())?;
     let (total, estime) = (n(m.next()), n(m.next()));
     Some((recus, total.or(estime)))
+}
+
+/// « 1:02:03 », « 2:03 », « 45 » → secondes (minutes et secondes < 60 après le premier champ).
+pub fn temps(s: &str) -> Option<u32> {
+    let p: Vec<&str> = s.trim().split(':').collect();
+    if p.is_empty() || p.len() > 3 {
+        return None;
+    }
+    let mut t = 0u32;
+    for (i, x) in p.iter().enumerate() {
+        if x.is_empty() || x.len() > 6 || !x.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let n: u32 = x.parse().ok()?;
+        if i > 0 && n >= 60 {
+            return None;
+        }
+        t = t.checked_mul(60)?.checked_add(n)?;
+    }
+    Some(t)
+}
+
+/// Secondes → « 01:02:03 ».
+pub fn hms(t: u32) -> String {
+    format!("{:02}:{:02}:{:02}", t / 3600, t / 60 % 60, t % 60)
+}
+
+/// Ce que l'utilisateur a choisi pour une vidéo (gardé dans queue.json, sans les cookies).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tache {
+    pub qualite: Qualite,
+    pub estimation: Option<u64>,
+    /// Passage seulement (début, fin en secondes ; `--download-sections`, ffmpeg requis).
+    pub section: Option<(u32, u32)>,
+    /// Live YouTube en cours : depuis son début (`--live-from-start`) plutôt que maintenant.
+    pub debut: bool,
+}
+
+impl Tache {
+    /// Arguments propres à la tâche : format, passage, live, nom du fichier.
+    fn args(&self) -> Vec<String> {
+        let mut a: Vec<String> = self.qualite.args().into_iter().map(String::from).collect();
+        let mut nom = "%(title).150B [%(id)s]".to_string();
+        if let Some((de, a_)) = self.section {
+            a.extend([
+                "--download-sections".into(),
+                format!("*{}-{}", hms(de), hms(a_)),
+            ]);
+            // Le passage n'écrase pas la vidéo entière (ni un autre passage).
+            nom += &format!(
+                " {}-{}",
+                hms(de).replace(':', "."),
+                hms(a_).replace(':', ".")
+            );
+        }
+        if self.debut {
+            a.push("--live-from-start".into());
+        }
+        a.extend(["-o".into(), format!("{nom}.%(ext)s")]);
+        a
+    }
+}
+
+/// « Depuis le début » d'un live : YouTube seulement (Twitch enregistre à partir de maintenant).
+pub fn debut_possible(url: &str) -> bool {
+    crate::cookies::site_de(url) == "youtube.com"
 }
 
 const MODELE: &str = "download:fluxdl %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s";
@@ -290,7 +365,7 @@ use crate::systeme::commande;
 /// Arguments communs : aucun fichier de config ni greffon (un `yt-dlp.conf` déposé dans le
 /// dossier de téléchargement ou le dossier courant pourrait contenir `--exec`), sortie UTF-8,
 /// environnement JavaScript pour YouTube, ffmpeg.
-fn args_communs(c: &mut Command, o: &Outils) {
+fn args_communs(c: &mut Command, o: &Outils, cookies: Option<&Path>) {
     c.arg("--ignore-config");
     // Notre copie (Windows) est à jour ; un yt-dlp système d'avant 2025.02 ne connaît pas
     // l'option (dossier courant sûr : pas de greffon pris dans Téléchargements).
@@ -313,14 +388,18 @@ fn args_communs(c: &mut Command, o: &Outils) {
     if let Some(f) = &o.ffmpeg {
         c.arg("--ffmpeg-location").arg(f);
     }
+    if let Some(f) = cookies {
+        c.arg("--cookies").arg(f);
+    }
 }
 
 /// `yt-dlp -J` (bloquant : à lancer dans un fil).
-pub fn lire_infos(o: &Outils, url: &str) -> Result<Infos, String> {
+/// `cookies` : fichier Netscape temporaire (vidéo réservée aux abonnés / membres).
+pub fn lire_infos(o: &Outils, url: &str, cookies: Option<&Path>) -> Result<Infos, String> {
     let yt = o.ytdlp.as_ref().ok_or("yt-dlp missing")?;
     let mut c = commande(yt);
     c.arg("-J");
-    args_communs(&mut c, o);
+    args_communs(&mut c, o, cookies);
     let sortie = c
         .arg("--")
         .arg(url)
@@ -349,24 +428,25 @@ fn derniere_erreur(err: &str) -> String {
 }
 
 /// Télécharge avec yt-dlp dans `dir` ; arrêt = processus tué, yt-dlp reprend ses `.part` au
-/// prochain lancement. Progression : un seul « morceau » dans `Live` (fichier puis son).
+/// prochain lancement (`--continue` ; pas pour un passage ni un live, recommencés).
+/// Progression : un seul « morceau » dans `Live` (fichier puis son).
 pub fn telecharger(
     o: &Outils,
     url: &str,
     dir: &Path,
-    q: Qualite,
-    taille: Option<u64>,
+    tache: &Tache,
+    cookies: Option<&Path>,
     ctl: &Control,
 ) -> Result<Outcome, String> {
     let yt = o.ytdlp.as_ref().ok_or("yt-dlp missing")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let taille = tache.estimation;
     let mut c = commande(yt);
-    c.args(q.args());
-    args_communs(&mut c, o);
+    c.args(tache.args());
+    args_communs(&mut c, o, cookies);
     c.args(["--newline", "--progress", "--no-simulate", "--continue"])
         .args(["--progress-template", MODELE])
         .args(["--print", "after_move:fluxdl-fichier %(filepath)s"])
-        .args(["-o", "%(title).150B [%(id)s].%(ext)s"])
         .arg("-P")
         .arg(dir)
         .arg("--")
@@ -625,7 +705,7 @@ mod tests {
                 ffmpeg: None,
             };
             let mut c = commande(&yt);
-            args_communs(&mut c, &o);
+            args_communs(&mut c, &o, None);
             let a: Vec<_> = c
                 .get_args()
                 .map(|a| a.to_string_lossy().into_owned())
@@ -685,6 +765,56 @@ mod tests {
         let i = infos_depuis_json(petit).unwrap();
         assert!(!i.choix[1].1 && !i.choix[2].1 && i.choix[0].1);
         assert!(infos_depuis_json(b"<html>").is_err());
+    }
+
+    #[test]
+    fn passage_live_et_cookies_dans_les_arguments() {
+        assert_eq!(temps("1:02:03"), Some(3723));
+        assert_eq!(temps(" 2:03 "), Some(123));
+        assert_eq!(temps("45"), Some(45));
+        assert_eq!(temps("90:00"), Some(5400));
+        for x in ["", "1:60", "a", "1::2", "1:2:3:4", "-1", "1:2.5"] {
+            assert_eq!(temps(x), None, "{x}");
+        }
+        assert_eq!(hms(3723), "01:02:03");
+        let t = Tache {
+            qualite: Qualite::P720,
+            estimation: None,
+            section: Some((60, 3723)),
+            debut: false,
+        };
+        let a = t.args();
+        let apres = |o: &str| a.iter().position(|x| x == o).map(|i| a[i + 1].as_str());
+        assert_eq!(apres("--download-sections"), Some("*00:01:00-01:02:03"));
+        assert_eq!(
+            apres("-o"),
+            Some("%(title).150B [%(id)s] 00.01.00-01.02.03.%(ext)s")
+        );
+        assert!(!a.iter().any(|x| x == "--live-from-start"));
+        let live = Tache {
+            debut: true,
+            section: None,
+            ..t
+        };
+        let a = live.args();
+        assert!(a.iter().any(|x| x == "--live-from-start"));
+        assert!(!a.iter().any(|x| x == "--download-sections"));
+        assert!(debut_possible("https://www.youtube.com/live/abc"));
+        assert!(!debut_possible("https://www.twitch.tv/chaine"));
+        // --cookies seulement avec un fichier, toujours après --ignore-config.
+        let o = Outils::default();
+        let mut c = commande(Path::new("/usr/bin/yt-dlp"));
+        args_communs(&mut c, &o, Some(Path::new("/tmp/c.txt")));
+        let a: Vec<_> = c
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(a[0], "--ignore-config");
+        let i = a.iter().position(|x| x == "--cookies").unwrap();
+        assert_eq!(a[i + 1], "/tmp/c.txt");
+        let mut c = commande(Path::new("/usr/bin/yt-dlp"));
+        args_communs(&mut c, &o, None);
+        assert!(!c.get_args().any(|a| a == "--cookies"));
     }
 
     #[test]

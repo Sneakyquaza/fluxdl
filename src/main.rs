@@ -2,6 +2,7 @@
 //! Gestionnaire de téléchargement multi-connexions : fenêtre egui, ou modes en ligne de
 //! commande (`--capture DOSSIER`, `--benchmark URL`).
 
+mod cookies;
 mod extension;
 mod github;
 mod i18n;

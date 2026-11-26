@@ -16,6 +16,8 @@ const DEFAULTS = {
   allowSites: "",
   denySites: "",
   cookieSites: "",
+  // Sites vidéo (sites.js) : { youtube: true } = cookies de connexion envoyés pour ce site
+  videoCookies: {},
 };
 
 // Extensions « probablement un fichier » pour le bouton flottant et la page de liens

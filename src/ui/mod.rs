@@ -161,6 +161,10 @@ enum Modale {
         rx: Attente<Result<video::Infos, String>>,
         infos: Option<Result<video::Infos, String>>,
         choix: video::Qualite,
+        /// Passage « de … à … » (texte saisi, vide = toute la vidéo) ; live depuis le début.
+        de: String,
+        a: String,
+        debut: bool,
     },
     /// Outils vidéo manquants ; `url` : vidéo à ouvrir ensuite (vide depuis les réglages).
     Outils { url: String, etat: EtatOutils },
@@ -264,6 +268,9 @@ pub struct App {
     inconnues: Vec<serde_json::Value>,
     /// Police CJK du système déjà cherchée.
     cjk: bool,
+    /// Cookies de connexion par page vidéo (extension, option par site) : en mémoire seulement,
+    /// oubliés quand plus aucune vidéo de la page n'attend (fin, retrait, fenêtre fermée).
+    jarres: HashMap<String, Arc<Vec<crate::cookies::Cookie>>>,
 }
 
 impl App {
@@ -324,6 +331,7 @@ impl App {
             horloge: std::time::Instant::now(),
             inconnues: Vec::new(),
             cjk: false,
+            jarres: HashMap::new(),
         };
         if let Some(d) = capture {
             app.demo();
@@ -342,6 +350,8 @@ impl App {
         }
         app.next_id = app.entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
         maj::nettoyer();
+        // Cookies laissés par un plantage (instance unique déjà prise).
+        crate::cookies::purger(&crate::cookies::dossier());
         crate::extension::mettre_a_jour(&crate::extension::dossier());
         app.outils = video::trouver();
         // yt-dlp suit les changements des sites : notre copie se met à jour chaque semaine.
@@ -492,11 +502,18 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         let o = self.outils.clone();
         let u = url.clone();
+        let jarre = self.jarres.get(&url).cloned();
         std::thread::spawn(move || {
             let r = if o.ytdlp.is_none() {
                 Err(video::ABSENT.to_string())
             } else {
-                video::lire_infos(&o, &u)
+                // Fichier de cookies effacé dès que yt-dlp a lu la page.
+                match jarre.map(|j| crate::cookies::Fichier::creer(&crate::cookies::dossier(), &j))
+                {
+                    Some(Err(e)) => Err(format!("cookies: {e}")),
+                    Some(Ok(f)) => video::lire_infos(&o, &u, Some(f.chemin())),
+                    None => video::lire_infos(&o, &u, None),
+                }
             };
             let _ = tx.send(r);
         });
@@ -504,8 +521,62 @@ impl App {
             url,
             rx: Some(rx),
             infos: None,
-            choix: video::Qualite::Best,
+            choix: self.settings.video_quality,
+            de: String::new(),
+            a: String::new(),
+            debut: false,
         });
+    }
+
+    /// Page vidéo envoyée par l'extension (bouton près du lecteur, menu) : choix du format,
+    /// ou ajout direct dans la qualité par défaut si la fenêtre est réduite. Déjà dans la file
+    /// (pas finie) : cookies neufs gardés et reprise (`--continue`) ; c'est aussi ainsi qu'une
+    /// vidéo à connexion reprend après un redémarrage de l'appli (cookies jamais sur le disque).
+    fn ajouter_video(
+        &mut self,
+        url: String,
+        cookies: Option<Vec<crate::cookies::Cookie>>,
+        reduite: bool,
+    ) -> Statut {
+        let url = url.trim().to_string();
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Statut::Refuse;
+        }
+        let jarre = cookies
+            .map(|c| crate::cookies::pour_la_page(&url, c))
+            .filter(|c| !c.is_empty());
+        if let Some(j) = jarre {
+            self.jarres.insert(url.clone(), Arc::new(j));
+        }
+        if let Some(e) = self.entries.iter_mut().rev().find(|e| {
+            e.url == url
+                && matches!(e.kind, Kind::Video { .. })
+                && !matches!(e.status, Status::Done | Status::Canceled)
+        }) {
+            if matches!(e.status, Status::Paused | Status::Failed(_)) {
+                e.status = Status::Queued;
+            }
+            self.selected = Some(e.id);
+            self.tab = Tab::Downloads;
+            return Statut::DejaActif;
+        }
+        if reduite && self.outils.ytdlp.is_some() && (cfg!(not(windows)) || self.outils.complets())
+        {
+            let login = self.jarres.contains_key(&url);
+            self.nouvelle(
+                url,
+                Kind::Video {
+                    quality: self.settings.video_quality,
+                    estimate: None,
+                    section: None,
+                    from_start: false,
+                    login,
+                },
+            );
+            return Statut::Ajoute;
+        }
+        self.ouvrir_video(url);
+        Statut::Ajoute
     }
 
     /// Torrent : liste des fichiers lue dans un fil (un lien magnet interroge les pairs).
@@ -556,10 +627,33 @@ impl App {
                 };
                 std::thread::spawn(move || engine::run(&url, &dir, name.as_deref(), &opts, &c))
             }
-            Kind::Video { quality, estimate } => {
+            Kind::Video {
+                quality,
+                estimate,
+                section,
+                from_start,
+                login,
+            } => {
                 let o = self.outils.clone();
+                let tache = video::Tache {
+                    qualite: quality,
+                    estimation: estimate,
+                    section,
+                    debut: from_start,
+                };
+                let jarre = self.jarres.get(&url).cloned();
                 std::thread::spawn(move || {
-                    video::telecharger(&o, &url, &dir, quality, estimate, &c)
+                    // Cookies en mémoire seulement : après un redémarrage, il faut les renvoyer.
+                    let f = match (jarre, login) {
+                        (None, true) => return Err(video::ERR_COOKIES.to_string()),
+                        (None, false) => None,
+                        (Some(j), _) => Some(
+                            crate::cookies::Fichier::creer(&crate::cookies::dossier(), &j)
+                                .map_err(|e| format!("cookies: {e}"))?,
+                        ),
+                    };
+                    // `f` vit jusqu'à la fin de yt-dlp, puis le fichier est effacé.
+                    video::telecharger(&o, &url, &dir, &tache, f.as_ref().map(|f| f.chemin()), &c)
                 })
             }
             Kind::Torrent {
@@ -641,6 +735,20 @@ impl App {
             }
             delete_parts(e, *effacer);
             false
+        });
+        // Cookies d'une page dont plus rien n'attend : oubliés.
+        let ouverte = match &self.modale {
+            Some(Modale::Video { url, .. } | Modale::Outils { url, .. }) => Some(url.as_str()),
+            _ => None,
+        };
+        let entries = &self.entries;
+        self.jarres.retain(|u, _| {
+            ouverte == Some(u.as_str())
+                || entries.iter().any(|e| {
+                    &e.url == u
+                        && matches!(e.kind, Kind::Video { .. })
+                        && !matches!(e.status, Status::Done | Status::Canceled)
+                })
         });
         // Fin, pause ou échec : la file est écrite tout de suite.
         if fini {
@@ -2182,7 +2290,7 @@ impl App {
         let f = *frame;
         let dir = dir.clone();
         // Assez d'images entre le changement de vue et la capture pour finir les animations.
-        let vues: [(Tab, Lang, &str); 18] = [
+        let vues: [(Tab, Lang, &str); 20] = [
             (Tab::Downloads, Lang::En, "downloads"),
             (Tab::Benchmark, Lang::En, "benchmark"),
             (Tab::Settings, Lang::En, "settings"),
@@ -2190,6 +2298,8 @@ impl App {
             (Tab::Downloads, Lang::Fr, "update_banner_fr"),
             (Tab::Settings, Lang::Fr, "settings_extension_fr"),
             (Tab::Downloads, Lang::Fr, "video_formats_fr"),
+            (Tab::Downloads, Lang::Fr, "video_live_fr"),
+            (Tab::Settings, Lang::Fr, "settings_video_fr"),
             (Tab::Downloads, Lang::Fr, "torrent_pieces_fr"),
             (Tab::Downloads, Lang::Fr, "video_tools_fr"),
             (Tab::Settings, Lang::Fr, "extension_guide_fr"),
@@ -2243,6 +2353,8 @@ impl App {
             })),
             "settings_extension_fr" => self.defile = Some(300.0),
             "video_formats_fr" => {
+                // ffmpeg présent : le passage « de … à … » est saisissable.
+                self.outils.ffmpeg = Some(PathBuf::from("ffmpeg"));
                 let ch = |q, d, t| (q, d, Some(t));
                 self.modale = Some(Modale::Video {
                     url: "https://www.youtube.com/watch?v=aqz-KE-bpKQ".into(),
@@ -2259,10 +2371,42 @@ impl App {
                             ch(video::Qualite::M4a, true, 10_300_000),
                             ch(video::Qualite::Mp3, true, 10_300_000),
                         ],
+                        en_direct: false,
                     })),
                     choix: video::Qualite::P1080,
+                    de: "00:02:00".into(),
+                    a: "00:05:30".into(),
+                    debut: false,
                 });
             }
+            "video_live_fr" => {
+                self.outils.ffmpeg = None;
+                let u = "https://www.youtube.com/live/jfKfPfyJRdk";
+                // Cookies de démonstration (vides) : montre la mention « avec vos cookies ».
+                self.jarres.insert(u.into(), Arc::new(Vec::new()));
+                self.modale = Some(Modale::Video {
+                    url: u.into(),
+                    rx: None,
+                    infos: Some(Ok(video::Infos {
+                        titre: "Live : concert en direct (réservé aux membres)".into(),
+                        duree: None,
+                        hauteur_max: 1080,
+                        choix: vec![
+                            (video::Qualite::Best, true, None),
+                            (video::Qualite::P1080, true, None),
+                            (video::Qualite::P720, true, None),
+                            (video::Qualite::M4a, true, None),
+                            (video::Qualite::Mp3, true, None),
+                        ],
+                        en_direct: true,
+                    })),
+                    choix: video::Qualite::Best,
+                    de: String::new(),
+                    a: String::new(),
+                    debut: true,
+                });
+            }
+            "settings_video_fr" => self.defile = Some(900.0),
             "torrent_pieces_fr" => self.selected = Some(5),
             "cancel_fr" => {
                 self.modale = Some(Modale::Annuler {
@@ -2471,6 +2615,9 @@ impl App {
         vid.kind = Kind::Video {
             quality: video::Qualite::P1080,
             estimate: Some(402 * mo),
+            section: None,
+            from_start: false,
+            login: false,
         };
         self.entries.insert(1, tor);
         self.entries.insert(3, vid);
@@ -2552,6 +2699,7 @@ impl eframe::App for App {
             .as_ref()
             .map(|rx| rx.try_iter().collect())
             .unwrap_or_default();
+        let reduite = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         for d in recus {
             // 2e instance lancée sans lien : montrer la fenêtre.
             if d.url.is_empty() {
@@ -2560,6 +2708,9 @@ impl eframe::App for App {
             }
             let avant = self.modale.is_some();
             let mut ajout = || {
+                if d.video() {
+                    return self.ajouter_video(d.url.clone(), d.video_cookies.clone(), reduite);
+                }
                 self.ajouter(
                     d.url.clone(),
                     d.referrer.clone(),
@@ -2875,6 +3026,8 @@ fn reglage(ui: &mut Ui, titre: &str, aide: &str, controle: impl FnOnce(&mut Ui))
             .layout(Layout::right_to_left(Align::Center)),
         controle,
     );
+    // Contrôle vide (ex. yt-dlp sous Linux) : la ligne suivante reste sous celle-ci.
+    ui.advance_cursor_after_rect(r);
 }
 
 /// Titre au-dessus d'une carte de réglages.

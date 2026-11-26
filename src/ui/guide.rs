@@ -461,7 +461,7 @@ impl App {
                 ),
             ],
             r"C:\Users\Camille\AppData\Local\fluxdl\extension".into(),
-            r"C:\Users\Camille\Downloads\fluxdl-firefox-0.2.3.zip".into(),
+            r"C:\Users\Camille\Downloads\fluxdl-firefox-0.2.4.zip".into(),
             None,
         );
         g.choix = if firefox { 3 } else { 0 };
