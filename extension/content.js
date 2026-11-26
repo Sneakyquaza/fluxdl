@@ -1,4 +1,5 @@
-// Script de contenu : bouton flottant « ⬇ fluxdl » au survol des liens de fichiers et des
+// Script de contenu : bouton flottant « ⬇ fluxdl » au survol des liens de fichiers (vérifiés par
+// l'arrière-plan : pas de bouton sur une page web) et des
 // vidéos/sons, bouton près du lecteur sur les pages de vidéo des sites de sites.js (chargé
 // avant ce script), et collecte des liens pour la page « tout télécharger ».
 // Ne lit jamais le stockage (le jeton y est) et ne parle qu'à l'arrière-plan.
@@ -14,6 +15,7 @@
   let host = null; // élément hôte dans la page
   let btn = null; // bouton dans l'ombre fermée
   let current = null; // { el, url }
+  let pointed = null; // lien survolé en attente de la sonde
   let hideTimer = 0;
   let resetTimer = 0;
 
@@ -250,6 +252,22 @@
     resetTimer = setTimeout(hide, 1600);
   }
 
+  // Lien : le bouton n'apparaît que si l'arrière-plan confirme que c'est un fichier (pas une
+  // page web) ; média : tout de suite (adresse réelle d'un <video>/<audio>).
+  function offer(target) {
+    if (target.media || (current && current.el === target.el && current.url === target.url)) {
+      show(target);
+      return;
+    }
+    if (pointed && pointed.el === target.el && pointed.url === target.url) return;
+    pointed = target;
+    send({ type: "fluxdl-probe", url: target.url }).then((res) => {
+      if (res?.ok !== true || pointed !== target || !config.floatButton) return;
+      pointed = null;
+      show(target);
+    });
+  }
+
   let pending = null;
   function onPointer(e) {
     if (!config.floatButton) return;
@@ -263,15 +281,18 @@
       onPointer.raf = 0;
       const ev = pending;
       const target = linkTarget(ev.target) || mediaAt(ev.clientX, ev.clientY);
-      if (target) show(target);
-      else if (current) scheduleHide();
+      if (target) offer(target);
+      else {
+        pointed = null;
+        if (current) scheduleHide();
+      }
     });
   }
 
   function onFocus(e) {
     if (!config.floatButton || e.target === host) return;
     const target = linkTarget(e.target);
-    if (target) show(target);
+    if (target) offer(target);
   }
 
   // Liens pour la page « tout télécharger »

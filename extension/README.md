@@ -3,6 +3,23 @@
 Manifest V3 extension for Chrome, Edge and Firefox that sends downloads to the fluxdl app
 running on `127.0.0.1`. Plain JavaScript, no build step, no remote code.
 
+## Link check before the floating button (0.2.5)
+
+- Hovering a link that looks like a file asks the background to check it first; the
+  "⬇ fluxdl" button appears only if the answer is a file: `Content-Disposition: attachment`,
+  a non-HTML `Content-Type`, or `206` with `Content-Range`. `text/html` /
+  `application/xhtml+xml` (file host landing pages, login walls, Cloudflare 403/503
+  challenges), errors and timeouts → no button. `<video>`/`<audio>` addresses and the video
+  page button are not checked.
+- The check is a `HEAD` request, or if refused a `GET` with `Range: bytes=0-0` cut as soon as
+  the headers arrive (the body is never read), redirects followed, 2.5 s max. Cookies are sent
+  only if **Send cookies** is on for that site (otherwise `credentials: "omit"`).
+- Results are cached 10 minutes per address (500 max, in memory: lost when the browser stops
+  the background), identical checks are shared and at most 4 run at once. Nothing is checked
+  when the floating button is turned off. The right-click menu still sends any link.
+- Firefox: if "Access your data for all websites" isn't granted (about:addons → fluxdl →
+  Permissions), the content script doesn't run and the check can't read headers: no button.
+
 ## Video pages (0.2.4)
 
 - `sites.js` lists the video sites (YouTube, Twitch): hosts, which paths are video pages, which
@@ -81,6 +98,7 @@ running on `127.0.0.1`. Plain JavaScript, no build step, no remote code.
 | `storage` | Settings (port, token, capture rules). `storage.session` keeps the picker's link list for the tab it opens. |
 | `notifications` | "fluxdl not running", errors. |
 | host `http://127.0.0.1/*` | Talk to the fluxdl app on this computer (optional on Firefox: granted in the options). |
+| host `http://*/*`, `https://*/*` | **New in 0.2.5.** The background checks what a hovered link returns (headers only) before showing the floating button; reading the response headers of another site requires host access. It can't be an optional permission asked at that moment (a hover isn't a click, and the browser only asks on a click). It doesn't add a new warning: the content script already runs on the same sites. |
 | content script on `http://*/*`, `https://*/*` | **New in 0.2.1.** Needed for the hover button and to list a page's links for the picker. It only reads link and media addresses when you hover or ask for the picker, and sends nothing anywhere except to the extension's background. This is why the browser now says the extension can "read and change data on websites". |
 | optional `cookies` + `<all_urls>` | Only requested when you turn on **Send cookies**. |
 | optional `cookies` + one video site | Only requested when you turn on **Send my login cookies for this site** (e.g. `*://*.youtube.com/*`). |

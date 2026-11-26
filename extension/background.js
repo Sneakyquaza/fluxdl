@@ -81,15 +81,21 @@ api.runtime.onInstalled.addListener(async (details) => {
 });
 api.runtime.onStartup?.addListener(setupMenu);
 
+// Vrai si l'option, la permission et la liste de sites permettent les cookies pour ce lien
+async function cookiesAllowed(url, settings) {
+  if (!settings.sendCookies || !api.cookies) return false;
+  if (parseList(settings.cookieSites).length && !hostInList(hostOf(url), settings.cookieSites)) return false;
+  try {
+    return await api.permissions.contains({ permissions: ["cookies"], origins: ["<all_urls>"] });
+  } catch {
+    return false;
+  }
+}
+
 // Cookies du site, si l'option, la permission et la liste de sites le permettent
 async function cookiesFor(url, settings) {
-  if (!settings.sendCookies || !api.cookies) return undefined;
-  if (parseList(settings.cookieSites).length && !hostInList(hostOf(url), settings.cookieSites)) {
-    return undefined;
-  }
+  if (!(await cookiesAllowed(url, settings))) return undefined;
   try {
-    const ok = await api.permissions.contains({ permissions: ["cookies"], origins: ["<all_urls>"] });
-    if (!ok) return undefined;
     const list = await api.cookies.getAll({ url });
     if (!list.length) return undefined;
     return list.map((c) => `${c.name}=${c.value}`).join("; ");
@@ -197,6 +203,86 @@ async function sendManual(url, extra) {
   return res.state;
 }
 
+// ---- Sonde des liens (bouton flottant) ----
+// Un lien qui « ressemble » à un fichier peut donner une page web (hébergeur, page d'accueil,
+// connexion, anti-robot) : le bouton n'apparaît qu'après une réponse qui est bien un fichier.
+// HEAD, sinon GET Range 0-0 coupé dès les en-têtes (corps jamais lu) ; doute → pas de bouton.
+const PROBE_TIMEOUT_MS = 2500;
+const PROBE_TTL_MS = 10 * 60 * 1000;
+const PROBE_MAX = 500;
+const PROBE_PARALLEL = 4;
+const probeCache = new Map(); // url → { ok, at } (ordre d'insertion = le plus ancien d'abord)
+const probing = new Map(); // url → Promise<bool> (sondes en cours, partagées)
+const probeQueue = [];
+let probeActive = 0;
+
+function isFileResponse(res) {
+  if (!res.ok) return false; // 403/503 d'anti-robot, 404…
+  if (/^\s*attachment/i.test(res.headers.get("content-disposition") || "")) return true;
+  const type = (res.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+  if (type === "text/html" || type === "application/xhtml+xml") return false;
+  if (res.status === 206 && res.headers.get("content-range")) return true;
+  return !!type;
+}
+
+async function probeFetch(url) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), PROBE_TIMEOUT_MS);
+  const opts = {
+    signal: ctrl.signal,
+    cache: "no-store",
+    redirect: "follow",
+    credentials: (await cookiesAllowed(url, await getSettings())) ? "include" : "omit",
+  };
+  try {
+    let res = null;
+    try {
+      res = await fetch(url, { ...opts, method: "HEAD" });
+    } catch {
+      if (ctrl.signal.aborted) return false;
+    }
+    // HEAD refusé (405, 403 d'une adresse signée pour GET…) ou en échec : GET d'un seul octet
+    if (!res?.ok) res = await fetch(url, { ...opts, headers: { Range: "bytes=0-0" } });
+    return isFileResponse(res);
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+    ctrl.abort(); // corps jamais lu
+  }
+}
+
+function pumpProbes() {
+  while (probeActive < PROBE_PARALLEL && probeQueue.length) {
+    const { url, done } = probeQueue.shift();
+    probeActive++;
+    probeFetch(url)
+      .then(done)
+      .finally(() => {
+        probeActive--;
+        pumpProbes();
+      });
+  }
+}
+
+function probeLink(url) {
+  const hit = probeCache.get(url);
+  if (hit && Date.now() - hit.at < PROBE_TTL_MS) return Promise.resolve(hit.ok);
+  if (probing.has(url)) return probing.get(url);
+  const p = new Promise((done) => {
+    probeQueue.push({ url, done });
+    pumpProbes();
+  }).then((ok) => {
+    probing.delete(url);
+    probeCache.delete(url);
+    probeCache.set(url, { ok, at: Date.now() });
+    if (probeCache.size > PROBE_MAX) probeCache.delete(probeCache.keys().next().value);
+    return ok;
+  });
+  probing.set(url, p);
+  return p;
+}
+
 // ---- Page de liens ----
 
 const pickerMemory = new Map(); // repli si storage.session manque
@@ -290,6 +376,12 @@ async function handleMessage(msg, sender) {
       const referrer = typeof msg.referrer === "string" ? msg.referrer : "";
       const res = await sendToApp(msg.url, { referrer }, await getSettings());
       return { state: res.state, status: res.status };
+    }
+    case "fluxdl-probe": {
+      // Bouton flottant : le lien survolé donne-t-il vraiment un fichier ?
+      if (!fromTab || typeof msg.url !== "string" || msg.url.length > MAX_URL || !isHttp(msg.url)) return { error: "url" };
+      if (!(await getSettings()).floatButton) return { ok: false };
+      return { ok: await probeLink(msg.url) };
     }
     case "fluxdl-video": {
       // Bouton près du lecteur : page de vidéo d'un site connu, du même site que l'onglet

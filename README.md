@@ -55,6 +55,13 @@ A free, open-source multi-connection download manager (Windows + Linux, single e
   files (asked on the first torrent, toggle in Settings, current user only).
 - **Browser extension** (below).
 
+### New in 0.2.5
+- **No more button on links that are really web pages.** A link that looks like a file
+  (`file.zip`, `download` attribute) often leads to a file host's landing page, a login wall
+  or an anti-bot check. Before showing "⬇ fluxdl" on hover, the extension now asks the server
+  what the link returns (`HEAD`, or a 1-byte `GET`, headers only, 2.5 s max) and shows the
+  button only for a real file. Right-click "Download with fluxdl" still works on any link.
+
 ### New in 0.2.4
 - **YouTube and Twitch from the browser.** On a video page (youtube.com/watch, /live/, /shorts/,
   youtu.be, twitch.tv/videos/…, Twitch clips, a live Twitch channel) the extension shows a
