@@ -1,7 +1,7 @@
 [package]
 # Nom provisoire : à changer ici et dans `APP_NAME` (src/lib.rs).
 name = "fluxdl"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 description = "Free open-source multi-connection download manager"
@@ -12,8 +12,8 @@ path = "src/lib.rs"
 
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["glow", "x11", "wayland"] }
-# Captures PNG (--capture) seulement.
-image = { version = "0.25", default-features = false, features = ["png"] }
+# Captures PNG (--capture) et fond d’écran JPEG embarqué.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # HTTP bloquant + fils : petit exe, HTTPS par rustls (pas d'OpenSSL).

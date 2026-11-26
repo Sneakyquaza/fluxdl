@@ -114,8 +114,8 @@ pub struct App {
     next_id: u64,
     last_save: f64,
     capture: Option<(PathBuf, u32)>,
-    /// Textures à garder en vie : palette (dessins) et logo.
-    _palette: egui::TextureHandle,
+    /// Textures à garder en vie : style (profils, fond) et logo.
+    _textures: Vec<egui::TextureHandle>,
     logo: egui::TextureHandle,
     now: f64,
     /// Instant d'ajout de chaque nouveau téléchargement (apparition en fondu).
@@ -128,7 +128,7 @@ pub struct App {
 
 impl App {
     pub fn new(ctx: &egui::Context, capture: Option<PathBuf>) -> Self {
-        let palette = installer_style(ctx);
+        let textures = installer_style(ctx);
         let logo = ctx.load_texture(
             "logo",
             egui::ColorImage::from_rgba_unmultiplied([64, 64], &crate::icone::icone_rgba(64)),
@@ -153,7 +153,7 @@ impl App {
             next_id: 1,
             last_save: 0.0,
             capture: None,
-            _palette: palette,
+            _textures: textures,
             logo,
             now: 0.0,
             born: HashMap::new(),
@@ -285,20 +285,18 @@ impl App {
             .resizable(false)
             .show_separator_line(false)
             .show(ui, |ui| {
-                egui::Frame::new()
-                    .fill(SURFACE)
-                    .stroke(Stroke::new(1.0, BORD))
-                    .corner_radius(12)
+                let fond = ui.painter().add(egui::Shape::Noop);
+                let cadre = egui::Frame::NONE
                     .inner_margin(Margin::same(14))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
-                        icone(ui.painter(), r, Icone::Eclair, teinte(0.55));
-                        ui.add_space(2.0);
+                        let (r, _) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
+                        tuile_icone(ui.painter(), r, Icone::Eclair, GEL_VERT);
+                        ui.add_space(4.0);
                         ui.label(
                             egui::RichText::new(t(l, "Done early? Take half."))
                                 .font(demi(13.5))
-                                .color(TEXTE),
+                                .color(TITRE),
                         );
                         ui.add_space(-2.0);
                         let m = t(
@@ -307,6 +305,16 @@ impl App {
                         );
                         ui.label(egui::RichText::new(m).font(regulier(12.5)).color(TEXTE2));
                     });
+                // Encart : verre plus clair, posé dans le verre de la barre.
+                let r = cadre.response.rect;
+                ui.painter().set(
+                    fond,
+                    egui::Shape::Vec(vec![
+                        vdeg(r, 12, blanc(215), blanc(150)),
+                        reflet(r.shrink(1.0), 11, 0.5),
+                        egui::Shape::rect_stroke(r, 12, Stroke::new(1.0, nuit(45)), StrokeKind::Inside),
+                    ]),
+                );
                 ui.add_space(14.0);
                 ui.label(
                     egui::RichText::new(format!(
@@ -333,14 +341,19 @@ impl App {
             pos2(logo.right() + 12.0, r.center().y),
             Align2::LEFT_CENTER,
             APP_NAME,
-            demi(17.0),
-            TEXTE,
+            demi(18.0),
+            TITRE,
         );
         ui.add_space(30.0);
         let items = [
-            (Tab::Downloads, Icone::Telecharger, "Downloads"),
-            (Tab::Benchmark, Icone::Comparatif, "Benchmark"),
-            (Tab::Settings, Icone::Reglages, "Settings"),
+            (Tab::Downloads, Icone::Telecharger, "Downloads", GEL_VERT),
+            (Tab::Benchmark, Icone::Comparatif, "Benchmark", GEL_BLEU),
+            (
+                Tab::Settings,
+                Icone::Reglages,
+                "Settings",
+                gel_de(rgb(0x5f, 0x86, 0xb0)),
+            ),
         ];
         let pas = 42.0;
         let (zone, _) = ui.allocate_exact_size(vec2(w, pas * items.len() as f32), Sense::hover());
@@ -350,14 +363,13 @@ impl App {
             .animate_value_with_time(egui::Id::unique("nav"), idx, 0.18);
         let ind = Rect::from_min_size(pos2(zone.left(), zone.top() + y * pas), vec2(w, 38.0));
         let p = ui.painter().clone();
-        p.rect_filled(ind, 10.0, SURFACE_HAUTE);
-        p.rect_stroke(ind, 10.0, Stroke::new(1.0, BORD), StrokeKind::Inside);
+        selection(&p, ind, 8.0, 1.0);
         let actifs = self
             .entries
             .iter()
             .filter(|e| e.status == Status::Running)
             .count();
-        for (k, (tab, ic, nom)) in items.into_iter().enumerate() {
+        for (k, (tab, ic, nom, teinte_ic)) in items.into_iter().enumerate() {
             let r = Rect::from_min_size(
                 pos2(zone.left(), zone.top() + k as f32 * pas),
                 vec2(w, 38.0),
@@ -368,55 +380,63 @@ impl App {
             }
             let h = survol(ui, &rep);
             let actif = self.tab == tab;
-            if !actif && h > 0.0 {
-                p.rect_filled(r, 10.0, Color32::from_white_alpha((7.0 * h) as u8));
+            if !actif {
+                selection(&p, r, 8.0, 0.45 * h);
             }
             let c = if actif { TEXTE } else { mix(TEXTE2, TEXTE, h) };
-            icone(
+            tuile_icone(
                 &p,
-                Rect::from_min_size(pos2(r.left() + 13.0, r.center().y - 8.0), Vec2::splat(16.0)),
+                Rect::from_min_size(pos2(r.left() + 8.0, r.center().y - 12.0), Vec2::splat(24.0)),
                 ic,
-                if actif { teinte(0.5) } else { c },
+                teinte_ic,
             );
             texte(
                 ui,
                 pos2(r.left() + 42.0, r.center().y),
                 Align2::LEFT_CENTER,
                 t(l, nom),
-                moyen(14.0),
+                if actif { demi(14.0) } else { moyen(14.0) },
                 c,
             );
             if tab == Tab::Downloads && actifs > 0 {
                 let b = Rect::from_min_size(
-                    pos2(r.right() - 28.0, r.center().y - 9.0),
-                    vec2(20.0, 18.0),
+                    pos2(r.right() - 30.0, r.center().y - 10.0),
+                    vec2(22.0, 20.0),
                 );
-                p.rect_filled(b, 9.0, ACCENT.gamma_multiply(0.2));
-                p.text(
-                    b.center(),
-                    Align2::CENTER_CENTER,
-                    actifs.to_string(),
-                    demi(11.5),
-                    teinte(0.45),
-                );
+                gel(&p, b, 10.0, GEL_BLEU, true, false);
+                for (d, c) in [(vec2(0.0, 1.0), nuit(140)), (Vec2::ZERO, Color32::WHITE)] {
+                    p.text(
+                        b.center() + d,
+                        Align2::CENTER_CENTER,
+                        actifs.to_string(),
+                        demi(12.0),
+                        c,
+                    );
+                }
             }
         }
     }
 
     /// Titre de page (et texte d'appoint facultatif).
     fn page_title(&self, ui: &mut Ui, titre: &str, sous: Option<&str>) -> Rect {
-        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
-        texte(
-            ui,
+        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
+        // Posé sur le ciel : blanc ombré.
+        texte_ciel(
+            ui.painter(),
             r.left_center(),
             Align2::LEFT_CENTER,
             titre,
-            affiche(26.0),
-            TEXTE,
+            affiche(30.0),
         );
         if let Some(s) = sous {
-            ui.add_space(2.0);
-            ui.label(egui::RichText::new(s).font(regulier(14.0)).color(TEXTE2));
+            let (rs, _) = ui.allocate_exact_size(vec2(r.width(), 22.0), Sense::hover());
+            texte_ciel(
+                ui.painter(),
+                rs.left_center(),
+                Align2::LEFT_CENTER,
+                s,
+                moyen(14.0),
+            );
         }
         r
     }
@@ -441,13 +461,14 @@ impl App {
                 vec2(larg, 34.0),
             );
             let p = ui.painter();
-            p.rect_filled(b, 17.0, SURFACE);
-            p.rect_stroke(b, 17.0, Stroke::new(1.0, BORD), StrokeKind::Inside);
+            p.add(verre(ui.ctx(), b, 17, 0.7));
+            p.add(reflet(b.shrink(1.0), 16, 0.6));
+            orbe(p, pos2(b.left() + 22.0, b.center().y), 9.0, GEL_VERT);
             icone(
                 p,
-                Rect::from_min_size(pos2(b.left() + 16.0, b.center().y - 8.0), Vec2::splat(16.0)),
+                Rect::from_center_size(pos2(b.left() + 22.0, b.center().y), Vec2::splat(11.0)),
                 Icone::Telecharger,
-                teinte(0.5),
+                Color32::WHITE,
             );
             let x = b.left() + 40.0;
             let ga_w = ga.size().x;
@@ -484,7 +505,7 @@ impl App {
     /// Barre « coller un lien » : champ, Coller, Télécharger ; dossier, SHA-256, connexions.
     fn paste_card(&mut self, ui: &mut Ui) {
         let l = self.settings.lang;
-        carte().inner_margin(Margin::same(14)).show(ui, |ui| {
+        carte(ui, Margin::same(14), |ui| {
             let w = ui.available_width();
             ui.set_width(w);
             let (r, _) = ui.allocate_exact_size(vec2(w, 44.0), Sense::hover());
@@ -514,7 +535,13 @@ impl App {
                     .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
             }
             let go = a_la_place(ui, bd, |ui| {
-                bouton_principal(ui, t(l, "Download"), Some(Icone::Telecharger), bd.size())
+                bouton_gel(
+                    ui,
+                    t(l, "Download"),
+                    Some(Icone::Telecharger),
+                    bd.size(),
+                    GEL_VERT,
+                )
             });
             if go.clicked() || entree {
                 self.add();
@@ -524,15 +551,14 @@ impl App {
             // Connexions : − valeur +, à droite.
             let st = Rect::from_min_size(pos2(r.right() - 96.0, r.top()), vec2(96.0, 30.0));
             let p = ui.painter().clone();
-            p.rect_filled(st, 8.0, CREUX);
-            p.rect_stroke(st, 8.0, Stroke::new(1.0, BORD), StrokeKind::Inside);
+            gel(&p, st, 15.0, gel_de(rgb(0xee, 0xf3, 0xf8)), true, false);
             for (k, d) in [(0usize, -1i32), (1, 1)] {
                 let b = Rect::from_min_size(
                     pos2(st.left() + k as f32 * 66.0, st.top()),
                     vec2(30.0, 30.0),
                 );
                 let rep = ui.interact(b, egui::Id::unique(("pas", k)), Sense::click());
-                let c = if rep.hovered() { TEXTE } else { TEXTE3 };
+                let c = if rep.hovered() { ACCENT } else { TEXTE2 };
                 p.line_segment(
                     [b.center() - vec2(4.5, 0.0), b.center() + vec2(4.5, 0.0)],
                     Stroke::new(1.5, c),
@@ -590,12 +616,13 @@ impl App {
                     t(l, "Choose folder"),
                     self.settings.folder
                 ));
-            let c = if rep.hovered() { TEXTE } else { TEXTE2 };
+            let c = if rep.hovered() { ACCENT } else { TEXTE };
+            selection(&p, d, 15.0, 0.6 * survol(ui, &rep));
             icone(
                 &p,
                 Rect::from_min_size(pos2(d.left() + 15.0, d.center().y - 7.0), Vec2::splat(14.0)),
                 Icone::Dossier,
-                if rep.hovered() { TEXTE2 } else { TEXTE3 },
+                if rep.hovered() { ACCENT } else { TEXTE2 },
             );
             let court = Path::new(&self.settings.folder)
                 .file_name()
@@ -616,27 +643,31 @@ impl App {
         ui.vertical_centered(|ui| {
             let (r, _) = ui.allocate_exact_size(Vec2::splat(56.0), Sense::hover());
             let p = ui.painter();
-            p.circle_filled(r.center(), 28.0, SURFACE);
-            p.circle_stroke(r.center(), 28.0, Stroke::new(1.0, BORD));
-            icone(
+            orbe(p, r.center(), 28.0, GEL_VERT);
+            icone_relief(
                 p,
-                Rect::from_center_size(r.center(), Vec2::splat(22.0)),
+                Rect::from_center_size(r.center(), Vec2::splat(24.0)),
                 Icone::Telecharger,
-                teinte(0.5),
             );
             ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new(t(l, "No downloads yet"))
-                    .font(demi(16.0))
-                    .color(TEXTE),
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
+            texte_ciel(
+                ui.painter(),
+                r.center(),
+                Align2::CENTER_CENTER,
+                t(l, "No downloads yet"),
+                demi(17.0),
             );
-            ui.label(
-                egui::RichText::new(t(
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
+            texte_ciel(
+                ui.painter(),
+                r.center(),
+                Align2::CENTER_CENTER,
+                t(
                     l,
                     "Paste a link above. Each file is split across up to 32 parallel connections.",
-                ))
-                .font(regulier(13.5))
-                .color(TEXTE2),
+                ),
+                moyen(13.5),
             );
         });
     }
@@ -662,34 +693,9 @@ impl App {
             let sel = self.selected == Some(e.id);
             let h = survol(ui, &rep);
             let p = ui.painter().clone();
-            p.add(
-                egui::Shadow {
-                    offset: [0, 4],
-                    blur: 14,
-                    spread: 0,
-                    color: Color32::from_black_alpha(45),
-                }
-                .as_shape(r, 12),
-            );
-            let fond = if sel {
-                rgb(0x1a, 0x1e, 0x29)
-            } else {
-                mix(SURFACE, rgb(0x19, 0x1c, 0x24), h)
-            };
-            p.rect_filled(r, 12.0, fond);
-            p.rect_stroke(
-                r,
-                12.0,
-                Stroke::new(
-                    1.0,
-                    if sel {
-                        ACCENT.gamma_multiply(0.55)
-                    } else {
-                        mix(BORD, BORD_FORT, h)
-                    },
-                ),
-                StrokeKind::Inside,
-            );
+            p.add(verre(ui.ctx(), r, 12, 0.66 + 0.1 * h));
+            // Choisie : sélection Windows 7 par-dessus le verre.
+            selection(&p, r.shrink(3.0), 9.0, if sel { 1.0 } else { 0.35 * h });
             let nom = e.name.clone().unwrap_or_else(|| e.url.clone());
             let tuile =
                 Rect::from_min_size(pos2(r.left() + 16.0, r.top() + 16.0), Vec2::splat(40.0));
@@ -730,10 +736,11 @@ impl App {
             let fa = ui
                 .ctx()
                 .animate_value_with_time(rep.id.with("progres"), frac, 0.5);
-            let barre = Rect::from_min_size(pos2(x0, r.top() + 46.0), vec2(x1 - x0, 4.0));
+            let barre = Rect::from_min_size(pos2(x0, r.top() + 42.0), vec2(x1 - x0, 9.0));
             match e.status {
-                Status::Running => jauge(&p, barre, fa, Some(ACCENT_UV), ACCENT),
-                _ => jauge(&p, barre, fa, None, ce.gamma_multiply(0.85)),
+                // Barre de progression Vista : vert, reflet qui balaie.
+                Status::Running => jauge(&p, barre, fa, rgb(0x3c, 0xbf, 0x2a), true),
+                _ => jauge(&p, barre, fa, ce, false),
             }
             let ym = r.top() + 66.0;
             let pr = pastille(ui, pos2(x0, ym), etat, ce);
@@ -794,7 +801,7 @@ impl App {
         let l = self.settings.lang;
         match s {
             Status::Queued => (t(l, "Queued"), TEXTE2),
-            Status::Running => (t(l, "Downloading"), teinte(0.45)),
+            Status::Running => (t(l, "Downloading"), ACCENT),
             Status::Paused => (t(l, "Paused"), ATTENTION),
             Status::Done => (t(l, "Completed"), SUCCES),
             Status::Failed(_) => (t(l, "Failed"), DANGER),
@@ -841,8 +848,8 @@ impl App {
             r.left_center(),
             Align2::LEFT_CENTER,
             titre,
-            demi(13.5),
-            TEXTE,
+            demi(14.0),
+            TITRE,
         );
         texte(
             ui,
@@ -866,16 +873,18 @@ impl App {
             ui.vertical_centered(|ui| {
                 let (r, _) = ui.allocate_exact_size(Vec2::splat(52.0), Sense::hover());
                 let p = ui.painter();
-                p.circle_filled(r.center(), 26.0, SURFACE);
-                p.circle_stroke(r.center(), 26.0, Stroke::new(1.0, BORD));
-                icone(
+                orbe(p, r.center(), 26.0, GEL_BLEU);
+                icone_relief(
                     p,
                     Rect::from_center_size(r.center(), Vec2::splat(20.0)),
                     Icone::Comparatif,
-                    TEXTE3,
                 );
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new(t(l, "Nothing selected")).font(demi(15.0)));
+                ui.label(
+                    egui::RichText::new(t(l, "Nothing selected"))
+                        .font(demi(15.0))
+                        .color(TITRE),
+                );
                 ui.label(
                     egui::RichText::new(t(l, "Pick a download to watch its connections at work."))
                         .font(regulier(13.0))
@@ -991,11 +1000,11 @@ impl App {
             );
             let lw = texte(
                 ui,
-                pos2(x, r.top() + 34.0),
+                pos2(x, r.top() + 33.0),
                 Align2::LEFT_CENTER,
                 val,
-                affiche(22.0),
-                TEXTE,
+                affiche(26.0),
+                TITRE,
             );
             if !unite.is_empty() {
                 let g = ligne(ui, unite.as_str(), regulier(12.0), TEXTE2, col - lw - 12.0);
@@ -1014,14 +1023,13 @@ impl App {
             .layout_no_wrap(t(l, "stolen range").into(), regulier(12.0), TEXTE3)
             .size()
             .x;
-        let tq = pos2(rs.right() - lg - 9.0, rs.center().y + 3.0);
-        ui.painter().add(egui::Shape::convex_polygon(
-            vec![tq + vec2(-3.5, -6.0), tq + vec2(3.5, -6.0), tq],
-            TEXTE,
-            Stroke::NONE,
-        ));
+        bulle_vol(
+            ui.painter(),
+            pos2(rs.right() - lg - 10.0, rs.center().y),
+            teinte(0.5),
+        );
         ui.add_space(4.0);
-        carte_fichier(ui, &lv, 10.0);
+        carte_fichier(ui, &lv, 12.0);
         ui.add_space(22.0);
         let n = lv.workers.len();
         self.section(
@@ -1091,7 +1099,7 @@ impl App {
         );
         ui.add_space(20.0);
         let en_cours = self.bench.handle.is_some();
-        carte().show(ui, |ui| {
+        carte(ui, Margin::same(20), |ui| {
             let w = ui.available_width();
             ui.set_width(w);
             let (r, _) = ui.allocate_exact_size(vec2(w, 44.0), Sense::hover());
@@ -1173,7 +1181,7 @@ impl App {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if let (true, Some((phase, c))) = (en_cours, live) {
-            carte().show(ui, |ui| {
+            carte(ui, Margin::same(20), |ui| {
                 ui.set_width(ui.available_width());
                 let n = if phase == 1 {
                     1
@@ -1208,7 +1216,7 @@ impl App {
             ui.add_space(16.0);
         }
         if let Some(r) = &self.bench.result {
-            carte().show(ui, |ui| {
+            carte(ui, Margin::same(20), |ui| {
                 let w = ui.available_width();
                 ui.set_width(w);
                 match r {
@@ -1222,7 +1230,7 @@ impl App {
                             Align2::LEFT_CENTER,
                             &format!("×{x:.1}"),
                             affiche(64.0),
-                            if x >= 1.5 { TEXTE } else { ATTENTION },
+                            if x >= 1.5 { TITRE } else { ATTENTION },
                         );
                         texte(
                             ui,
@@ -1247,16 +1255,14 @@ impl App {
                         }
                         let k = 1.0 - (1.0 - k).powi(3);
                         let max = v1.max(*vn).max(1.0);
-                        for (n, v, uv) in [(1, *v1, None), (n, *vn, Some((0.15, 0.85)))] {
+                        let gris = rgb(0x9a, 0xaa, 0xbd);
+                        for (n, v, c) in [(1, *v1, gris), (n, *vn, rgb(0x3c, 0xbf, 0x2a))] {
                             let (r, _) = ui.allocate_exact_size(vec2(w, 20.0), Sense::hover());
                             texte(
                                 ui,
                                 r.left_center(),
                                 Align2::LEFT_CENTER,
-                                &format!(
-                                    "{n} {}",
-                                    compte(l, n, "connections")
-                                ),
+                                &format!("{n} {}", compte(l, n, "connections")),
                                 moyen(13.5),
                                 TEXTE2,
                             );
@@ -1269,8 +1275,8 @@ impl App {
                                 TEXTE,
                             );
                             ui.add_space(2.0);
-                            let (b, _) = ui.allocate_exact_size(vec2(w, 12.0), Sense::hover());
-                            jauge(ui.painter(), b, (v / max) as f32 * k, uv, TEXTE3);
+                            let (b, _) = ui.allocate_exact_size(vec2(w, 16.0), Sense::hover());
+                            jauge(ui.painter(), b, (v / max) as f32 * k, c, false);
                             ui.add_space(12.0);
                         }
                         if x < 1.5 {
@@ -1324,9 +1330,9 @@ impl App {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.set_max_width(w);
-                titre_section(ui, t(l, "Downloads"));
-                carte().inner_margin(Margin::symmetric(20, 6)).show(ui, |ui| {
+                carte(ui, Margin::symmetric(20, 6), |ui| {
                     ui.set_width(ui.available_width());
+                    titre_section(ui, t(l, "Downloads"));
                     reglage(
                         ui,
                         t(l, "Connections per download"),
@@ -1380,9 +1386,9 @@ impl App {
                     );
                 });
                 ui.add_space(20.0);
-                titre_section(ui, t(l, "Interface"));
-                carte().inner_margin(Margin::symmetric(20, 6)).show(ui, |ui| {
+                carte(ui, Margin::symmetric(20, 6), |ui| {
                     ui.set_width(ui.available_width());
+                    titre_section(ui, t(l, "Interface"));
                     reglage(
                         ui,
                         t(l, "Language"),
@@ -1397,9 +1403,10 @@ impl App {
                     );
                 });
                 ui.add_space(20.0);
-                titre_section(ui, t(l, "About"));
-                carte().show(ui, |ui| {
+                carte(ui, Margin::symmetric(20, 6), |ui| {
                     ui.set_width(ui.available_width());
+                    titre_section(ui, t(l, "About"));
+                    ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         let (r, _) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::hover());
                         ui.painter().image(
@@ -1411,7 +1418,7 @@ impl App {
                         ui.add_space(6.0);
                         ui.vertical(|ui| {
                             ui.add_space(2.0);
-                            ui.label(egui::RichText::new(APP_NAME).font(demi(16.0)));
+                            ui.label(egui::RichText::new(APP_NAME).font(demi(16.0)).color(TITRE));
                             ui.label(
                                 egui::RichText::new(format!(
                                     "{} {}, {}",
@@ -1424,7 +1431,7 @@ impl App {
                             );
                         });
                     });
-                    ui.add_space(12.0);
+                    ui.add_space(10.0);
                     ui.label(
                         egui::RichText::new(t(
                             l,
@@ -1433,6 +1440,7 @@ impl App {
                         .font(regulier(13.5))
                         .color(TEXTE2),
                     );
+                    ui.add_space(14.0);
                 });
                 ui.add_space(24.0);
             });
@@ -1629,32 +1637,58 @@ impl eframe::App for App {
             }
         }
         self.capture_step(&ctx);
+        let ecran = ctx.content_rect();
+        fond(&ctx.layer_painter(egui::LayerId::background()), ecran);
+        // Panneaux de verre posés sur le fond, à 12 px des bords de la fenêtre.
+        let panneau = |ui: &mut Ui, marge: Margin, voile: f32| {
+            let r = ui.max_rect();
+            let r = Rect::from_min_max(
+                r.min - vec2(marge.left as f32 - 12.0, marge.top as f32 - 12.0),
+                r.max + vec2(marge.right as f32 - 12.0, marge.bottom as f32 - 12.0),
+            );
+            egui::Painter::new(ui.ctx().clone(), ui.layer_id(), ecran).add(verre(
+                ui.ctx(),
+                r,
+                16,
+                voile,
+            ));
+        };
+        let marge = Margin {
+            left: 26,
+            right: 26,
+            top: 30,
+            bottom: 26,
+        };
         egui::Panel::left("navigation")
-            .exact_size(228.0)
+            .exact_size(256.0)
             .resizable(false)
-            .frame(egui::Frame::new().fill(LATERAL).inner_margin(Margin {
-                left: 16,
-                right: 16,
-                top: 22,
-                bottom: 16,
-            }))
-            .show(ui, |ui| self.sidebar(ui));
+            .show_separator_line(false)
+            .frame(egui::Frame::NONE.inner_margin(marge))
+            .show(ui, |ui| {
+                panneau(ui, marge, 0.5);
+                self.sidebar(ui)
+            });
         if self.tab == Tab::Downloads {
+            let marge = Margin {
+                left: 28,
+                right: 38,
+                top: 36,
+                bottom: 30,
+            };
             egui::Panel::right("detail")
                 .exact_size((ui.available_width() * 0.43).clamp(400.0, 600.0))
                 .resizable(false)
-                .frame(egui::Frame::new().fill(LATERAL).inner_margin(Margin {
-                    left: 26,
-                    right: 26,
-                    top: 28,
-                    bottom: 22,
-                }))
-                .show(ui, |ui| self.detail(ui));
+                .show_separator_line(false)
+                .frame(egui::Frame::NONE.inner_margin(marge))
+                .show(ui, |ui| {
+                    panneau(ui, marge, 0.66);
+                    self.detail(ui)
+                });
         }
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(FOND).inner_margin(Margin {
-                left: 30,
-                right: 30,
+            .frame(egui::Frame::NONE.inner_margin(Margin {
+                left: 18,
+                right: 18,
                 top: 22,
                 bottom: 0,
             }))
@@ -1756,9 +1790,18 @@ fn reglage(ui: &mut Ui, titre: &str, aide: &str, controle: impl FnOnce(&mut Ui))
 }
 
 /// Titre au-dessus d'une carte de réglages.
+/// Titre en tête d'une carte de réglages (bleu des panneaux Windows 7).
 fn titre_section(ui: &mut Ui, t: &str) {
-    ui.label(egui::RichText::new(t).font(demi(13.5)).color(TEXTE2));
-    ui.add_space(2.0);
+    ui.add_space(10.0);
+    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::hover());
+    texte(
+        ui,
+        r.left_center(),
+        Align2::LEFT_CENTER,
+        t,
+        demi(15.0),
+        TITRE,
+    );
 }
 
 /// Nom compté : « 1 vol » / « 4 vols » (français : 0 et 1 au singulier).
