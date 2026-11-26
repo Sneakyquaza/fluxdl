@@ -122,9 +122,13 @@ async function sendManual(url, extra) {
   const settings = await getSettings();
   const res = await sendToApp(url, extra, settings);
   if (res.state === "ok") return "ok";
-  if (FALLBACK_STATES.includes(res.state)) {
+  if (res.state === "kept" && res.data?.status === "already_done") {
+    notify(t("notifAlreadyDone"));
+    return "kept";
+  }
+  if (FALLBACK_STATES.includes(res.state) || res.state === "kept") {
     await browserDownload(url);
-    notify(t("notifNotRunning"));
+    notify(t(res.state === "kept" ? "notifAppKept" : "notifNotRunning"));
     return "browser";
   }
   notify(errorMessage(res));
@@ -286,7 +290,8 @@ async function handOver(item, settings) {
   const res = await sendToApp(url, { referrer: item.referrer, filename: basename(item.filename) || undefined }, settings);
   if (res.state === "ok") return true;
   flagBadge();
-  notify(res.state === "rate" ? t("notifRateLimited") : t("notifKeptInBrowser"), true);
+  const msg = { rate: "notifRateLimited", kept: "notifAppKept" }[res.state] ?? "notifKeptInBrowser";
+  notify(t(msg), true);
   return false;
 }
 

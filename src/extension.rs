@@ -154,13 +154,11 @@ pub fn detecter() -> Vec<Navigateur> {
 
 #[cfg(windows)]
 fn reg_app_paths() -> String {
-    use std::os::windows::process::CommandExt;
     let mut s = String::new();
     for racine in ["HKLM", "HKCU"] {
         let cle = format!(r"{racine}\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths");
-        if let Ok(o) = std::process::Command::new("reg")
+        if let Ok(o) = crate::systeme::commande(&crate::systeme::outil("reg"))
             .args(["query", &cle, "/s"])
-            .creation_flags(0x0800_0000)
             .output()
         {
             s += &String::from_utf8_lossy(&o.stdout);
@@ -176,7 +174,9 @@ fn reg_app_paths() -> String {
 
 /// Ouvre la page des extensions du navigateur (adresse interne passée en argument).
 pub fn ouvrir(n: &Navigateur) -> bool {
+    // Chemin complet détecté ; dossier courant sûr.
     std::process::Command::new(&n.exe)
+        .current_dir(crate::systeme::dossier_sur())
         .arg(n.page)
         .spawn()
         .is_ok()

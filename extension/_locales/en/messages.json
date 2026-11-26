@@ -4,6 +4,8 @@
   "menuDownload": {"message": "Download with fluxdl"},
   "notifNotRunning": {"message": "fluxdl isn't running (or isn't paired): the browser downloads the file."},
   "notifKeptInBrowser": {"message": "fluxdl not running — downloaded by the browser."},
+  "notifAppKept": {"message": "fluxdl didn't take this link (failed before or refused): the browser downloads the file."},
+  "notifAlreadyDone": {"message": "Already downloaded by fluxdl."},
   "notifRateLimited": {"message": "fluxdl received too many requests. Try again in a moment."},
   "notifRejected": {"message": "fluxdl refused the link (error $CODE$).", "placeholders": {"code": {"content": "$1", "example": "400"}}},
   "notifUnsupported": {"message": "This link can't be sent to fluxdl (only http and https links)."},

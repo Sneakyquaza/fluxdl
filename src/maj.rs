@@ -160,10 +160,18 @@ pub fn annonce(r: &github::Release) -> Result<Annonce, Erreur> {
     })
 }
 
+/// Argument de la relance : la nouvelle version attend que l'ancienne rende le verrou.
+pub const APRES_MAJ: &str = "--apres-maj";
+
 /// Relance la nouvelle version (après la fermeture : file d'attente sauvée). Lancement
 /// impossible : l'ancienne version reprend sa place.
 pub fn relancer(exe: &Path) {
-    if std::process::Command::new(exe).spawn().is_err() {
+    if std::process::Command::new(exe)
+        .arg(APRES_MAJ)
+        .current_dir(crate::systeme::dossier_sur())
+        .spawn()
+        .is_err()
+    {
         let nouveau = suffixe(exe, ".nouveau");
         if std::fs::rename(exe, &nouveau).is_ok() {
             let _ = std::fs::rename(suffixe(exe, ".ancien"), exe);

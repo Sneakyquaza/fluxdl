@@ -142,11 +142,70 @@ pub fn load<T: DeserializeOwned>(name: &str) -> Option<T> {
 }
 
 pub fn save<T: Serialize>(name: &str, v: &T) {
-    let d = data_dir();
-    let _ = std::fs::create_dir_all(&d);
-    if let Ok(json) = serde_json::to_vec_pretty(v) {
-        let _ = dlcore::engine::write_atomic(&d.join(name), &json);
+    save_in(&data_dir(), name, v);
+}
+
+fn save_in<T: Serialize>(d: &std::path::Path, name: &str, v: &T) {
+    let _ = std::fs::create_dir_all(d);
+    // Jeton et cookies dedans : dossier et fichiers lisibles par l'utilisateur seul.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700));
     }
+    if let Ok(json) = serde_json::to_vec_pretty(v) {
+        let f = d.join(name);
+        let _ = dlcore::engine::write_atomic(&f, &json);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+/// File d'attente lue entrée par entrée : une entrée illisible (version plus récente, fichier
+/// abîmé à la main) ne vide pas la file. Elle est gardée telle quelle (`inconnues`, réécrite à
+/// chaque sauvegarde) et le fichier d'origine est copié en `<nom>.bak`. Fichier entièrement
+/// illisible : copié en `.bak`, file vide.
+pub fn load_queue(d: &std::path::Path, name: &str) -> (Vec<Entry>, Vec<serde_json::Value>) {
+    let f = d.join(name);
+    let Ok(octets) = std::fs::read(&f) else {
+        return Default::default();
+    };
+    let bak = || {
+        let _ = std::fs::copy(&f, d.join(format!("{name}.bak")));
+    };
+    let Ok(valeurs) = serde_json::from_slice::<Vec<serde_json::Value>>(&octets) else {
+        bak();
+        return Default::default();
+    };
+    let (mut bonnes, mut inconnues) = (Vec::new(), Vec::new());
+    for v in valeurs {
+        match serde_json::from_value::<Entry>(v.clone()) {
+            Ok(e) => bonnes.push(e),
+            Err(_) => inconnues.push(v),
+        }
+    }
+    if !inconnues.is_empty() {
+        bak();
+    }
+    (bonnes, inconnues)
+}
+
+/// Écrit la file : entrées connues puis inconnues gardées telles quelles.
+pub fn save_queue(
+    d: &std::path::Path,
+    name: &str,
+    entries: &[Entry],
+    inconnues: &[serde_json::Value],
+) {
+    let mut v: Vec<serde_json::Value> = entries
+        .iter()
+        .filter_map(|e| serde_json::to_value(e).ok())
+        .collect();
+    v.extend(inconnues.iter().cloned());
+    save_in(d, name, &v);
 }
 
 fn default_folder() -> String {
@@ -188,6 +247,39 @@ fn system_lang() -> Lang {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit M1 : une entrée d'un `Kind` inconnu (version plus récente) ne vide plus la file.
+    #[test]
+    fn file_tolerante_entree_par_entree() {
+        let d = std::env::temp_dir().join(format!("{APP_NAME}-file-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let bonne = r#"{"id":1,"url":"https://h/a.zip","dir":"/t","name":null,"sha256":null,
+            "connections":8,"status":"Queued","size":null,"done":0}"#;
+        let futur = r#"{"id":2,"url":"https://h/b","dir":"/t","name":null,"sha256":null,
+            "connections":8,"status":"Queued","size":null,"done":0,"kind":{"Ipfs":{"cid":"x"}}}"#;
+        std::fs::write(d.join("q.json"), format!("[{bonne},{futur},{bonne}]")).unwrap();
+        let (e, inconnues) = load_queue(&d, "q.json");
+        assert_eq!((e.len(), inconnues.len()), (2, 1));
+        assert!(d.join("q.json.bak").exists());
+        // Réécrite : l'entrée inconnue est gardée.
+        save_queue(&d, "q.json", &e, &inconnues);
+        let (e2, i2) = load_queue(&d, "q.json");
+        assert_eq!((e2.len(), i2.len()), (2, 1));
+        assert_eq!(i2[0]["kind"]["Ipfs"]["cid"], "x");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let m = std::fs::metadata(d.join("q.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(m & 0o777, 0o600);
+        }
+        // Fichier illisible : copié en .bak, file vide (jamais d'écrasement sans copie).
+        std::fs::write(d.join("c.json"), b"[{\"id\":").unwrap();
+        assert_eq!(load_queue(&d, "c.json").0.len(), 0);
+        assert_eq!(std::fs::read(d.join("c.json.bak")).unwrap(), b"[{\"id\":");
+    }
 
     #[test]
     fn partiel_efface_pas_recree() {

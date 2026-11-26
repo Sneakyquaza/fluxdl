@@ -26,6 +26,8 @@ const FILE_EXTS = (
 
 const APP_ORIGIN = "http://127.0.0.1/*";
 const TIMEOUT_MS = 1500;
+// /add : l'appli répond après avoir décidé (5 s au plus), et peut d'abord sonder le lien
+const ADD_TIMEOUT_MS = 12000;
 
 function t(key, subs) {
   return api.i18n.getMessage(key, subs) || key;
@@ -50,13 +52,15 @@ async function hasAppAccess() {
 }
 
 // Appel de l'appli ; renvoie { state, status, data }
-// state : ok | unpaired | noaccess | down | origin | rate | bad | error
+// state : ok | kept | unpaired | noaccess | down | origin | rate | bad | error
+// kept : l'appli a reçu le lien mais ne le télécharge pas (data.status already_done | refused |
+// timeout) : le navigateur garde sa copie.
 async function callApp(path, body, settings) {
   const s = settings ?? (await getSettings());
   if (!s.token) return { state: "unpaired" };
   if (!(await hasAppAccess())) return { state: "noaccess" };
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), path === "/add" ? ADD_TIMEOUT_MS : TIMEOUT_MS);
   try {
     const opts = {
       method: body ? "POST" : "GET",
@@ -76,8 +80,13 @@ async function callApp(path, body, settings) {
     } catch {
       // corps vide ou non JSON
     }
-    const map = { 200: "ok", 400: "bad", 401: "unpaired", 403: "origin", 429: "rate" };
-    return { state: map[res.status] ?? "error", status: res.status, data };
+    const map = { 200: "ok", 400: "bad", 401: "unpaired", 403: "origin", 409: "kept", 429: "rate", 503: "kept" };
+    let state = map[res.status] ?? "error";
+    // Appli 0.2.3+ : « ok » seulement si le lien est ajouté ou déjà en cours
+    if (state === "ok" && typeof data?.status === "string" && !["added", "already_active"].includes(data.status)) {
+      state = "kept";
+    }
+    return { state, status: res.status, data };
   } catch {
     return { state: "down" };
   } finally {

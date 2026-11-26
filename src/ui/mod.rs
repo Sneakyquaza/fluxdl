@@ -7,7 +7,7 @@ mod guide;
 
 use crate::i18n::t;
 use crate::maj::{self, Maj};
-use crate::serveur::{self, Demande};
+use crate::serveur::{self, Demande, Statut};
 use crate::store::{self, Entry, Kind, Lang, Settings, Status};
 use crate::{torrent, video};
 use dlcore::engine::{self, Control, Live, Options, Outcome, Segment, WorkerStat};
@@ -254,6 +254,10 @@ pub struct App {
     copie_app: Option<String>,
     /// Bulle « Lien copié » : lien et instant d'apparition.
     lien_copie: Option<(String, f64)>,
+    /// Horloge de `now` (aussi quand la fenêtre est masquée).
+    horloge: std::time::Instant,
+    /// Entrées de queue.json illisibles par cette version : gardées telles quelles.
+    inconnues: Vec<serde_json::Value>,
 }
 
 impl App {
@@ -311,6 +315,8 @@ impl App {
             presse_actif: Arc::new(AtomicBool::new(false)),
             copie_app: None,
             lien_copie: None,
+            horloge: std::time::Instant::now(),
+            inconnues: Vec::new(),
         };
         if let Some(d) = capture {
             app.demo();
@@ -320,7 +326,7 @@ impl App {
         if let Some(s) = store::load(SETTINGS) {
             app.settings = s;
         }
-        app.entries = store::load(QUEUE).unwrap_or_default();
+        (app.entries, app.inconnues) = store::load_queue(&store::data_dir(), QUEUE);
         app.presse_actif
             .store(app.settings.clipboard_watch, Ordering::Relaxed);
         app.presse = Some(crate::presse::lancer(ctx.clone(), app.presse_actif.clone()));
@@ -355,6 +361,7 @@ impl App {
         match serveur::lancer(
             self.settings.port,
             self.jeton.clone(),
+            self.settings.token.clone(),
             self.appairage.clone(),
             tx,
             move || c.request_repaint(),
@@ -374,47 +381,68 @@ impl App {
 
     /// Aiguillage d'un lien : magnet / .torrent → choix des fichiers, site vidéo → choix du
     /// format, sinon téléchargement multi-connexions. `local` : chemin de .torrent permis.
+    /// Le sort est renvoyé à l'extension (elle n'abandonne sa copie que si ajouté / actif).
     fn ajouter(
         &mut self,
         url: String,
         referrer: Option<String>,
         cookies: Option<String>,
         local: bool,
-    ) {
+    ) -> Statut {
         let url = url.trim().to_string();
         if url.starts_with("magnet:") {
-            return self.ouvrir_torrent(url, None);
+            self.ouvrir_torrent(url, None);
+            return Statut::Ajoute;
         }
         if local && url.to_ascii_lowercase().ends_with(".torrent") {
             let nom = Path::new(&url)
                 .file_name()
                 .map_or(url.clone(), |n| n.to_string_lossy().into_owned());
-            if let Ok(o) = std::fs::read(&url) {
-                self.ouvrir_torrent(nom, Some(o));
-            }
-            return;
+            let Ok(o) = std::fs::read(&url) else {
+                return Statut::Refuse;
+            };
+            self.ouvrir_torrent(nom, Some(o));
+            return Statut::Ajoute;
         }
         if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return;
+            return Statut::Refuse;
         }
         if video::site_video(&url) {
-            return self.ouvrir_video(url);
+            self.ouvrir_video(url);
+            return Statut::Ajoute;
         }
-        // Déjà dans la file : la montrer plutôt que télécharger deux fois le même fichier.
-        if let Some(e) = self
-            .entries
-            .iter()
-            .find(|e| e.url == url && !matches!(e.status, Status::Done | Status::Canceled))
-        {
+        // Déjà dans la file : la montrer plutôt que télécharger deux fois le même fichier ;
+        // en pause → reprise ; en échec → refus (le navigateur garde sa copie) ; fini → rien
+        // tant que le fichier est là.
+        if let Some(e) = self.entries.iter_mut().rev().find(|e| {
+            e.url == url
+                && match &e.status {
+                    Status::Done => e
+                        .name
+                        .as_ref()
+                        .is_some_and(|n| Path::new(&e.dir).join(n).exists()),
+                    s => *s != Status::Canceled,
+                }
+        }) {
+            let st = match e.status {
+                Status::Done => Statut::DejaFini,
+                Status::Failed(_) => Statut::Refuse,
+                Status::Paused => {
+                    e.status = Status::Queued;
+                    Statut::DejaActif
+                }
+                _ => Statut::DejaActif,
+            };
             self.selected = Some(e.id);
             self.tab = Tab::Downloads;
-            return;
+            return st;
         }
         let sha = std::mem::take(&mut self.sha).trim().to_string();
         let e = self.nouvelle(url, Kind::Http);
         e.sha256 = (!sha.is_empty()).then_some(sha);
         e.referrer = referrer;
         e.cookies = cookies;
+        Statut::Ajoute
     }
 
     /// Ajoute une entrée en attente, choisie dans la liste.
@@ -614,6 +642,19 @@ impl App {
         }
     }
 
+    /// Fenêtre qui attend un résultat (fil, délai) : il faut repasser de temps en temps.
+    fn modale_attend(&self) -> bool {
+        matches!(
+            self.modale,
+            Some(
+                Modale::Video { rx: Some(_), .. }
+                    | Modale::Torrent { rx: Some(_), .. }
+                    | Modale::Outils { .. }
+                    | Modale::Appairage { .. }
+            )
+        )
+    }
+
     /// Torrent fini qui partage encore.
     fn partage(&self, id: u64) -> bool {
         self.jobs.get(&id).is_some_and(|j| j.ctl.lock().seeding)
@@ -621,7 +662,7 @@ impl App {
 
     fn persist(&mut self, now: f64) {
         if self.capture.is_none() && now - self.last_save > 2.0 {
-            store::save(QUEUE, &self.entries);
+            store::save_queue(&store::data_dir(), QUEUE, &self.entries, &self.inconnues);
             store::save(SETTINGS, &self.settings);
             self.last_save = now;
         }
@@ -1293,7 +1334,9 @@ impl App {
         match a {
             Act::Select => self.selected = Some(id),
             Act::Folder => open_folder(Path::new(&self.entries[i].dir)),
-            Act::Navigateur => open_folder(Path::new(&self.entries[i].url)),
+            Act::Navigateur => {
+                ouvrir_url(&self.entries[i].url);
+            }
             // Un torrent qui partage s'arrête « fini » (voir torrent::telecharger).
             Act::Pause => match self.jobs.get(&id).filter(|j| j.handle.is_some()) {
                 Some(j) => j.ctl.request_stop(),
@@ -1353,7 +1396,7 @@ impl App {
             None => delete_parts(&e, effacer),
         }
         if self.capture.is_none() {
-            store::save(QUEUE, &self.entries);
+            store::save_queue(&store::data_dir(), QUEUE, &self.entries, &self.inconnues);
         }
     }
 
@@ -2384,9 +2427,12 @@ enum Act {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        let now = ctx.input(|i| i.time);
+    /// File, demandes de l'extension, presse-papiers, mises à jour, enregistrement : appelé
+    /// avant chaque `ui`, et seul quand la fenêtre est réduite ou masquée (eframe n'y dessine
+    /// plus rien) : les téléchargements avancent donc aussi fenêtre réduite.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Horloge à nous : fenêtre masquée, l'heure d'egui reste celle de la dernière image.
+        let now = self.horloge.elapsed().as_secs_f64();
         if self.capture.is_none() {
             self.schedule(now);
         }
@@ -2423,30 +2469,30 @@ impl eframe::App for App {
             .map(|rx| rx.try_iter().collect())
             .unwrap_or_default();
         for d in recus {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            self.ajouter(d.url, d.referrer, d.cookies, d.locale);
-        }
-        // .torrent glissés sur la fenêtre.
-        let poses: Vec<String> = ctx.input(|i| {
-            i.raw
-                .dropped_files
-                .iter()
-                .map(|f| f.path().display().to_string())
-                .filter(|p| !p.is_empty())
-                .collect()
-        });
-        for f in poses {
-            if f.to_ascii_lowercase().ends_with(".url") {
-                // Raccourci Internet (Windows) : la ligne « URL=… ».
-                let lien = std::fs::read_to_string(&f).ok().and_then(|t| {
-                    t.lines()
-                        .find_map(|l| l.trim().strip_prefix("URL=").map(str::to_string))
-                });
-                if let Some(u) = lien {
-                    self.ajouter(u, None, None, false);
+            // 2e instance lancée sans lien : montrer la fenêtre.
+            if d.url.is_empty() {
+                montrer(ctx);
+                continue;
+            }
+            let avant = self.modale.is_some();
+            let mut ajout = || {
+                self.ajouter(
+                    d.url.clone(),
+                    d.referrer.clone(),
+                    d.cookies.clone(),
+                    d.locale,
+                )
+            };
+            match &d.decision {
+                // Décidé sous le verrou : une demande abandonnée (délai passé) n'est pas ajoutée.
+                Some(dec) => dec.decider(ajout),
+                None => {
+                    ajout();
                 }
-            } else {
-                self.ajouter(f, None, None, true);
+            }
+            // Un choix à faire (formats, fichiers d'un torrent) : la fenêtre passe devant.
+            if !avant && self.modale.is_some() {
+                montrer(ctx);
             }
         }
         // Lien copié ailleurs : bulle, sauf copie de l'appli ou lien déjà dans la file.
@@ -2474,9 +2520,55 @@ impl eframe::App for App {
             }
         }
         if self.capture.is_none() {
-            self.suivre_appairage(&ctx);
+            self.suivre_appairage(ctx);
         }
         self.suivre_modale();
+        self.persist(now);
+        // Au repos, aucune image : on ne repasse que si quelque chose bouge ou télécharge
+        // (les animations egui demandent elles-mêmes leurs images).
+        let vivant = self
+            .entries
+            .iter()
+            .any(|e| matches!(e.status, Status::Running | Status::Queued))
+            || !self.orphelins.is_empty()
+            || self.bench.handle.is_some()
+            || self.picker.is_some()
+            || self.picker_torrent.is_some()
+            || matches!(
+                self.maj.etat(),
+                maj::Etat::Recherche | maj::Etat::Telechargement(..)
+            )
+            || self.modale_attend();
+        if vivant {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+    }
+
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        // .torrent glissés sur la fenêtre.
+        let poses: Vec<String> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().display().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        });
+        for f in poses {
+            if f.to_ascii_lowercase().ends_with(".url") {
+                // Raccourci Internet (Windows) : la ligne « URL=… ».
+                let lien = std::fs::read_to_string(&f).ok().and_then(|t| {
+                    t.lines()
+                        .find_map(|l| l.trim().strip_prefix("URL=").map(str::to_string))
+                });
+                if let Some(u) = lien {
+                    self.ajouter(u, None, None, false);
+                }
+            } else {
+                self.ajouter(f, None, None, true);
+            }
+        }
         self.capture_step(&ctx);
         let ecran = ctx.content_rect();
         fond(&ctx.layer_painter(egui::LayerId::background()), ecran);
@@ -2543,7 +2635,6 @@ impl eframe::App for App {
         self.bulle_extension(&ctx);
         self.bulle_lien(&ctx);
         self.zone_depot(&ctx);
-        self.persist(now);
         // Textes copiés par l'appli (Ctrl+C, bouton Copier) : à ne pas proposer.
         if let Some(c) = ctx.output(|o| {
             o.commands.iter().rev().find_map(|c| match c {
@@ -2552,23 +2643,6 @@ impl eframe::App for App {
             })
         }) {
             self.copie_app = Some(c);
-        }
-        // Au repos, aucune image : on ne redessine que si quelque chose bouge ou télécharge
-        // (les animations egui demandent elles-mêmes leurs images).
-        let vivant = self
-            .entries
-            .iter()
-            .any(|e| matches!(e.status, Status::Running | Status::Queued))
-            || self.bench.handle.is_some()
-            || self.picker.is_some()
-            || self.picker_torrent.is_some()
-            || matches!(
-                self.maj.etat(),
-                maj::Etat::Recherche | maj::Etat::Telechargement(..)
-            )
-            || self.modale.is_some();
-        if vivant {
-            ctx.request_repaint_after(Duration::from_millis(250));
         }
     }
 
@@ -2597,12 +2671,19 @@ impl eframe::App for App {
         for (_, e, effacer) in &self.orphelins {
             delete_parts(e, *effacer);
         }
-        store::save(QUEUE, &self.entries);
+        store::save_queue(&store::data_dir(), QUEUE, &self.entries, &self.inconnues);
         store::save(SETTINGS, &self.settings);
         if let Some(exe) = &self.relance {
             maj::relancer(exe);
         }
     }
+}
+
+/// Fenêtre réduite ou derrière les autres : la remettre devant.
+fn montrer(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
 }
 
 /// Annulé (`annule`) : efface le `.part` et l'état d'un fichier HTTP, ou les fichiers
@@ -2643,14 +2724,7 @@ fn secondes() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-fn open_folder(d: &Path) {
-    let prog = if cfg!(windows) {
-        "explorer"
-    } else {
-        "xdg-open"
-    };
-    let _ = std::process::Command::new(prog).arg(d).spawn();
-}
+use crate::systeme::{ouvrir_dossier as open_folder, ouvrir_url};
 
 pub fn octets(n: u64) -> String {
     let (v, u) = octets_parts(n);

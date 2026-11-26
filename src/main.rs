@@ -6,10 +6,12 @@ mod extension;
 mod github;
 mod i18n;
 mod icone;
+mod instance;
 mod maj;
 mod presse;
 mod serveur;
 mod store;
+mod systeme;
 mod torrent;
 mod ui;
 mod video;
@@ -29,22 +31,51 @@ fn main() -> Result<(), String> {
     if let Some(url) = valeur("--benchmark") {
         return benchmark(&url, &args);
     }
-    let capture = valeur("--capture").map(std::path::PathBuf::from);
-    // Lien magnet ou .torrent ouvert depuis le navigateur ou l'Explorateur : confié à l'appli
-    // déjà lancée s'il y en a une (serveur local, jeton des réglages), sinon ouvert ici.
+    // Chemins rendus absolus avant de quitter le dossier courant.
+    let capture = valeur("--capture").map(|d| std::path::absolute(&d).unwrap_or(d.into()));
+    // Lien (magnet, http(s)) ou .torrent ouvert depuis le navigateur ou l'Explorateur.
     let ouvrir = args
         .iter()
         .skip(1)
-        .find(|a| a.starts_with("magnet:") || a.to_ascii_lowercase().ends_with(".torrent"));
-    if let Some(u) = ouvrir {
-        let s: store::Settings = store::load("settings.json").unwrap_or_default();
-        let chemin = std::fs::canonicalize(u).map_or(u.clone(), |p| p.display().to_string());
-        if s.server && !s.token.is_empty() && serveur::confier(s.port, &s.token, &chemin) {
-            return Ok(());
+        .find(|a| {
+            let b = a.to_ascii_lowercase();
+            b.starts_with("magnet:")
+                || b.starts_with("http://")
+                || b.starts_with("https://")
+                || b.ends_with(".torrent")
+        })
+        .map(|u| std::fs::canonicalize(u).map_or(u.clone(), |p| p.display().to_string()));
+    // Instance unique : déjà lancée → le lien lui est confié (ou sa fenêtre montrée), et on
+    // s'arrête. Le serveur local écoute toujours la 2e instance (jeton des réglages).
+    let _verrou = if capture.is_none() {
+        let donnees = store::data_dir();
+        let verrou = if args.iter().any(|a| a == maj::APRES_MAJ) {
+            instance::attendre(&donnees, Duration::from_secs(15))
+        } else {
+            instance::prendre(&donnees)
+        };
+        if verrou.is_none() {
+            // La 1re instance peut être en train de démarrer : quelques essais.
+            let fin = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let s: store::Settings = store::load("settings.json").unwrap_or_default();
+                let ok = !s.token.is_empty()
+                    && match &ouvrir {
+                        Some(u) => serveur::confier(s.port, &s.token, u),
+                        None => serveur::montrer(s.port, &s.token),
+                    };
+                if ok || std::time::Instant::now() >= fin {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
         }
-    }
-    let ouvrir =
-        ouvrir.map(|u| std::fs::canonicalize(u).map_or(u.clone(), |p| p.display().to_string()));
+        // Dossier courant sûr : jamais le dossier de lancement (souvent Téléchargements).
+        let _ = std::env::set_current_dir(systeme::dossier_sur());
+        verrou
+    } else {
+        None
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_NAME)

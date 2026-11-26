@@ -3,7 +3,10 @@
 //! une 2e instance de l'appli) ou absent, `Host` local (contre le DNS rebinding), débit limité.
 //! `Origin` absent accepté : Firefox peut l'omettre pour une extension ; une page web, elle,
 //! l'envoie toujours dès qu'elle ajoute l'en-tête du jeton (requête CORS), donc refusée.
-//! `GET /ping` → version ; `POST /add` {url, referrer?, filename?, cookies?} → file d'attente.
+//! `GET /ping` → version ; `POST /add` {url, referrer?, filename?, cookies?} → file d'attente,
+//! réponse donnée après la décision de l'appli : 200 `added` / `already_active` (le navigateur
+//! peut abandonner sa copie), 409 `already_done` / `refused`, 503 `timeout` (rien d'ajouté).
+//! `POST /focus` (2e instance seulement) : montre la fenêtre.
 //! `POST /pair` {nonce} (sans jeton, origine d'extension exigée) : appairage automatique. La 1re
 //! requête ouvre « Autoriser ? » dans l'appli (202) ; l'extension la répète avec le même nonce
 //! jusqu'à la réponse : jeton (200, une seule fois), refus (403) ou délai passé (410, 60 s).
@@ -20,8 +23,13 @@ use std::time::{Duration, Instant};
 pub const PORT: u16 = 47591;
 /// Origine envoyée par une 2e instance (lien magnet, .torrent ouvert depuis l'Explorateur).
 pub const ORIGINE_LOCALE: &str = "fluxdl://local";
-/// Requêtes au plus par fenêtre de 10 s (toutes origines confondues).
+/// Requêtes acceptées (Host, Origin et jeton bons) au plus par fenêtre de 10 s.
 const LIMITE: usize = 30;
+/// Connexions traitées en même temps au plus ; délai total pour lire une requête.
+const MAX_CONNEXIONS: usize = 8;
+const DELAI_LECTURE: Duration = Duration::from_secs(2);
+/// Attente de la décision de l'appli pour un `/add` (l'extension attend un peu plus).
+pub const DELAI_DECISION: Duration = Duration::from_secs(5);
 const MAX_ENTETE: usize = 8 << 10;
 const MAX_CORPS: usize = 64 << 10;
 /// Durée de vie d'une demande d'appairage (réponse comprise).
@@ -29,7 +37,7 @@ pub const DELAI_APPAIRAGE: Duration = Duration::from_secs(60);
 /// Nouvelles demandes d'appairage au plus par minute.
 const APPAIRAGES_MINUTE: usize = 3;
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct Demande {
     pub url: String,
     #[serde(default)]
@@ -41,6 +49,74 @@ pub struct Demande {
     /// Vrai si la demande vient de l'appli elle-même (fichier .torrent local permis).
     #[serde(skip)]
     pub locale: bool,
+    /// Réponse attendue par le serveur (absente : rien à répondre).
+    #[serde(skip)]
+    pub decision: Option<Arc<Decision>>,
+}
+
+impl PartialEq for Demande {
+    fn eq(&self, o: &Self) -> bool {
+        (
+            &self.url,
+            &self.referrer,
+            &self.filename,
+            &self.cookies,
+            self.locale,
+        ) == (&o.url, &o.referrer, &o.filename, &o.cookies, o.locale)
+    }
+}
+
+/// Sort d'un lien confié à l'appli.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Statut {
+    Ajoute,
+    DejaActif,
+    DejaFini,
+    Refuse,
+}
+
+impl Statut {
+    fn texte(self) -> &'static str {
+        match self {
+            Statut::Ajoute => "added",
+            Statut::DejaActif => "already_active",
+            Statut::DejaFini => "already_done",
+            Statut::Refuse => "refused",
+        }
+    }
+}
+
+/// Décision de l'UI pour un `/add`, attendue par le fil du serveur. Une fois le délai passé la
+/// demande est abandonnée : l'UI ne l'ajoute plus (l'extension a gardé la copie du navigateur).
+#[derive(Debug, Default)]
+pub struct Decision(Mutex<Option<Result<Statut, ()>>>);
+
+impl Decision {
+    /// Décide avec `f` (exécutée sous le verrou) si la demande attend encore.
+    pub fn decider(&self, f: impl FnOnce() -> Statut) {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            *g = Some(Ok(f()));
+        }
+    }
+
+    /// Décision de l'UI, sinon abandon au bout de `delai` (`None`).
+    pub fn attendre(&self, delai: Duration) -> Option<Statut> {
+        let fin = Instant::now() + delai;
+        loop {
+            {
+                let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(r) = *g {
+                    return r.ok();
+                }
+                if Instant::now() >= fin {
+                    *g = Some(Err(()));
+                    return None;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 /// Jeton aléatoire (128 bits en hexadécimal).
@@ -220,17 +296,16 @@ fn egal(a: &str, b: &str) -> bool {
 }
 
 /// Traite une requête brute (en-têtes + corps). Sans réseau : testable.
+/// `jeton` : celui de l'extension (vide = serveur coupé) ; `local` : celui d'une 2e instance
+/// (toujours actif, l'appli s'écoute même serveur coupé pour recevoir les liens ouverts).
 pub fn traiter(
     brut: &[u8],
     port: u16,
-    jeton: &str,
+    (jeton, local): (&str, &str),
     lim: &mut Limiteur,
     pair: &mut Appairage,
     t: Instant,
 ) -> Reponse {
-    if !lim.accepte(t) {
-        return rep(429, r#"{"error":"rate limited"}"#);
-    }
     let Some(fin) = brut.windows(4).position(|w| w == b"\r\n\r\n") else {
         return rep(400, r#"{"error":"bad request"}"#);
     };
@@ -300,10 +375,27 @@ pub fn traiter(
             Etape::Limite => avec(rep(429, r#"{"error":"rate limited"}"#)),
         };
     }
+    let jeton = if origine == ORIGINE_LOCALE {
+        local
+    } else {
+        jeton
+    };
     if jeton.is_empty() || !egal(&entete("X-Fluxdl-Token").unwrap_or_default(), jeton) {
         return avec(rep(401, r#"{"error":"bad token"}"#));
     }
+    // Seules les requêtes légitimes comptent : une page web ne peut pas épuiser la limite.
+    if !lim.accepte(t) {
+        return avec(rep(429, r#"{"error":"rate limited"}"#));
+    }
     match (methode, chemin) {
+        ("POST", "/focus") if origine == ORIGINE_LOCALE => {
+            let mut r = rep(200, r#"{"ok":true}"#);
+            r.demande = Some(Demande {
+                locale: true,
+                ..Default::default()
+            });
+            r
+        }
         ("GET", "/ping") => avec(rep(
             200,
             &format!(
@@ -335,17 +427,24 @@ pub fn traiter(
 
 /// Lit une requête : en-têtes puis `Content-Length` octets (tailles bornées).
 fn lire(s: &mut TcpStream) -> Option<Vec<u8>> {
-    s.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    // Délai total (pas par lecture) : un octet toutes les 2,5 s ne retient pas la connexion.
+    let fin = Instant::now() + DELAI_LECTURE;
+    let lire_un = |s: &mut TcpStream, b: &mut [u8]| {
+        let reste = fin.checked_duration_since(Instant::now())?;
+        s.set_read_timeout(Some(reste.max(Duration::from_millis(1))))
+            .ok()?;
+        s.read(b).ok()
+    };
     let mut d = Vec::new();
     let mut tampon = [0u8; 4096];
     loop {
-        let n = s.read(&mut tampon).ok()?;
+        let n = lire_un(s, &mut tampon)?;
         if n == 0 {
             return None;
         }
         d.extend_from_slice(&tampon[..n]);
-        if let Some(fin) = d.windows(4).position(|w| w == b"\r\n\r\n") {
-            let tete = String::from_utf8_lossy(&d[..fin]).to_ascii_lowercase();
+        if let Some(f) = d.windows(4).position(|w| w == b"\r\n\r\n") {
+            let tete = String::from_utf8_lossy(&d[..f]).to_ascii_lowercase();
             let longueur = tete
                 .lines()
                 .find_map(|l| l.strip_prefix("content-length:"))
@@ -354,8 +453,8 @@ fn lire(s: &mut TcpStream) -> Option<Vec<u8>> {
             if longueur > MAX_CORPS {
                 return None;
             }
-            while d.len() < fin + 4 + longueur {
-                let n = s.read(&mut tampon).ok()?;
+            while d.len() < f + 4 + longueur {
+                let n = lire_un(s, &mut tampon)?;
                 if n == 0 {
                     return None;
                 }
@@ -378,6 +477,7 @@ fn repondre(s: &mut TcpStream, r: &Reponse) {
         401 => "Unauthorized",
         403 => "Forbidden",
         409 => "Conflict",
+        503 => "Service Unavailable",
         410 => "Gone",
         429 => "Too Many Requests",
         _ => "Not Found",
@@ -397,55 +497,126 @@ fn repondre(s: &mut TcpStream, r: &Reponse) {
     let _ = s.write_all(r.corps.as_bytes());
 }
 
-/// Écoute `127.0.0.1:port` dans un fil ; chaque demande acceptée part dans `tx` et réveille
-/// l'interface. Renvoie le port réel (utile avec 0 dans les tests).
+/// Écoute `127.0.0.1:port` dans un fil (un fil par connexion, `MAX_CONNEXIONS` au plus) ;
+/// chaque demande part dans `tx` et réveille l'interface, qui décide (`Decision`) avant la
+/// réponse. `local` : jeton d'une 2e instance. Renvoie le port réel (utile avec 0 dans les
+/// tests). Port pris (l'ancienne version finit de se fermer après une mise à jour) : nouvel
+/// essai pendant 5 s.
 pub fn lancer(
     port: u16,
     jeton: Arc<Mutex<String>>,
+    local: String,
     pair: Arc<Mutex<Appairage>>,
     tx: Sender<Demande>,
-    reveil: impl Fn() + Send + 'static,
+    reveil: impl Fn() + Send + Sync + 'static,
 ) -> std::io::Result<u16> {
-    let ecoute = TcpListener::bind(("127.0.0.1", port))?;
+    let fin = Instant::now() + Duration::from_secs(5);
+    let ecoute = loop {
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(e) => break e,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < fin => {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(e) => return Err(e),
+        }
+    };
     let port = ecoute.local_addr()?.port();
+    let lim = Arc::new(Mutex::new(Limiteur::default()));
+    let reveil = Arc::new(reveil);
+    let actives = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     std::thread::spawn(move || {
-        let mut lim = Limiteur::default();
+        use std::sync::atomic::Ordering::SeqCst;
         for s in ecoute.incoming() {
             let Ok(mut s) = s else { continue };
-            // raccourci : une connexion à la fois (requêtes minuscules, délai de 3 s max).
-            let Some(brut) = lire(&mut s) else { continue };
-            let j = jeton.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let r = {
-                let mut p = pair.lock().unwrap_or_else(|e| e.into_inner());
-                traiter(&brut, port, &j, &mut lim, &mut p, Instant::now())
-            };
-            repondre(&mut s, &r);
-            if r.appairage {
-                reveil();
+            if actives.fetch_add(1, SeqCst) >= MAX_CONNEXIONS {
+                actives.fetch_sub(1, SeqCst);
+                continue;
             }
-            if let Some(d) = r.demande {
-                if tx.send(d).is_err() {
-                    return;
-                }
-                reveil();
-            }
+            let (jeton, local, pair, lim, tx, reveil, actives) = (
+                jeton.clone(),
+                local.clone(),
+                pair.clone(),
+                lim.clone(),
+                tx.clone(),
+                reveil.clone(),
+                actives.clone(),
+            );
+            std::thread::spawn(move || {
+                servir(&mut s, port, &jeton, &local, &pair, &lim, &tx, &*reveil);
+                actives.fetch_sub(1, SeqCst);
+            });
         }
     });
     Ok(port)
 }
 
+/// Une connexion : lecture, traitement, décision de l'UI pour un `/add`, réponse.
+#[allow(clippy::too_many_arguments)]
+fn servir(
+    s: &mut TcpStream,
+    port: u16,
+    jeton: &Mutex<String>,
+    local: &str,
+    pair: &Mutex<Appairage>,
+    lim: &Mutex<Limiteur>,
+    tx: &Sender<Demande>,
+    reveil: &dyn Fn(),
+) {
+    let Some(brut) = lire(s) else { return };
+    let j = jeton.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut r = {
+        let mut p = pair.lock().unwrap_or_else(|e| e.into_inner());
+        let mut l = lim.lock().unwrap_or_else(|e| e.into_inner());
+        traiter(&brut, port, (&j, local), &mut l, &mut p, Instant::now())
+    };
+    if let Some(mut d) = r.demande.take() {
+        let attendre = !d.url.is_empty();
+        let dec = Arc::new(Decision::default());
+        if attendre {
+            d.decision = Some(dec.clone());
+        }
+        if tx.send(d).is_err() {
+            return;
+        }
+        reveil();
+        if attendre {
+            let (code, statut) = match dec.attendre(DELAI_DECISION) {
+                Some(st @ (Statut::Ajoute | Statut::DejaActif)) => (200, st.texte()),
+                Some(st) => (409, st.texte()),
+                None => (503, "timeout"),
+            };
+            r.code = code;
+            r.corps = serde_json::json!({ "ok": code == 200, "status": statut }).to_string();
+        }
+    }
+    repondre(s, &r);
+    if r.appairage {
+        reveil();
+    }
+}
+
 /// 2e instance : confie `url` (lien magnet, chemin de .torrent) à l'appli déjà lancée.
 pub fn confier(port: u16, jeton: &str, url: &str) -> bool {
     let corps = serde_json::json!({ "url": url }).to_string();
-    ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(2))
+    poster(port, jeton, "/add", &corps)
+}
+
+/// 2e instance lancée sans lien : la 1re montre sa fenêtre.
+pub fn montrer(port: u16, jeton: &str) -> bool {
+    poster(port, jeton, "/focus", "{}")
+}
+
+fn poster(port: u16, jeton: &str, chemin: &str, corps: &str) -> bool {
+    let r = ureq::AgentBuilder::new()
+        .timeout(DELAI_DECISION + Duration::from_secs(2))
         .build()
-        .post(&format!("http://127.0.0.1:{port}/add"))
+        .post(&format!("http://127.0.0.1:{port}{chemin}"))
         .set("Origin", ORIGINE_LOCALE)
         .set("X-Fluxdl-Token", jeton)
         .set("Content-Type", "application/json")
-        .send_string(&corps)
-        .is_ok()
+        .send_string(corps);
+    // 409 (déjà là, refusé) : l'appli a bien reçu le lien.
+    matches!(r, Ok(_) | Err(ureq::Error::Status(409, _)))
 }
 
 #[cfg(test)]
@@ -476,7 +647,7 @@ mod tests {
         traiter(
             &req(methode, chemin, &e, corps),
             PORT,
-            J,
+            (J, J),
             &mut Limiteur::default(),
             &mut Appairage::default(),
             Instant::now(),
@@ -570,12 +741,12 @@ mod tests {
         let r = req("GET", "/ping", &e, "");
         for _ in 0..LIMITE {
             assert_eq!(
-                traiter(&r, PORT, J, &mut lim, &mut Appairage::default(), t).code,
+                traiter(&r, PORT, (J, J), &mut lim, &mut Appairage::default(), t).code,
                 200
             );
         }
         assert_eq!(
-            traiter(&r, PORT, J, &mut lim, &mut Appairage::default(), t).code,
+            traiter(&r, PORT, (J, J), &mut lim, &mut Appairage::default(), t).code,
             429
         );
         // 10 s plus tard, la fenêtre est vide.
@@ -583,7 +754,7 @@ mod tests {
             traiter(
                 &r,
                 PORT,
-                J,
+                (J, J),
                 &mut lim,
                 &mut Appairage::default(),
                 t + Duration::from_secs(11)
@@ -605,7 +776,7 @@ mod tests {
         traiter(
             &req("POST", "/pair", &e, &corps),
             PORT,
-            J,
+            (J, J),
             &mut Limiteur::default(),
             p,
             t,
@@ -692,7 +863,7 @@ mod tests {
         let r = traiter(
             &req("POST", "/pair", &e, &format!(r#"{{"nonce":"{N}"}}"#)),
             PORT,
-            J,
+            (J, J),
             &mut Limiteur::default(),
             &mut p,
             t,
@@ -708,7 +879,7 @@ mod tests {
         let r = traiter(
             &req("POST", "/pair", &e, &format!(r#"{{"nonce":"{N}"}}"#)),
             PORT,
-            "",
+            ("", J),
             &mut Limiteur::default(),
             &mut p,
             t,
@@ -723,12 +894,97 @@ mod tests {
 
     #[test]
     fn vrai_serveur_local() {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel::<Demande>();
         let jeton = Arc::new(Mutex::new(J.to_string()));
-        let port = lancer(0, jeton, Arc::default(), tx, || {}).unwrap();
+        let port = lancer(0, jeton.clone(), J.into(), Arc::default(), tx, || {}).unwrap();
+        // L'« UI » : déjà active, puis refus ; la réponse attend la décision.
+        let ui = std::thread::spawn(move || {
+            let mut vus = Vec::new();
+            for st in [Statut::DejaActif, Statut::Refuse] {
+                let d = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                d.decision.as_ref().unwrap().decider(|| st);
+                vus.push(d.url);
+            }
+            // /focus : sans décision à donner.
+            let d = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(d.url.is_empty() && d.decision.is_none() && d.locale);
+            vus
+        });
         assert!(confier(port, J, "magnet:?xt=urn:btih:abc"));
-        let d = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(d.url, "magnet:?xt=urn:btih:abc");
+        assert!(confier(port, J, "magnet:?xt=urn:btih:abc"));
+        assert!(montrer(port, J));
+        assert_eq!(ui.join().unwrap(), ["magnet:?xt=urn:btih:abc"; 2]);
         assert!(!confier(port, "faux", "magnet:?xt=urn:btih:abc"));
+        // Serveur coupé pour l'extension : la 2e instance passe toujours (jeton local).
+        *jeton.lock().unwrap() = String::new();
+        let e = ext(J);
+        let r = ureq::get(&format!("http://127.0.0.1:{port}/ping"))
+            .set("Origin", &e[1].1)
+            .set("X-Fluxdl-Token", J)
+            .call();
+        assert!(matches!(r, Err(ureq::Error::Status(401, _))));
+    }
+
+    #[test]
+    fn decision_abandonnee_apres_le_delai() {
+        let d = Decision::default();
+        assert_eq!(d.attendre(Duration::from_millis(30)), None);
+        // Trop tard : l'UI ne décide plus (rien ne doit être ajouté).
+        let mut appele = false;
+        d.decider(|| {
+            appele = true;
+            Statut::Ajoute
+        });
+        assert!(!appele);
+        let d = Decision::default();
+        d.decider(|| Statut::DejaFini);
+        assert_eq!(d.attendre(Duration::ZERO), Some(Statut::DejaFini));
+    }
+
+    #[test]
+    fn connexion_lente_ne_bloque_pas_les_autres() {
+        let (tx, _rx) = std::sync::mpsc::channel::<Demande>();
+        let port = lancer(
+            0,
+            Arc::new(Mutex::new(J.into())),
+            J.into(),
+            Arc::default(),
+            tx,
+            || {},
+        )
+        .unwrap();
+        // Une connexion qui envoie un octet de temps en temps, puis un ping normal.
+        let mut lente = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        lente.write_all(b"G").unwrap();
+        let t = Instant::now();
+        let r = ureq::get(&format!("http://127.0.0.1:{port}/ping"))
+            .set("Origin", "chrome-extension://abcdefghijklmnop")
+            .set("X-Fluxdl-Token", J)
+            .call();
+        assert!(r.is_ok() && t.elapsed() < Duration::from_secs(1));
+        // Pages web refusées : elles n'entament pas la limite de l'extension.
+        let web = req(
+            "GET",
+            "/ping",
+            &[("Host", "127.0.0.1:47591"), ("Origin", "https://x.example")],
+            "",
+        );
+        let mut lim = Limiteur::default();
+        for _ in 0..LIMITE * 2 {
+            let r = traiter(&web, PORT, (J, J), &mut lim, &mut Appairage::default(), t);
+            assert_eq!(r.code, 403);
+        }
+        assert_eq!(envoyer(&ext(J), "GET", "/ping", "").code, 200);
+        let e: Vec<(&str, String)> = ext(J);
+        let e: Vec<(&str, &str)> = e.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let r = traiter(
+            &req("GET", "/ping", &e, ""),
+            PORT,
+            (J, J),
+            &mut lim,
+            &mut Appairage::default(),
+            t,
+        );
+        assert_eq!(r.code, 200);
     }
 }

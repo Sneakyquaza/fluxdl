@@ -793,7 +793,7 @@ impl App {
     /// téléchargements tournent, puis téléchargement, installation et redémarrage.
     pub(super) fn demander_maj(&mut self) {
         if !maj::AUTO {
-            open_folder(Path::new(maj::PAGE_RELEASES));
+            ouvrir_url(maj::PAGE_RELEASES);
             return;
         }
         let n = self
@@ -1092,7 +1092,7 @@ impl App {
         })
         .clicked()
         {
-            open_folder(Path::new(url));
+            ouvrir_url(url);
             res = Some(false);
         }
         x = b.left() - 10.0;

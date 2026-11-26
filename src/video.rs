@@ -264,6 +264,8 @@ const EXE: &str = if cfg!(windows) { ".exe" } else { "" };
 fn dans_path(nom: &str) -> Option<PathBuf> {
     let p = std::env::var_os("PATH")?;
     std::env::split_paths(&p)
+        // Dossiers absolus seulement (une entrée vide ou « . » = dossier courant).
+        .filter(|d| d.is_absolute())
         .map(|d| d.join(format!("{nom}{EXE}")))
         .find(|f| f.is_file())
 }
@@ -283,21 +285,25 @@ pub fn trouver() -> Outils {
     }
 }
 
-fn commande(prog: &Path) -> Command {
-    #[allow(unused_mut)]
-    let mut c = Command::new(prog);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // Pas de fenêtre de console (l'appli est en sous-système « windows »).
-        c.creation_flags(0x0800_0000);
-    }
-    c
-}
+use crate::systeme::commande;
 
-/// Arguments communs : environnement JavaScript pour YouTube, ffmpeg.
+/// Arguments communs : aucun fichier de config ni greffon (un `yt-dlp.conf` déposé dans le
+/// dossier de téléchargement ou le dossier courant pourrait contenir `--exec`), sortie UTF-8,
+/// environnement JavaScript pour YouTube, ffmpeg.
 fn args_communs(c: &mut Command, o: &Outils) {
+    c.arg("--ignore-config");
+    // Notre copie (Windows) est à jour ; un yt-dlp système d'avant 2025.02 ne connaît pas
+    // l'option (dossier courant sûr : pas de greffon pris dans Téléchargements).
+    if o.ytdlp
+        .as_ref()
+        .is_some_and(|y| y.starts_with(dossier_outils()))
+    {
+        c.arg("--no-plugin-dirs");
+    }
+    c.env("PYTHONIOENCODING", "utf-8");
     c.args([
+        "--encoding",
+        "utf-8",
         "--no-playlist",
         "--js-runtimes",
         "deno",
@@ -372,29 +378,9 @@ pub fn telecharger(
     let (tx, rx) = mpsc::channel();
     let sortie = fils.stdout.take().map(BufReader::new);
     let tx2 = tx.clone();
-    std::thread::spawn(move || {
-        for l in sortie
-            .into_iter()
-            .flat_map(|s| s.lines())
-            .map_while(Result::ok)
-        {
-            if tx2.send((false, l)).is_err() {
-                return;
-            }
-        }
-    });
+    std::thread::spawn(move || lignes(sortie, |l| tx2.send((false, l)).is_ok()));
     let err = fils.stderr.take().map(BufReader::new);
-    std::thread::spawn(move || {
-        for l in err
-            .into_iter()
-            .flat_map(|s| s.lines())
-            .map_while(Result::ok)
-        {
-            if tx.send((true, l)).is_err() {
-                return;
-            }
-        }
-    });
+    std::thread::spawn(move || lignes(err, |l| tx.send((true, l)).is_ok()));
     {
         let mut l = ctl.lock();
         l.size = taille;
@@ -458,11 +444,25 @@ pub fn telecharger(
     }
 }
 
+/// Lignes d'une sortie de yt-dlp, octets non UTF-8 remplacés (page de code Windows) : une
+/// ligne illisible n'arrête pas la lecture (sinon le tube se bloque et yt-dlp avec).
+fn lignes(r: Option<impl BufRead>, mut f: impl FnMut(String) -> bool) {
+    let Some(mut r) = r else { return };
+    let mut b = Vec::new();
+    while matches!(r.read_until(b'\n', &mut b), Ok(n) if n > 0) {
+        let l = String::from_utf8_lossy(&b);
+        if !f(l.trim_end_matches(['\r', '\n']).to_string()) {
+            return;
+        }
+        b.clear();
+    }
+}
+
 /// yt-dlp.exe (PyInstaller) lance un second processus : tout l'arbre est arrêté.
 fn tuer(f: &mut std::process::Child) {
     #[cfg(windows)]
     {
-        let _ = commande(Path::new("taskkill"))
+        let _ = commande(&crate::systeme::outil("taskkill"))
             .args(["/T", "/F", "/PID", &f.id().to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -552,8 +552,7 @@ fn extraire_ffmpeg(zip: &Path, d: &Path) -> Result<(), Erreur> {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).map_err(|_| "Cannot write the file.")?;
     // Chemin complet : pas de tar.exe pris dans le dossier courant ou le PATH.
-    let racine = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
-    let tar = Path::new(&racine).join("System32").join("tar.exe");
+    let tar = crate::systeme::outil("tar");
     let ok = commande(&tar)
         .arg("-xf")
         .arg(zip)

@@ -15,6 +15,56 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+/// Torrent refusé : un nom de fichier sortirait du dossier choisi (`C:`, `..`, absolu…).
+pub const ERR_CHEMIN: &str = "Unsafe file name in torrent.";
+
+/// Noms de périphériques Windows (avec ou sans extension) : `NUL.txt` ouvre le périphérique.
+fn nom_reserve(c: &str) -> bool {
+    let base = c
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_ascii_uppercase();
+    matches!(
+        base.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || (base.len() == 4
+        && (base.starts_with("COM") || base.starts_with("LPT"))
+        && base.as_bytes()[3].is_ascii_digit())
+}
+
+/// Composant de chemin sûr : un seul nom normal (ni absolu, ni lecteur `C:`, ni `..`), sans
+/// séparateur ; sous Windows aussi sans `:` (flux de données alternatif), caractère interdit,
+/// point ou espace final, nom réservé.
+pub fn composant_sur(c: &str, windows: bool) -> bool {
+    use std::path::Component;
+    let mut it = Path::new(c).components();
+    let normal = matches!((it.next(), it.next()), (Some(Component::Normal(_)), None));
+    normal
+        && !c.is_empty()
+        && c != "."
+        && c != ".."
+        && !c
+            .chars()
+            .any(|ch| ch == '/' || ch == '\\' || ch.is_control())
+        && (!windows
+            || !(c.chars().any(|ch| r#":<>"|?*"#.contains(ch))
+                || c.ends_with('.')
+                || c.ends_with(' ')
+                || nom_reserve(c)))
+}
+
+/// Tous les fichiers du torrent ont des chemins sûrs, sinon `ERR_CHEMIN`.
+fn chemins_surs(fichiers: impl Iterator<Item = Vec<String>>, windows: bool) -> Result<(), String> {
+    for f in fichiers {
+        if f.is_empty() || !f.iter().all(|c| composant_sur(c, windows)) {
+            return Err(ERR_CHEMIN.into());
+        }
+    }
+    Ok(())
+}
+
 /// Cases de la carte des pièces dessinée dans le panneau de détail.
 pub const CASES: usize = 160;
 
@@ -120,6 +170,15 @@ impl Moteur {
         let AddTorrentResponse::ListOnly(l) = r else {
             return Err("unexpected answer".into());
         };
+        chemins_surs(
+            l.info.iter_file_details().map(|f| {
+                f.filename
+                    .iter_components()
+                    .map(|c| c.into_owned())
+                    .collect()
+            }),
+            cfg!(windows),
+        )?;
         let fichiers = l
             .info
             .iter_file_details()
@@ -157,6 +216,16 @@ impl Moteur {
         // directement dans le dossier donné).
         let (nom, multi) = {
             let m = librqbit::torrent_from_bytes(&octets).map_err(err)?;
+            let v = m.info.data.clone().validate().map_err(err)?;
+            chemins_surs(
+                v.iter_file_details().map(|f| {
+                    f.filename
+                        .iter_components()
+                        .map(|c| c.into_owned())
+                        .collect()
+                }),
+                cfg!(windows),
+            )?;
             let i = &m.info.data;
             let nom = i
                 .name
@@ -173,6 +242,14 @@ impl Moteur {
             dir.to_path_buf()
         };
         std::fs::create_dir_all(&sortie).map_err(|e| format!("{}: {e}", sortie.display()))?;
+        // Le sous-dossier ne doit pas mener ailleurs (lien symbolique posé à l'avance).
+        let dans = |p: &Path| std::fs::canonicalize(p).ok();
+        if !dans(&sortie)
+            .zip(dans(dir))
+            .is_some_and(|(s, d)| s.starts_with(d))
+        {
+            return Err(ERR_CHEMIN.into());
+        }
         let opts = AddTorrentOptions {
             output_folder: Some(sortie.display().to_string()),
             only_files: fichiers,
@@ -283,10 +360,8 @@ pub fn associer(oui: bool) -> bool {
     };
     let cmd = format!("\"{}\" \"%1\"", exe.display());
     let reg = |args: &[&str]| {
-        use std::os::windows::process::CommandExt;
-        std::process::Command::new("reg")
+        crate::systeme::commande(&crate::systeme::outil("reg"))
             .args(args)
-            .creation_flags(0x0800_0000)
             .output()
             .ok()
     };
@@ -373,6 +448,118 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Torrent v1 minimal (repris de l'audit, `harness/src/bin/torrent_noms.rs`) : un fichier
+    /// `nom` (seul) ou les fichiers `chemins` (plusieurs).
+    fn torrent_piege(nom: &[u8], chemins: Option<&[&[&[u8]]]>) -> Vec<u8> {
+        let b = |s: &[u8]| [format!("{}:", s.len()).as_bytes(), s].concat();
+        let mut info = b"d".to_vec();
+        match chemins {
+            Some(cs) => {
+                info.extend(b"5:filesl");
+                for c in cs {
+                    info.extend(b"d6:lengthi10e4:pathl");
+                    for p in *c {
+                        info.extend(b(p));
+                    }
+                    info.extend(b"ee");
+                }
+                info.extend(b"e");
+            }
+            None => info.extend(b"6:lengthi10e"),
+        }
+        info.extend(b"4:name");
+        info.extend(b(nom));
+        info.extend(b"12:piece lengthi16384e6:pieces20:");
+        info.extend([0u8; 20]);
+        info.extend(b"e");
+        [&b"d4:info"[..], &info, b"e"].concat()
+    }
+
+    #[test]
+    fn noms_de_fichiers_pieges() {
+        for (c, linux, win) in [
+            ("ok.txt", true, true),
+            ("Film: partie 1.mkv", true, false),
+            ("C:", true, false),
+            ("C:evil.bat", true, false),
+            ("a.txt:Zone.Identifier", true, false),
+            ("NUL", true, false),
+            ("nul.zip", true, false),
+            ("COM1.txt", true, false),
+            ("COM10.txt", true, true),
+            ("fin.", true, false),
+            ("fin ", true, false),
+            ("..", false, false),
+            (".", false, false),
+            ("", false, false),
+            ("/etc/passwd", false, false),
+            ("a/b", false, false),
+            ("a\\b", false, false),
+        ] {
+            assert_eq!(composant_sur(c, false), linux, "linux {c:?}");
+            assert_eq!(composant_sur(c, true), win, "windows {c:?}");
+        }
+        // Torrents piégés : refusés dès l'aperçu (Windows), rien d'écrit.
+        let m = moteur_local();
+        let pieges: [Vec<u8>; 4] = [
+            torrent_piege(b"C:evil.bat", None),
+            torrent_piege(b"jeu", Some(&[&[b"C:", b"Users", b"x.bat"], &[b"ok.txt"]])),
+            torrent_piege(b"jeu", Some(&[&[b"a.txt:Zone.Identifier"], &[b"ok.txt"]])),
+            torrent_piege(b"NUL", None),
+        ];
+        for o in pieges {
+            let r = m.apercu("", Some(o.clone()));
+            if cfg!(windows) {
+                assert_eq!(r.err().as_deref(), Some(ERR_CHEMIN));
+            } else {
+                assert!(r.is_ok());
+            }
+            let v = librqbit::torrent_from_bytes(&o)
+                .unwrap()
+                .info
+                .data
+                .clone()
+                .validate();
+            let noms = v
+                .unwrap()
+                .iter_file_details()
+                .map(|f| {
+                    f.filename
+                        .iter_components()
+                        .map(|c| c.into_owned())
+                        .collect()
+                })
+                .collect::<Vec<Vec<String>>>();
+            assert_eq!(
+                chemins_surs(noms.into_iter(), true).err().as_deref(),
+                Some(ERR_CHEMIN)
+            );
+        }
+        let ok = torrent_piege(b"jeu", Some(&[&[b"dossier", b"a.txt"], &[b"b.txt"]]));
+        assert!(m.apercu("", Some(ok)).is_ok());
+    }
+
+    /// Sous-dossier du torrent remplacé à l'avance par un lien vers ailleurs : refusé.
+    #[cfg(unix)]
+    #[test]
+    fn sous_dossier_lien_symbolique_refuse() {
+        let d = dossier_test("lien");
+        let ailleurs = dossier_test("ailleurs");
+        std::os::unix::fs::symlink(&ailleurs, d.join("jeu")).unwrap();
+        let o = torrent_piege(b"jeu", Some(&[&[b"a.txt"], &[b"b.txt"]]));
+        let r = moteur_local().telecharger(
+            o,
+            &d,
+            None,
+            false,
+            Partage { ratio: 0.0 },
+            None,
+            &Control::default(),
+        );
+        assert_eq!(r.err().as_deref(), Some(ERR_CHEMIN));
+        assert_eq!(std::fs::read_dir(&ailleurs).unwrap().count(), 0);
     }
 
     #[test]
