@@ -58,6 +58,19 @@ async function setupMenu() {
 }
 
 api.runtime.onInstalled.addListener(setupMenu);
+
+// Appairage : une seule tentative à la fois (popup, options, installation)
+let pairing = null;
+function pairOnce() {
+  if (!pairing) pairing = pairWithApp().finally(() => (pairing = null));
+  return pairing;
+}
+
+// Juste installée et pas encore appairée : une tentative, si l'appli tourne
+api.runtime.onInstalled.addListener(async (details) => {
+  if (details.reason !== "install" || (await getSettings()).token) return;
+  if ((await pairOnce()) === "paired") notify(t("pairPaired"));
+});
 api.runtime.onStartup?.addListener(setupMenu);
 
 // Cookies du site, si l'option, la permission et la liste de sites le permettent
@@ -202,6 +215,10 @@ async function handleMessage(msg, sender) {
       const referrer = typeof msg.referrer === "string" ? msg.referrer : "";
       const res = await sendToApp(msg.url, { referrer }, await getSettings());
       return { state: res.state, status: res.status };
+    }
+    case "fluxdl-pair": {
+      if (!fromOwnPage(sender)) return { error: "sender" };
+      return { state: await pairOnce() };
     }
     case "fluxdl-picker": {
       if (!fromOwnPage(sender)) return { error: "sender" };

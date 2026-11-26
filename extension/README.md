@@ -3,6 +3,16 @@
 Manifest V3 extension for Chrome, Edge and Firefox that sends downloads to the fluxdl app
 running on `127.0.0.1`. Plain JavaScript, no build step, no remote code.
 
+## Pairing (0.2.2)
+
+- **Connect to fluxdl** (popup and options) or, once, right after installation: the background
+  sends `POST /pair {nonce}` (no token) and repeats it every second with the same nonce while
+  fluxdl shows "Allow?". On **Allow** the app answers with the token, once; the extension stores
+  it and shows "Paired ✓". Denied, busy (another request pending), expired (60 s) and "app not
+  running" are reported. Manual token pairing stays available in the options.
+- Only the extension's own pages can start a pairing (message `fluxdl-pair`, sender checked).
+  On Firefox the options page asks for the `127.0.0.1` permission in the same click.
+
 ## Features (0.2.1)
 
 - **Auto-capture** (off by default, popup or options): a browser download is handed to fluxdl

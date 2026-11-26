@@ -10,7 +10,7 @@
   "statusChecking": {"message": "Checking…"},
   "statusConnected": {"message": "Connected to fluxdl $VERSION$", "placeholders": {"version": {"content": "$1", "example": "0.2.0"}}},
   "statusNotRunning": {"message": "fluxdl not running"},
-  "statusNotPaired": {"message": "Not paired: open options"},
+  "statusNotPaired": {"message": "Not paired"},
   "statusNoAccess": {"message": "No access to the app: open options"},
   "statusBadOrigin": {"message": "fluxdl refused the extension (origin check)."},
   "statusError": {"message": "Unexpected answer from fluxdl"},
@@ -70,5 +70,14 @@
   "pickCount": {"message": "$N$ selected", "placeholders": {"n": {"content": "$1", "example": "3"}}},
   "pickSend": {"message": "Send to fluxdl"},
   "pickEmpty": {"message": "No links found on this page."},
-  "pickSent": {"message": "$OK$ of $TOTAL$ sent to fluxdl.", "placeholders": {"ok": {"content": "$1", "example": "3"}, "total": {"content": "$2", "example": "4"}}}
+  "pickSent": {"message": "$OK$ of $TOTAL$ sent to fluxdl.", "placeholders": {"ok": {"content": "$1", "example": "3"}, "total": {"content": "$2", "example": "4"}}},
+  "optPair": {"message": "Connect to fluxdl"},
+  "optPairHint": {"message": "fluxdl then asks “Allow?”: click Allow in the app. No token to copy."},
+  "optManualHint": {"message": "Or by hand: copy the token from fluxdl → Settings and paste it below."},
+  "pairWaiting": {"message": "Answer in fluxdl…"},
+  "pairPaired": {"message": "Paired ✓"},
+  "pairDenied": {"message": "Refused in fluxdl."},
+  "pairBusy": {"message": "Another request is waiting in fluxdl. Try again in a minute."},
+  "pairExpired": {"message": "No answer from fluxdl (1 minute). Try again."},
+  "pairOld": {"message": "This version of fluxdl can't pair automatically: update it, or paste the token."}
 }

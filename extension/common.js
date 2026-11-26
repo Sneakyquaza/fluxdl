@@ -85,6 +85,80 @@ async function callApp(path, body, settings) {
   }
 }
 
+// ---- Appairage automatique ----
+// POST /pair sans jeton, répété avec le même nonce jusqu'à « Autoriser » / « Refuser » dans
+// l'appli (60 s au plus côté appli). L'appli ne donne le jeton qu'à cette demande, une fois.
+const PAIR_POLL_MS = 1000;
+const PAIR_TIMEOUT_MS = 62000;
+
+async function postPair(port, nonce) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/pair`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ nonce }),
+      signal: ctrl.signal,
+      cache: "no-store",
+      credentials: "omit",
+    });
+    let data = null;
+    try {
+      data = await res.json();
+    } catch {
+      // corps vide
+    }
+    return { status: res.status, data };
+  } catch {
+    return { status: 0 };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Résultat : paired | denied | busy | expired | down | noaccess | rate | old | error
+async function pairWithApp() {
+  const s = await getSettings();
+  if (!(await hasAppAccess())) return "noaccess";
+  const nonce = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+  const end = Date.now() + PAIR_TIMEOUT_MS;
+  while (Date.now() < end) {
+    const r = await postPair(s.port, nonce);
+    if (r.status === 202) {
+      await new Promise((ok) => setTimeout(ok, PAIR_POLL_MS));
+      // Appel d'API d'extension : garde le service worker éveillé pendant l'attente
+      await api.storage.local.get("port");
+      continue;
+    }
+    if (r.status === 200) {
+      const token = r.data?.token;
+      if (typeof token !== "string" || !/^[0-9a-f]{16,64}$/.test(token)) return "error";
+      await saveSettings({ token });
+      return "paired";
+    }
+    const map = { 0: "down", 401: "old", 404: "old", 409: "busy", 410: "expired", 429: "rate" };
+    if (r.status === 403) return r.data?.error === "denied" ? "denied" : "error";
+    return map[r.status] ?? "error";
+  }
+  return "expired";
+}
+
+// Texte d'un résultat d'appairage
+function pairText(state) {
+  const keys = {
+    paired: "pairPaired",
+    denied: "pairDenied",
+    busy: "pairBusy",
+    expired: "pairExpired",
+    down: "statusNotRunning",
+    noaccess: "statusNoAccess",
+    rate: "notifRateLimited",
+    old: "pairOld",
+  };
+  return t(keys[state] ?? "statusError");
+}
+
 function ping(settings) {
   return callApp("/ping", null, settings);
 }

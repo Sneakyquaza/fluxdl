@@ -10,6 +10,7 @@ function setStatus(cls, text) {
 
 async function refreshStatus() {
   const res = await ping();
+  $("pairRow").hidden = res.state === "ok" || res.state === "noaccess";
   switch (res.state) {
     case "ok":
       setStatus("on", t("statusConnected", [String(res.data?.version ?? "?")]));
@@ -70,6 +71,17 @@ async function init() {
   $("openOptions").addEventListener("click", () => {
     api.runtime.openOptionsPage();
     window.close();
+  });
+
+  // Appairage : la réponse se donne dans l'appli (le popup peut se fermer, l'arrière-plan
+  // continue et garde le jeton)
+  $("pair").addEventListener("click", async () => {
+    $("pair").disabled = true;
+    setStatus("", t("pairWaiting"));
+    const res = await api.runtime.sendMessage({ type: "fluxdl-pair" });
+    $("pair").disabled = false;
+    setStatus(res?.state === "paired" ? "on" : "off", pairText(res?.state));
+    if (res?.state === "paired") $("pairRow").hidden = true;
   });
 
   refreshStatus();

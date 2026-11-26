@@ -82,6 +82,38 @@ async function init() {
 
   $("test").addEventListener("click", testConnection);
 
+  // Appairage automatique ; Firefox : l'accès à 127.0.0.1 se demande dans le même clic
+  const pair = async () => {
+    $("pair").disabled = true;
+    $("pairOrb").className = "orb";
+    $("pairMsg").textContent = t("pairWaiting");
+    const res = await api.runtime.sendMessage({ type: "fluxdl-pair" });
+    $("pair").disabled = false;
+    $("pairOrb").className = "orb " + (res?.state === "paired" ? "on" : "off");
+    $("pairMsg").textContent = pairText(res?.state);
+  };
+  $("pair").addEventListener("click", () => {
+    if ($("accessCard").hidden) {
+      pair();
+      return;
+    }
+    api.permissions.request({ origins: [APP_ORIGIN] }).then(
+      (granted) => {
+        if (!granted) {
+          $("pairMsg").textContent = t("optPermDenied");
+          return;
+        }
+        refreshAccess();
+        pair();
+      },
+      () => ($("pairMsg").textContent = t("optPermDenied"))
+    );
+  });
+  // Jeton reçu (ici ou par l'arrière-plan après l'installation) : champ à jour
+  api.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes.token) $("token").value = changes.token.newValue ?? "";
+  });
+
   // permissions.request doit être appelé directement dans le geste utilisateur
   $("grant").addEventListener("click", () => {
     api.permissions.request({ origins: [APP_ORIGIN] }).then(

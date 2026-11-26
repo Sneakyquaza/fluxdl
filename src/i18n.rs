@@ -346,6 +346,100 @@ const FR: &[(&str, &str)] = &[
     ("Nothing to download.", "Rien à télécharger."),
     ("Cannot find the app's location.", "Emplacement de l'appli introuvable."),
     ("App file locked: nothing was changed.", "Fichier de l'appli verrouillé : rien n'a été changé."),
+    ("Install the extension", "Installer l'extension"),
+    (
+        "Chrome, Edge, Brave, Firefox: guided, in 3 steps.",
+        "Chrome, Edge, Brave, Firefox : guidé, en 3 étapes.",
+    ),
+    (
+        "Without automatic pairing: paste it in the extension's options.",
+        "Sans appairage automatique : colle-le dans les options de l'extension.",
+    ),
+    ("Install", "Installer"),
+    ("Install the browser extension", "Installer l'extension du navigateur"),
+    ("Add fluxdl to your browser", "Ajoute fluxdl à ton navigateur"),
+    (
+        "Right-click menu, capture of browser downloads.",
+        "Menu du clic droit, capture des téléchargements.",
+    ),
+    ("Copy the path", "Copier le chemin"),
+    ("Open", "Ouvrir"),
+    ("Open the folder", "Ouvrir le dossier"),
+    ("Opens", "Ouvre"),
+    ("and copies the path.", "et copie le chemin."),
+    (
+        "Path copied. If the page did not open, type",
+        "Chemin copié. Si la page ne s'est pas ouverte, tape",
+    ),
+    ("in the address bar.", "dans la barre d'adresse."),
+    ("Cannot start", "Impossible de lancer"),
+    (
+        "Firefox not found: the button saves the zip in this folder; open about:debugging in Firefox.",
+        "Firefox introuvable : le bouton enregistre le zip dans ce dossier ; ouvre about:debugging dans Firefox.",
+    ),
+    (
+        "No browser found: open its extensions page yourself.",
+        "Aucun navigateur trouvé : ouvre toi-même sa page des extensions.",
+    ),
+    ("Turn on “Developer mode”", "Active le « Mode développeur »"),
+    (
+        "Top right of the extensions page (Edge: bottom left).",
+        "En haut à droite de la page des extensions (Edge : en bas à gauche).",
+    ),
+    ("Click “Load unpacked”", "Clique sur « Charger l'extension non empaquetée »"),
+    (
+        "The button appears under the page title.",
+        "Le bouton apparaît sous le titre de la page.",
+    ),
+    ("Paste the path and confirm", "Colle le chemin et valide"),
+    (
+        "Ctrl+V in the folder picker (path already copied), then Select Folder.",
+        "Ctrl+V dans la fenêtre de choix du dossier (chemin déjà copié), puis « Sélectionner un dossier ».",
+    ),
+    ("Open “This Firefox”", "Ouvre « Ce Firefox »"),
+    (
+        "On the left of the about:debugging page.",
+        "À gauche de la page about:debugging.",
+    ),
+    (
+        "Click “Load Temporary Add-on…”",
+        "Clique sur « Charger un module complémentaire temporaire… »",
+    ),
+    (
+        "The button is at the top of the page.",
+        "Le bouton est en haut de la page.",
+    ),
+    ("Pick the zip file", "Choisis le fichier zip"),
+    (
+        "Ctrl+V pastes its path (already copied), then Open.",
+        "Ctrl+V colle son chemin (déjà copié), puis « Ouvrir ».",
+    ),
+    (
+        "Temporary add-on: Firefox removes it when it closes, until Mozilla signs the extension.",
+        "Module temporaire : Firefox le retire à sa fermeture, tant que Mozilla n'a pas signé l'extension.",
+    ),
+    (
+        "This folder is updated with fluxdl: after an update, click Reload on the extension's card.",
+        "Ce dossier est mis à jour avec fluxdl : après une mise à jour, clique sur Recharger sur la carte de l'extension.",
+    ),
+    ("Developer mode", "Mode développeur"),
+    ("Load unpacked", "Charger l'extension non empaquetée"),
+    ("This Firefox", "Ce Firefox"),
+    ("Load Temporary Add-on…", "Charger un module temporaire…"),
+    ("Select Folder", "Sélectionner un dossier"),
+    ("Connect the extension?", "Connecter l'extension ?"),
+    (
+        "A fluxdl extension asks for access",
+        "Une extension fluxdl demande l'accès",
+    ),
+    ("origin", "origine"),
+    ("Allow?", "Autoriser ?"),
+    (
+        "Allow only if you just installed it or clicked “Connect to fluxdl”. It will be able to send downloads to fluxdl.",
+        "N'autorise que si tu viens de l'installer ou de cliquer sur « Connecter à fluxdl ». Elle pourra envoyer des téléchargements à fluxdl.",
+    ),
+    ("Deny", "Refuser"),
+    ("Allow", "Autoriser"),
 ];
 
 pub fn t(lang: Lang, en: &'static str) -> &'static str {

@@ -10,7 +10,7 @@
   "statusChecking": {"message": "Vérification…"},
   "statusConnected": {"message": "Connecté à fluxdl $VERSION$", "placeholders": {"version": {"content": "$1", "example": "0.2.0"}}},
   "statusNotRunning": {"message": "fluxdl n'est pas lancé"},
-  "statusNotPaired": {"message": "Non appairé : ouvrez les options"},
+  "statusNotPaired": {"message": "Non appairé"},
   "statusNoAccess": {"message": "Pas d'accès à l'appli : ouvrez les options"},
   "statusBadOrigin": {"message": "fluxdl a refusé l'extension (contrôle d'origine)."},
   "statusError": {"message": "Réponse inattendue de fluxdl"},
@@ -70,5 +70,14 @@
   "pickCount": {"message": "$N$ coché(s)", "placeholders": {"n": {"content": "$1", "example": "3"}}},
   "pickSend": {"message": "Envoyer à fluxdl"},
   "pickEmpty": {"message": "Aucun lien trouvé sur cette page."},
-  "pickSent": {"message": "$OK$ sur $TOTAL$ envoyé(s) à fluxdl.", "placeholders": {"ok": {"content": "$1", "example": "3"}, "total": {"content": "$2", "example": "4"}}}
+  "pickSent": {"message": "$OK$ sur $TOTAL$ envoyé(s) à fluxdl.", "placeholders": {"ok": {"content": "$1", "example": "3"}, "total": {"content": "$2", "example": "4"}}},
+  "optPair": {"message": "Connecter à fluxdl"},
+  "optPairHint": {"message": "fluxdl demande alors « Autoriser ? » : cliquez sur Autoriser dans l'appli. Aucun jeton à copier."},
+  "optManualHint": {"message": "Ou à la main : copiez le jeton dans fluxdl → Réglages et collez-le ci-dessous."},
+  "pairWaiting": {"message": "Répondez dans fluxdl…"},
+  "pairPaired": {"message": "Appairé ✓"},
+  "pairDenied": {"message": "Refusé dans fluxdl."},
+  "pairBusy": {"message": "Une autre demande attend dans fluxdl. Réessayez dans une minute."},
+  "pairExpired": {"message": "Pas de réponse de fluxdl (1 minute). Réessayez."},
+  "pairOld": {"message": "Cette version de fluxdl ne sait pas appairer toute seule : mettez-la à jour, ou collez le jeton."}
 }

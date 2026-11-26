@@ -22,6 +22,15 @@
 
     <section class="card">
       <h2 data-i18n="optConnection"></h2>
+      <p class="hint" data-i18n="optPairHint"></p>
+      <p class="actions">
+        <button type="button" id="pair" class="go" data-i18n="optPair"></button>
+      </p>
+      <div class="status">
+        <span id="pairOrb" class="orb"></span>
+        <span id="pairMsg"></span>
+      </div>
+      <p class="hint" data-i18n="optManualHint"></p>
       <label class="field">
         <span data-i18n="optPort"></span>
         <input type="number" id="port" min="1024" max="65535" step="1">

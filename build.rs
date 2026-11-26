@@ -35,8 +35,54 @@ fn ecrire_ico(chemin: &std::path::Path) {
     std::fs::write(chemin, ico).expect("icône .ico");
 }
 
+/// Fichiers de l'extension (`extension/`, sans dist/, package.sh, README.md ni le manifeste
+/// Firefox), triés : `$OUT_DIR/extension.rs` pour `include!` dans src/extension.rs.
+fn embarquer_extension() {
+    let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("extension");
+    println!("cargo:rerun-if-changed={}", racine.display());
+    let mut fichiers = Vec::new();
+    let mut pile = vec![racine.clone()];
+    while let Some(d) = pile.pop() {
+        for e in std::fs::read_dir(&d).expect("extension/") {
+            let p = e.expect("extension/").path();
+            let rel = p
+                .strip_prefix(&racine)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if p.is_dir() {
+                if rel != "dist" {
+                    println!("cargo:rerun-if-changed={}", p.display());
+                    pile.push(p);
+                }
+            } else if !["package.sh", "README.md", "manifest.firefox.json"].contains(&rel.as_str())
+            {
+                println!("cargo:rerun-if-changed={}", p.display());
+                fichiers.push((rel, p));
+            }
+        }
+    }
+    fichiers.sort();
+    let mut code = String::from("const FICHIERS: &[(&str, &[u8])] = &[\n");
+    for (rel, p) in &fichiers {
+        code += &format!(
+            "    ({rel:?}, include_bytes!({:?})),\n",
+            p.display().to_string()
+        );
+    }
+    let ff = racine.join("manifest.firefox.json");
+    println!("cargo:rerun-if-changed={}", ff.display());
+    code += &format!(
+        "];\nconst MANIFESTE_FIREFOX: &[u8] = include_bytes!({:?});\n",
+        ff.display().to_string()
+    );
+    let sortie = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    std::fs::write(sortie.join("extension.rs"), code).expect("extension.rs");
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    embarquer_extension();
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=src/icone.rs");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {

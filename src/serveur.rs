@@ -4,6 +4,10 @@
 //! `Origin` absent accepté : Firefox peut l'omettre pour une extension ; une page web, elle,
 //! l'envoie toujours dès qu'elle ajoute l'en-tête du jeton (requête CORS), donc refusée.
 //! `GET /ping` → version ; `POST /add` {url, referrer?, filename?, cookies?} → file d'attente.
+//! `POST /pair` {nonce} (sans jeton, origine d'extension exigée) : appairage automatique. La 1re
+//! requête ouvre « Autoriser ? » dans l'appli (202) ; l'extension la répète avec le même nonce
+//! jusqu'à la réponse : jeton (200, une seule fois), refus (403) ou délai passé (410, 60 s).
+//! Une seule demande à la fois (409 pour les autres), 3 nouvelles demandes par minute au plus.
 
 use serde::Deserialize;
 use std::collections::VecDeque;
@@ -20,6 +24,10 @@ pub const ORIGINE_LOCALE: &str = "fluxdl://local";
 const LIMITE: usize = 30;
 const MAX_ENTETE: usize = 8 << 10;
 const MAX_CORPS: usize = 64 << 10;
+/// Durée de vie d'une demande d'appairage (réponse comprise).
+pub const DELAI_APPAIRAGE: Duration = Duration::from_secs(60);
+/// Nouvelles demandes d'appairage au plus par minute.
+const APPAIRAGES_MINUTE: usize = 3;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct Demande {
@@ -67,13 +75,133 @@ impl Limiteur {
     }
 }
 
-/// Réponse : code, corps JSON, origine à renvoyer (CORS) et demande acceptée.
+/// Demande d'appairage en cours : extension, navigateur deviné, nonce de l'extension,
+/// arrivée (sert aussi d'identifiant pour l'UI) et réponse de l'utilisateur.
+pub struct Attente {
+    pub origine: String,
+    pub navigateur: &'static str,
+    nonce: String,
+    pub depuis: Instant,
+    accord: Option<bool>,
+}
+
+/// Machine à états de l'appairage, partagée entre le serveur et l'UI.
+#[derive(Default)]
+pub struct Appairage {
+    attente: Option<Attente>,
+    essais: VecDeque<Instant>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Etape {
+    /// En attente du clic (vrai = nouvelle demande : réveiller l'UI).
+    Attente(bool),
+    Jeton,
+    Refus,
+    Occupe,
+    Expire,
+    Limite,
+}
+
+impl Appairage {
+    /// Requête `/pair` de `origine` avec `nonce` à l'instant `t`.
+    pub fn demander(
+        &mut self,
+        origine: &str,
+        navigateur: &'static str,
+        nonce: &str,
+        t: Instant,
+    ) -> Etape {
+        if let Some(a) = &self.attente {
+            let meme = a.origine == origine && egal(&a.nonce, nonce);
+            if t.duration_since(a.depuis) > DELAI_APPAIRAGE {
+                self.attente = None;
+                if meme {
+                    return Etape::Expire;
+                }
+            } else if !meme {
+                return Etape::Occupe;
+            } else {
+                return match a.accord {
+                    None => Etape::Attente(false),
+                    // Réponse donnée une seule fois : la demande disparaît.
+                    Some(oui) => {
+                        self.attente = None;
+                        if oui {
+                            Etape::Jeton
+                        } else {
+                            Etape::Refus
+                        }
+                    }
+                };
+            }
+        }
+        while self
+            .essais
+            .front()
+            .is_some_and(|d| t.duration_since(*d) > Duration::from_secs(60))
+        {
+            self.essais.pop_front();
+        }
+        if self.essais.len() >= APPAIRAGES_MINUTE {
+            return Etape::Limite;
+        }
+        self.essais.push_back(t);
+        self.attente = Some(Attente {
+            origine: origine.into(),
+            navigateur,
+            nonce: nonce.into(),
+            depuis: t,
+            accord: None,
+        });
+        Etape::Attente(true)
+    }
+
+    /// Demande à montrer à l'utilisateur : sans réponse et pas expirée.
+    pub fn en_cours(&self, t: Instant) -> Option<&Attente> {
+        self.attente
+            .as_ref()
+            .filter(|a| a.accord.is_none() && t.duration_since(a.depuis) <= DELAI_APPAIRAGE)
+    }
+
+    /// Réponse de l'utilisateur à la demande arrivée à `depuis` (pas à une autre arrivée
+    /// entre-temps).
+    pub fn repondre(&mut self, depuis: Instant, oui: bool, t: Instant) {
+        if let Some(a) = &mut self.attente {
+            if a.depuis == depuis
+                && a.accord.is_none()
+                && t.duration_since(depuis) <= DELAI_APPAIRAGE
+            {
+                a.accord = Some(oui);
+            }
+        }
+    }
+}
+
+/// Navigateur affiché dans « Autoriser ? » (deviné, à titre indicatif).
+fn navigateur(origine: &str, agent: &str) -> &'static str {
+    if origine.starts_with("moz-extension://") {
+        "Firefox"
+    } else if agent.contains("Edg/") {
+        "Edge"
+    } else if agent.contains("OPR/") {
+        "Opera"
+    } else if agent.contains("Vivaldi") {
+        "Vivaldi"
+    } else {
+        "Chrome / Brave"
+    }
+}
+
+/// Réponse : code, corps JSON, origine à renvoyer (CORS), demande acceptée, nouvelle demande
+/// d'appairage (réveiller l'UI).
 #[derive(Debug, PartialEq)]
 pub struct Reponse {
     pub code: u16,
     pub corps: String,
     pub origine: Option<String>,
     pub demande: Option<Demande>,
+    pub appairage: bool,
 }
 
 fn rep(code: u16, corps: &str) -> Reponse {
@@ -82,6 +210,7 @@ fn rep(code: u16, corps: &str) -> Reponse {
         corps: corps.into(),
         origine: None,
         demande: None,
+        appairage: false,
     }
 }
 
@@ -91,7 +220,14 @@ fn egal(a: &str, b: &str) -> bool {
 }
 
 /// Traite une requête brute (en-têtes + corps). Sans réseau : testable.
-pub fn traiter(brut: &[u8], port: u16, jeton: &str, lim: &mut Limiteur, t: Instant) -> Reponse {
+pub fn traiter(
+    brut: &[u8],
+    port: u16,
+    jeton: &str,
+    lim: &mut Limiteur,
+    pair: &mut Appairage,
+    t: Instant,
+) -> Reponse {
     if !lim.accepte(t) {
         return rep(429, r#"{"error":"rate limited"}"#);
     }
@@ -130,6 +266,39 @@ pub fn traiter(brut: &[u8], port: u16, jeton: &str, lim: &mut Limiteur, t: Insta
     };
     if methode == "OPTIONS" {
         return avec(rep(204, ""));
+    }
+    if (methode, chemin) == ("POST", "/pair") {
+        // Origine d'extension exigée (une 2e instance ou une requête sans origine n'appaire pas).
+        if !extension {
+            return rep(403, r#"{"error":"bad origin"}"#);
+        }
+        if jeton.is_empty() {
+            return avec(rep(403, r#"{"error":"server off"}"#));
+        }
+        #[derive(Deserialize)]
+        struct Corps {
+            nonce: String,
+        }
+        let nonce = serde_json::from_slice::<Corps>(corps).map(|c| c.nonce);
+        let Some(nonce) = nonce
+            .ok()
+            .filter(|n| (16..=64).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_hexdigit()))
+        else {
+            return avec(rep(400, r#"{"error":"bad body"}"#));
+        };
+        let nav = navigateur(&origine, &entete("User-Agent").unwrap_or_default());
+        return match pair.demander(&origine, nav, &nonce, t) {
+            Etape::Attente(nouvelle) => {
+                let mut r = avec(rep(202, r#"{"state":"waiting"}"#));
+                r.appairage = nouvelle;
+                r
+            }
+            Etape::Jeton => avec(rep(200, &serde_json::json!({ "token": jeton }).to_string())),
+            Etape::Refus => avec(rep(403, r#"{"error":"denied"}"#)),
+            Etape::Occupe => avec(rep(409, r#"{"error":"busy"}"#)),
+            Etape::Expire => avec(rep(410, r#"{"error":"expired"}"#)),
+            Etape::Limite => avec(rep(429, r#"{"error":"rate limited"}"#)),
+        };
     }
     if jeton.is_empty() || !egal(&entete("X-Fluxdl-Token").unwrap_or_default(), jeton) {
         return avec(rep(401, r#"{"error":"bad token"}"#));
@@ -203,10 +372,13 @@ fn lire(s: &mut TcpStream) -> Option<Vec<u8>> {
 fn repondre(s: &mut TcpStream, r: &Reponse) {
     let texte = match r.code {
         200 => "OK",
+        202 => "Accepted",
         204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
+        409 => "Conflict",
+        410 => "Gone",
         429 => "Too Many Requests",
         _ => "Not Found",
     };
@@ -230,6 +402,7 @@ fn repondre(s: &mut TcpStream, r: &Reponse) {
 pub fn lancer(
     port: u16,
     jeton: Arc<Mutex<String>>,
+    pair: Arc<Mutex<Appairage>>,
     tx: Sender<Demande>,
     reveil: impl Fn() + Send + 'static,
 ) -> std::io::Result<u16> {
@@ -242,8 +415,14 @@ pub fn lancer(
             // raccourci : une connexion à la fois (requêtes minuscules, délai de 3 s max).
             let Some(brut) = lire(&mut s) else { continue };
             let j = jeton.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let r = traiter(&brut, port, &j, &mut lim, Instant::now());
+            let r = {
+                let mut p = pair.lock().unwrap_or_else(|e| e.into_inner());
+                traiter(&brut, port, &j, &mut lim, &mut p, Instant::now())
+            };
             repondre(&mut s, &r);
+            if r.appairage {
+                reveil();
+            }
             if let Some(d) = r.demande {
                 if tx.send(d).is_err() {
                     return;
@@ -299,6 +478,7 @@ mod tests {
             PORT,
             J,
             &mut Limiteur::default(),
+            &mut Appairage::default(),
             Instant::now(),
         )
     }
@@ -389,13 +569,155 @@ mod tests {
         let e: Vec<(&str, &str)> = e.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let r = req("GET", "/ping", &e, "");
         for _ in 0..LIMITE {
-            assert_eq!(traiter(&r, PORT, J, &mut lim, t).code, 200);
+            assert_eq!(
+                traiter(&r, PORT, J, &mut lim, &mut Appairage::default(), t).code,
+                200
+            );
         }
-        assert_eq!(traiter(&r, PORT, J, &mut lim, t).code, 429);
+        assert_eq!(
+            traiter(&r, PORT, J, &mut lim, &mut Appairage::default(), t).code,
+            429
+        );
         // 10 s plus tard, la fenêtre est vide.
         assert_eq!(
-            traiter(&r, PORT, J, &mut lim, t + Duration::from_secs(11)).code,
+            traiter(
+                &r,
+                PORT,
+                J,
+                &mut lim,
+                &mut Appairage::default(),
+                t + Duration::from_secs(11)
+            )
+            .code,
             200
+        );
+    }
+
+    const N: &str = "00112233445566778899aabbccddeeff";
+
+    /// Requête `/pair` sans jeton depuis `origine` (vide = sans en-tête Origin).
+    fn pair(origine: &str, nonce: &str, p: &mut Appairage, t: Instant) -> Reponse {
+        let mut e = vec![("Host", "127.0.0.1:47591")];
+        if !origine.is_empty() {
+            e.push(("Origin", origine));
+        }
+        let corps = format!(r#"{{"nonce":"{nonce}"}}"#);
+        traiter(
+            &req("POST", "/pair", &e, &corps),
+            PORT,
+            J,
+            &mut Limiteur::default(),
+            p,
+            t,
+        )
+    }
+
+    #[test]
+    fn appairage_accorde_une_fois() {
+        let (mut p, t) = (Appairage::default(), Instant::now());
+        let o = "chrome-extension://abcdefghijklmnop";
+        let r = pair(o, N, &mut p, t);
+        assert_eq!((r.code, r.appairage), (202, true));
+        assert!(!r.corps.contains(J));
+        let a = p.en_cours(t).unwrap();
+        assert_eq!((a.origine.as_str(), a.navigateur), (o, "Chrome / Brave"));
+        let depuis = a.depuis;
+        // Sans clic : jamais de jeton, l'UI n'est réveillée qu'une fois.
+        let r = pair(o, N, &mut p, t + Duration::from_secs(5));
+        assert_eq!((r.code, r.appairage), (202, false));
+        // Une autre extension (ou un autre nonce) pendant l'attente : occupé, sans jeton.
+        let r = pair("chrome-extension://zzzz", N, &mut p, t);
+        assert_eq!(r.code, 409);
+        assert_eq!(pair(o, &N.replace('0', "1"), &mut p, t).code, 409);
+        // Clic « Autoriser » pour une autre demande (identifiant différent) : ignoré.
+        p.repondre(depuis + Duration::from_millis(1), true, t);
+        assert_eq!(pair(o, N, &mut p, t).code, 202);
+        p.repondre(depuis, true, t + Duration::from_secs(10));
+        assert!(p.en_cours(t + Duration::from_secs(10)).is_none());
+        // L'intrus ne l'obtient pas ; le demandeur, une seule fois.
+        assert_eq!(pair("chrome-extension://zzzz", N, &mut p, t).code, 409);
+        let r = pair(o, N, &mut p, t + Duration::from_secs(11));
+        assert_eq!(r.code, 200);
+        assert_eq!(r.corps, format!(r#"{{"token":"{J}"}}"#));
+        assert_eq!(r.origine.as_deref(), Some(o));
+        // Rejeu de la même requête : nouvelle demande, pas de jeton.
+        let r = pair(o, N, &mut p, t + Duration::from_secs(12));
+        assert_eq!((r.code, r.appairage), (202, true));
+        assert!(!r.corps.contains(J));
+    }
+
+    #[test]
+    fn appairage_refus_expiration_limite() {
+        let (mut p, t) = (Appairage::default(), Instant::now());
+        let o = "moz-extension://3f2a-uuid";
+        assert_eq!(pair(o, N, &mut p, t).code, 202);
+        assert_eq!(p.en_cours(t).unwrap().navigateur, "Firefox");
+        p.repondre(t, false, t);
+        assert_eq!(pair(o, N, &mut p, t).code, 403);
+        // Expiration : plus montrée après 60 s, puis 410 au demandeur ; un clic tardif est ignoré.
+        let t2 = t + Duration::from_secs(1);
+        assert_eq!(pair(o, N, &mut p, t2).code, 202);
+        let tard = t2 + DELAI_APPAIRAGE + Duration::from_secs(1);
+        assert!(p.en_cours(tard).is_none());
+        p.repondre(t2, true, tard);
+        assert_eq!(pair(o, N, &mut p, tard).code, 410);
+        // 3 nouvelles demandes par minute au plus.
+        let mut p = Appairage::default();
+        for _ in 0..APPAIRAGES_MINUTE {
+            assert_eq!(pair(o, N, &mut p, t).code, 202);
+            p.repondre(t, false, t);
+            assert_eq!(pair(o, N, &mut p, t).code, 403);
+        }
+        assert_eq!(pair(o, N, &mut p, t).code, 429);
+        assert!(p.en_cours(t).is_none());
+        assert_eq!(pair(o, N, &mut p, t + Duration::from_secs(30)).code, 429);
+        assert_eq!(pair(o, N, &mut p, t + Duration::from_secs(61)).code, 202);
+    }
+
+    #[test]
+    fn appairage_refuse_hors_extension() {
+        let (mut p, t) = (Appairage::default(), Instant::now());
+        // Page web, origine absente, 2e instance de l'appli : refusés, aucune demande ouverte.
+        for o in ["https://pirate.example", "null", "", ORIGINE_LOCALE] {
+            let r = pair(o, N, &mut p, t);
+            assert_eq!(r.code, 403, "{o}");
+            assert!(!r.appairage && !r.corps.contains(J));
+        }
+        assert!(p.en_cours(t).is_none());
+        // Host d'un domaine pirate (DNS rebinding) : refusé.
+        let e = [
+            ("Host", "pirate.example:47591"),
+            ("Origin", "chrome-extension://abcdefghijklmnop"),
+        ];
+        let r = traiter(
+            &req("POST", "/pair", &e, &format!(r#"{{"nonce":"{N}"}}"#)),
+            PORT,
+            J,
+            &mut Limiteur::default(),
+            &mut p,
+            t,
+        );
+        assert_eq!(r.code, 403);
+        // Nonce absent, trop court ou non hexadécimal.
+        let o = "chrome-extension://abcdefghijklmnop";
+        for n in ["", "abc", "zz112233445566778899aabbccddeeff"] {
+            assert_eq!(pair(o, n, &mut p, t).code, 400, "{n}");
+        }
+        // Serveur coupé (jeton vide) : rien.
+        let e = [("Host", "127.0.0.1:47591"), ("Origin", o)];
+        let r = traiter(
+            &req("POST", "/pair", &e, &format!(r#"{{"nonce":"{N}"}}"#)),
+            PORT,
+            "",
+            &mut Limiteur::default(),
+            &mut p,
+            t,
+        );
+        assert_eq!(r.code, 403);
+        assert!(p.en_cours(t).is_none());
+        assert_eq!(
+            navigateur(o, "Mozilla/5.0 … Chrome/130 Safari/537.36 Edg/130"),
+            "Edge"
         );
     }
 
@@ -403,7 +725,7 @@ mod tests {
     fn vrai_serveur_local() {
         let (tx, rx) = std::sync::mpsc::channel();
         let jeton = Arc::new(Mutex::new(J.to_string()));
-        let port = lancer(0, jeton, tx, || {}).unwrap();
+        let port = lancer(0, jeton, Arc::default(), tx, || {}).unwrap();
         assert!(confier(port, J, "magnet:?xt=urn:btih:abc"));
         let d = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(d.url, "magnet:?xt=urn:btih:abc");

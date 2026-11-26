@@ -95,13 +95,20 @@ impl App {
                 let rep = egui::Frame::NONE
                     .inner_margin(Margin::same(24))
                     .show(ui, |ui| {
-                        ui.set_width(LARGEUR);
+                        ui.set_width(if matches!(self.modale, Some(Modale::Guide(_))) {
+                            guide::LARGEUR_GUIDE
+                        } else {
+                            LARGEUR
+                        });
                         fermer = self.contenu_modale(ui);
                     });
                 let r = rep.response.rect;
                 ui.painter().set(fond, verre(ui.ctx(), r, 16, 0.86));
             });
         if fermer || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if let Some(Modale::Appairage { depuis, .. }) = &self.modale {
+                self.repondre_appairage(*depuis, false);
+            }
             if let Some(Modale::Outils {
                 etat: EtatOutils::Installation(_, _, stop),
                 ..
@@ -185,6 +192,12 @@ impl App {
                 }
                 return false;
             }
+            Modale::Guide(g) => return self.contenu_guide(ui, g),
+            Modale::Appairage {
+                depuis,
+                origine,
+                navigateur,
+            } => return self.contenu_appairage(ui, depuis, origine, navigateur),
             Modale::Page(url) => {
                 titre_modale(ui, Icone::Lien, t(l, "This link is a web page"));
                 match self.page_web(ui, &url, true) {
@@ -804,6 +817,24 @@ impl App {
             titre_section(ui, t(l, "Browser extension"));
             reglage(
                 ui,
+                t(l, "Install the extension"),
+                t(l, "Chrome, Edge, Brave, Firefox: guided, in 3 steps."),
+                |ui| {
+                    if bouton_principal(
+                        ui,
+                        t(l, "Install"),
+                        Some(Icone::Telecharger),
+                        vec2(120.0, 36.0),
+                    )
+                    .clicked()
+                    {
+                        self.ouvrir_guide();
+                    }
+                },
+            );
+            separateur(ui);
+            reglage(
+                ui,
                 t(l, "Accept links from the browser"),
                 t(
                     l,
@@ -819,7 +850,10 @@ impl App {
             reglage(
                 ui,
                 t(l, "Pairing token"),
-                t(l, "Paste it in the extension's options to pair it."),
+                t(
+                    l,
+                    "Without automatic pairing: paste it in the extension's options.",
+                ),
                 |ui| {
                     let c = ui.ctx().clone();
                     if bouton_principal(ui, t(l, "Copy"), Some(Icone::Copier), vec2(104.0, 36.0))
@@ -1078,8 +1112,8 @@ impl App {
     }
 }
 
-fn titre_modale(ui: &mut Ui, i: Icone, titre: &str) {
-    let (r, _) = ui.allocate_exact_size(vec2(LARGEUR, 34.0), Sense::hover());
+pub(super) fn titre_modale(ui: &mut Ui, i: Icone, titre: &str) {
+    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
     tuile_icone(
         ui.painter(),
         Rect::from_min_size(pos2(r.left(), r.center().y - 15.0), Vec2::splat(30.0)),
@@ -1097,7 +1131,7 @@ fn titre_modale(ui: &mut Ui, i: Icone, titre: &str) {
     ui.add_space(12.0);
 }
 
-fn paragraphe(ui: &mut Ui, s: &str) {
+pub(super) fn paragraphe(ui: &mut Ui, s: &str) {
     ui.label(egui::RichText::new(s).font(regulier(13.5)).color(TEXTE2));
 }
 
@@ -1115,9 +1149,9 @@ fn attente(ui: &mut Ui, s: &str) {
 
 /// Boutons du bas, à droite : secondaire (`Some(false)`), principal vert (`Some(true)`, absent
 /// si `ok` est vide, grisé si `actif` est faux).
-fn boutons(ui: &mut Ui, annuler: &str, ok: &str, actif: bool) -> Option<bool> {
+pub(super) fn boutons(ui: &mut Ui, annuler: &str, ok: &str, actif: bool) -> Option<bool> {
     ui.add_space(16.0);
-    let (r, _) = ui.allocate_exact_size(vec2(LARGEUR, 38.0), Sense::hover());
+    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
     let mut res = None;
     let mut x = r.right();
     if !ok.is_empty() {

@@ -31,6 +31,8 @@ pub struct Settings {
     pub ytdlp_updated: u64,
     /// Lien téléchargeable copié ailleurs : le proposer dans une bulle.
     pub clipboard_watch: bool,
+    /// Bulle « Installer l'extension » déjà montrée (ou guide déjà ouvert).
+    pub extension_asked: bool,
 }
 
 impl Default for Settings {
@@ -48,6 +50,7 @@ impl Default for Settings {
             handler_asked: false,
             ytdlp_updated: 0,
             clipboard_watch: true,
+            extension_asked: false,
         }
     }
 }

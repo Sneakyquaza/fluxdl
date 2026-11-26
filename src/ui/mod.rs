@@ -3,6 +3,7 @@
 
 mod draw;
 mod fenetres;
+mod guide;
 
 use crate::i18n::t;
 use crate::maj::{self, Maj};
@@ -174,6 +175,14 @@ enum Modale {
     Page(String),
     /// Annuler un téléchargement : effacer aussi le fichier partiel ? (oui par défaut)
     Annuler { id: u64, supprimer: bool },
+    /// Installation guidée de l'extension.
+    Guide(guide::Guide),
+    /// Une extension demande l'appairage : « Autoriser ? ».
+    Appairage {
+        depuis: std::time::Instant,
+        origine: String,
+        navigateur: &'static str,
+    },
 }
 
 /// Phase du comparatif (1 = une connexion, 2 = N) et son contrôle.
@@ -232,6 +241,8 @@ pub struct App {
     /// Liens envoyés par l'extension (serveur local) ou par une 2e instance.
     demandes: Option<Receiver<Demande>>,
     jeton: Arc<Mutex<String>>,
+    /// Demande d'appairage automatique (partagée avec le serveur).
+    appairage: Arc<Mutex<serveur::Appairage>>,
     serveur_err: Option<String>,
     outils: video::Outils,
     /// Captures : défilement imposé de la page des réglages.
@@ -292,6 +303,7 @@ impl App {
             modale: None,
             demandes: None,
             jeton: Arc::new(Mutex::new(String::new())),
+            appairage: Arc::default(),
             serveur_err: None,
             outils: video::Outils::default(),
             defile: None,
@@ -317,6 +329,7 @@ impl App {
         }
         app.next_id = app.entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
         maj::nettoyer();
+        crate::extension::mettre_a_jour(&crate::extension::dossier());
         app.outils = video::trouver();
         // yt-dlp suit les changements des sites : notre copie se met à jour chaque semaine.
         let maintenant = secondes();
@@ -339,9 +352,13 @@ impl App {
         self.sync_jeton();
         let (tx, rx) = std::sync::mpsc::channel();
         let c = ctx.clone();
-        match serveur::lancer(self.settings.port, self.jeton.clone(), tx, move || {
-            c.request_repaint()
-        }) {
+        match serveur::lancer(
+            self.settings.port,
+            self.jeton.clone(),
+            self.appairage.clone(),
+            tx,
+            move || c.request_repaint(),
+        ) {
             Ok(_) => self.demandes = Some(rx),
             Err(e) => self.serveur_err = Some(e.to_string()),
         }
@@ -2071,7 +2088,7 @@ impl App {
         let f = *frame;
         let dir = dir.clone();
         // Assez d'images entre le changement de vue et la capture pour finir les animations.
-        let vues: [(Tab, Lang, &str); 9] = [
+        let vues: [(Tab, Lang, &str); 14] = [
             (Tab::Downloads, Lang::En, "downloads"),
             (Tab::Benchmark, Lang::En, "benchmark"),
             (Tab::Settings, Lang::En, "settings"),
@@ -2081,6 +2098,11 @@ impl App {
             (Tab::Downloads, Lang::Fr, "video_formats_fr"),
             (Tab::Downloads, Lang::Fr, "torrent_pieces_fr"),
             (Tab::Downloads, Lang::Fr, "video_tools_fr"),
+            (Tab::Settings, Lang::Fr, "extension_guide_fr"),
+            (Tab::Settings, Lang::Fr, "extension_guide_firefox_fr"),
+            (Tab::Settings, Lang::En, "extension_guide_en"),
+            (Tab::Settings, Lang::Fr, "pairing_fr"),
+            (Tab::Downloads, Lang::Fr, "extension_bubble_fr"),
         ];
         for (i, (tab, lang, nom)) in vues.into_iter().enumerate() {
             let k = 30 * (i as u32 + 1);
@@ -2103,6 +2125,7 @@ impl App {
     fn demo_vue(&mut self, nom: &str) {
         self.modale = None;
         self.defile = None;
+        self.settings.extension_asked = nom != "extension_bubble_fr";
         self.maj.mettre(maj::Etat::Rien);
         self.selected = Some(1);
         let f = |nom: &str, size| crate::github::Fichier {
@@ -2139,6 +2162,15 @@ impl App {
                 });
             }
             "torrent_pieces_fr" => self.selected = Some(5),
+            "extension_guide_fr" | "extension_guide_en" => self.demo_guide(false),
+            "extension_guide_firefox_fr" => self.demo_guide(true),
+            "pairing_fr" => {
+                self.modale = Some(Modale::Appairage {
+                    depuis: std::time::Instant::now(),
+                    origine: "chrome-extension://kbfnbcaeplbcioakkpcpgfkobkghlhen".into(),
+                    navigateur: "Chrome / Brave",
+                })
+            }
             "video_tools_fr" => {
                 self.modale = Some(Modale::Outils {
                     url: String::new(),
@@ -2441,6 +2473,9 @@ impl eframe::App for App {
                 }
             }
         }
+        if self.capture.is_none() {
+            self.suivre_appairage(&ctx);
+        }
         self.suivre_modale();
         self.capture_step(&ctx);
         let ecran = ctx.content_rect();
@@ -2505,6 +2540,7 @@ impl eframe::App for App {
             });
         self.modale(&ctx);
         self.bulle_maj(&ctx);
+        self.bulle_extension(&ctx);
         self.bulle_lien(&ctx);
         self.zone_depot(&ctx);
         self.persist(now);
