@@ -8,6 +8,7 @@ mod i18n;
 mod icone;
 mod instance;
 mod maj;
+mod motw;
 mod presse;
 mod serveur;
 mod store;

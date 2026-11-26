@@ -601,7 +601,16 @@ impl App {
             j.speed = 0.0;
             fini = true;
             e.status = match r {
-                Some(Ok(Outcome::Done(_))) => Status::Done,
+                Some(Ok(Outcome::Done(p))) => {
+                    // Marque « venu d'Internet » (Windows) ; un dossier seulement pour un torrent
+                    // (yt-dlp sans chemin final renvoie le dossier de téléchargement).
+                    if p.is_file() || matches!(e.kind, Kind::Torrent { .. }) {
+                        crate::motw::marquer(&p, &e.url, e.referrer.as_deref());
+                    }
+                    // Cookies inutiles une fois fini : ils ne restent pas dans queue.json.
+                    e.cookies = None;
+                    Status::Done
+                }
                 Some(Ok(Outcome::Stopped)) => Status::Paused,
                 Some(Err(m)) => {
                     if m == engine::ERR_PAGE {
