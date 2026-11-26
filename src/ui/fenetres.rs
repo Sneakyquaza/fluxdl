@@ -170,6 +170,22 @@ impl App {
                 }
                 return false;
             }
+            Modale::Page(url) => {
+                titre_modale(ui, Icone::Lien, t(l, "This link is a web page"));
+                match self.page_web(ui, &url, true) {
+                    Some(true) => {
+                        // L'entrée en échec laisse la place à la vidéo.
+                        self.entries.retain(|e| {
+                            !(e.url == url
+                                && matches!(&e.status, Status::Failed(m) if m == engine::ERR_PAGE))
+                        });
+                        self.ouvrir_video(url);
+                        return false;
+                    }
+                    Some(false) => fermer = true,
+                    None => self.modale = Some(Modale::Page(url)),
+                }
+            }
             Modale::Video {
                 url,
                 rx,
@@ -181,7 +197,9 @@ impl App {
                     None => attente(ui, t(l, "Reading the available formats…")),
                     Some(Err(m)) => {
                         erreur(ui, tr(l, m));
-                        fermer = boutons(ui, t(l, "Close"), "", false).is_some();
+                        // yt-dlp ne sait pas lire la page : passer par le navigateur.
+                        ui.add_space(8.0);
+                        fermer = self.page_web(ui, &url, false).is_some();
                     }
                     Some(Ok(i)) => {
                         let g = ligne(ui, i.titre.as_str(), demi(14.5), TEXTE, LARGEUR);
@@ -492,6 +510,142 @@ impl App {
     }
 
     /// Bulle de notification (en bas à droite) : nouvelle version, téléchargement, échec.
+    /// Bulle « Lien copié » en bas à gauche de la colonne, 8 s, fondu d'entrée et de sortie.
+    pub(super) fn bulle_lien(&mut self, ctx: &egui::Context) {
+        const DUREE: f64 = 8.0;
+        let Some((url, depuis)) = self.lien_copie.clone() else {
+            return;
+        };
+        let age = self.now - depuis;
+        if age >= DUREE {
+            self.lien_copie = None;
+            return;
+        }
+        let a = (age / 0.25).min((DUREE - age) / 0.4).clamp(0.0, 1.0) as f32;
+        if a < 1.0 {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(Duration::from_secs_f64(DUREE - 0.4 - age));
+        }
+        let l = self.settings.lang;
+        let (icone, nom) = if url.starts_with("magnet:") {
+            (Icone::Aimant, t(l, "magnet link").to_string())
+        } else if video::site_video(&url) {
+            let hote = url.split('/').nth(2).unwrap_or("").to_string();
+            (Icone::Lecture, format!("{} ({hote})", t(l, "video")))
+        } else {
+            let nom = engine::name_from_url(&url).unwrap_or_default();
+            (Icone::Lien, nom)
+        };
+        let ecran = ctx.content_rect();
+        let taille = vec2(392.0, 100.0);
+        let pos = pos2(
+            ecran.left() + 284.0,
+            ecran.bottom() - taille.y - 26.0 + 8.0 * (1.0 - a),
+        );
+        egui::Area::new(egui::Id::unique("bulle-lien"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                ui.multiply_opacity(a);
+                let (r, _) = ui.allocate_exact_size(taille, Sense::hover());
+                let p = ui.painter();
+                p.add(lueur(
+                    r.expand(2.0),
+                    rgb(0x5c, 0xc8, 0xff).gamma_multiply(0.35),
+                    14.0,
+                ));
+                p.add(verre(ui.ctx(), r, 16, 0.84));
+                let c = pos2(r.left() + 34.0, r.top() + 32.0);
+                orbe(p, c, 17.0, GEL_BLEU);
+                icone_relief(p, Rect::from_center_size(c, Vec2::splat(16.0)), icone);
+                let x = r.left() + 62.0;
+                let g = ligne(
+                    ui,
+                    t(l, "Link copied"),
+                    demi(14.5),
+                    TITRE,
+                    r.right() - x - 14.0,
+                );
+                p.galley(pos2(x, r.top() + 24.0 - g.size().y / 2.0), g, TITRE);
+                let g = ligne(ui, nom, regulier(12.5), TEXTE2, r.right() - x - 14.0);
+                p.galley(pos2(x, r.top() + 43.0 - g.size().y / 2.0), g, TEXTE2);
+                let bp = Rect::from_min_size(
+                    pos2(r.right() - 16.0 - 130.0, r.bottom() - 42.0),
+                    vec2(130.0, 30.0),
+                );
+                let bi = Rect::from_min_size(pos2(bp.left() - 98.0, bp.top()), vec2(90.0, 30.0));
+                let ignorer = a_la_place(ui, bi, |ui| {
+                    bouton_secondaire(ui, t(l, "Ignore"), None, bi.size())
+                });
+                let go = a_la_place(ui, bp, |ui| {
+                    bouton_gel(
+                        ui,
+                        t(l, "Download"),
+                        Some(Icone::Telecharger),
+                        bp.size(),
+                        GEL_VERT,
+                    )
+                });
+                if ignorer.clicked() {
+                    self.lien_copie = None;
+                }
+                if go.clicked() {
+                    self.lien_copie = None;
+                    self.ajouter(url.clone(), None, None, false);
+                }
+            });
+    }
+
+    /// Fichiers survolés au-dessus de la fenêtre : zone de dépôt en verre.
+    pub(super) fn zone_depot(&self, ctx: &egui::Context) {
+        if ctx.input(|i| i.raw.hovered_files.is_empty()) {
+            return;
+        }
+        let l = self.settings.lang;
+        let ecran = ctx.content_rect();
+        egui::Area::new(egui::Id::unique("depot"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(ecran.min)
+            .interactable(false)
+            .show(ctx, |ui| {
+                let p = ui.painter();
+                p.rect_filled(ecran, 0.0, nuit(60));
+                let r = ecran.shrink(28.0);
+                p.add(lueur(r, rgb(0x5c, 0xc8, 0xff).gamma_multiply(0.5), 18.0));
+                p.add(verre(ui.ctx(), r, 22, 0.6));
+                p.rect_stroke(
+                    r.shrink(10.0),
+                    16,
+                    Stroke::new(2.0, blanc(200)),
+                    StrokeKind::Inside,
+                );
+                let c = r.center() - vec2(0.0, 30.0);
+                orbe(p, c, 36.0, GEL_VERT);
+                icone_relief(
+                    p,
+                    Rect::from_center_size(c, Vec2::splat(30.0)),
+                    Icone::Telecharger,
+                );
+                texte(
+                    ui,
+                    c + vec2(0.0, 62.0),
+                    Align2::CENTER_CENTER,
+                    t(l, "Drop to download"),
+                    demi(20.0),
+                    TITRE,
+                );
+                texte(
+                    ui,
+                    c + vec2(0.0, 90.0),
+                    Align2::CENTER_CENTER,
+                    t(l, ".torrent file or .url shortcut"),
+                    regulier(14.0),
+                    TEXTE2,
+                );
+            });
+    }
+
     pub(super) fn bulle_maj(&mut self, ctx: &egui::Context) {
         let l = self.settings.lang;
         let etat = self.maj.etat();
@@ -854,6 +1008,58 @@ impl App {
             url: String::new(),
             etat: EtatOutils::Lecture(rx),
         });
+    }
+}
+
+impl App {
+    /// Explication « page web, pas fichier » et boutons Fermer / Essayer comme vidéo (si
+    /// `video`) / Ouvrir la page. `Some(true)` = vidéo, `Some(false)` = fermer.
+    fn page_web(&self, ui: &mut Ui, url: &str, video: bool) -> Option<bool> {
+        let l = self.settings.lang;
+        paragraphe(
+            ui,
+            t(
+                l,
+                "This link leads to a web page, not directly to a file. Open the page in your browser and click its download button: with the fluxdl extension (auto-capture on), the real file will arrive here.",
+            ),
+        );
+        ui.add_space(4.0);
+        let g = ligne(ui, url, regulier(12.0), TEXTE3, LARGEUR);
+        let (r, _) = ui.allocate_exact_size(g.size(), Sense::hover());
+        ui.painter().galley(r.min, g, TEXTE3);
+        ui.add_space(16.0);
+        let (r, _) = ui.allocate_exact_size(vec2(LARGEUR, 38.0), Sense::hover());
+        let mut res = None;
+        let mut x = r.right();
+        let peintre = ui.painter().clone();
+        let largeur = |s: &str, marge: f32| {
+            peintre.layout_no_wrap(s.into(), demi(13.5), TEXTE).size().x + marge
+        };
+        let ouvrir = t(l, "Open the page");
+        let w = largeur(ouvrir, 64.0);
+        let b = Rect::from_min_size(pos2(x - w, r.top()), vec2(w, 38.0));
+        if a_la_place(ui, b, |ui| {
+            bouton_gel(ui, ouvrir, Some(Icone::Lien), b.size(), GEL_BLEU)
+        })
+        .clicked()
+        {
+            open_folder(Path::new(url));
+            res = Some(false);
+        }
+        x = b.left() - 10.0;
+        let mut autres = vec![(t(l, "Close"), false)];
+        if video {
+            autres.insert(0, (t(l, "Try as video"), true));
+        }
+        for (nom, v) in autres {
+            let w = largeur(nom, 44.0);
+            let b = Rect::from_min_size(pos2(x - w, r.top()), vec2(w, 38.0));
+            if a_la_place(ui, b, |ui| bouton_secondaire(ui, nom, None, b.size())).clicked() {
+                res = Some(v);
+            }
+            x = b.left() - 10.0;
+        }
+        res
     }
 }
 

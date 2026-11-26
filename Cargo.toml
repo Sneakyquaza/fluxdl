@@ -1,7 +1,7 @@
 [package]
 # Nom provisoire : à changer ici et dans `APP_NAME` (src/lib.rs).
 name = "fluxdl"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 description = "Free open-source multi-connection download manager"
@@ -11,7 +11,9 @@ name = "dlcore"
 path = "src/lib.rs"
 
 [dependencies]
-eframe = { version = "0.37", default-features = false, features = ["glow", "x11", "wayland"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "x11", "wayland", "clipboard"] }
+# Presse-papiers (déjà tiré par la fonction `clipboard` d'eframe) : bouton « Coller ».
+arboard = { version = "3.6", default-features = false }
 # Captures PNG (--capture) et fond d’écran JPEG embarqué.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 serde = { version = "1", features = ["derive"] }

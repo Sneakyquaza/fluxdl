@@ -28,6 +28,51 @@ use std::time::Duration;
 const MAX_ACTIFS: usize = 3;
 const QUEUE: &str = "queue.json";
 const SETTINGS: &str = "settings.json";
+/// Carte d'astuces de la barre latérale : (icône, titre, texte), une toutes les `ASTUCE_S` s.
+const ASTUCES: [(Icone, &str, &str); 8] = [
+    (
+        Icone::Eclair,
+        "Done early? Take half.",
+        "A connection that finishes early takes half of the largest remaining range.",
+    ),
+    (
+        Icone::Actualiser,
+        "Picks up where it stopped",
+        "After a crash, a power cut or a pause, a download resumes from where it was.",
+    ),
+    (
+        Icone::Lien,
+        "Browser extension",
+        "Pair it in Settings, turn on auto-capture: browser downloads land here.",
+    ),
+    (
+        Icone::Lecture,
+        "Videos too",
+        "Paste a video page link: yt-dlp fetches it in the quality you pick, or audio only.",
+    ),
+    (
+        Icone::Aimant,
+        "Magnets and torrents",
+        "Paste a magnet link or drop a .torrent file onto the window.",
+    ),
+    (
+        Icone::Comparatif,
+        "Measure the gain",
+        "The Benchmark tab downloads the same link with 1 connection, then with N.",
+    ),
+    (
+        Icone::Reglages,
+        "Leave some bandwidth",
+        "Settings → Speed limit: each download leaves bandwidth for everyone else.",
+    ),
+    (
+        Icone::Telecharger,
+        "Always up to date",
+        "fluxdl tells you when a new version is out and updates itself in one click.",
+    ),
+];
+const ASTUCE_S: f64 = 12.0;
+const FONDU_S: f64 = 0.6;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
@@ -127,6 +172,8 @@ enum Modale {
     },
     /// Premier torrent (Windows) : ouvrir les liens magnet et .torrent avec l'appli ?
     Association,
+    /// Le lien mène à une page web, pas à un fichier : l'ouvrir dans le navigateur.
+    Page(String),
 }
 
 /// Phase du comparatif (1 = une connexion, 2 = N) et son contrôle.
@@ -164,8 +211,8 @@ pub struct App {
     now: f64,
     /// Instant d'ajout de chaque nouveau téléchargement (apparition en fondu).
     born: HashMap<u64, f64>,
-    /// Bouton « Coller » : collage demandé à cet instant (0 = aucun).
-    paste_wait: f64,
+    /// Carte d'astuces : (actuelle, précédente, depuis quand).
+    astuce: (usize, usize, f64),
     /// Sélecteur de dossier ouvert dans un fil.
     picker: Option<Receiver<String>>,
     /// Sélecteur de fichier .torrent ouvert dans un fil.
@@ -187,6 +234,13 @@ pub struct App {
     outils: video::Outils,
     /// Captures : défilement imposé de la page des réglages.
     defile: Option<f32>,
+    /// Liens copiés ailleurs (fil de `presse`) ; surveillance active ou non.
+    presse: Option<Receiver<String>>,
+    presse_actif: Arc<AtomicBool>,
+    /// Dernier texte copié par l'appli elle-même (jamais proposé).
+    copie_app: Option<String>,
+    /// Bulle « Lien copié » : lien et instant d'apparition.
+    lien_copie: Option<(String, f64)>,
 }
 
 impl App {
@@ -221,7 +275,7 @@ impl App {
             logo,
             now: 0.0,
             born: HashMap::new(),
-            paste_wait: 0.0,
+            astuce: (0, 0, 0.0),
             picker: None,
             picker_torrent: None,
             maj: Maj::new({
@@ -238,6 +292,10 @@ impl App {
             serveur_err: None,
             outils: video::Outils::default(),
             defile: None,
+            presse: None,
+            presse_actif: Arc::new(AtomicBool::new(false)),
+            copie_app: None,
+            lien_copie: None,
         };
         if let Some(d) = capture {
             app.demo();
@@ -248,6 +306,9 @@ impl App {
             app.settings = s;
         }
         app.entries = store::load(QUEUE).unwrap_or_default();
+        app.presse_actif
+            .store(app.settings.clipboard_watch, Ordering::Relaxed);
+        app.presse = Some(crate::presse::lancer(ctx.clone(), app.presse_actif.clone()));
         for e in &mut app.entries {
             // Interrompu par un arrêt ou un plantage : reprend tout seul.
             if e.status == Status::Running {
@@ -458,6 +519,7 @@ impl App {
 
     /// Fin des téléchargements terminés, démarrage des suivants, noms et tailles à jour.
     fn schedule(&mut self, now: f64) {
+        let mut page = None;
         for e in &mut self.entries {
             let Some(j) = self.jobs.get_mut(&e.id) else {
                 continue;
@@ -488,9 +550,18 @@ impl App {
                     Status::Canceled
                 }
                 Some(Ok(Outcome::Stopped)) => Status::Paused,
-                Some(Err(m)) => Status::Failed(m),
+                Some(Err(m)) => {
+                    if m == engine::ERR_PAGE {
+                        page = Some(e.url.clone());
+                    }
+                    Status::Failed(m)
+                }
                 None => e.status.clone(),
             };
+        }
+        // Page web au lieu d'un fichier : explication et bouton vers le navigateur.
+        if let Some(url) = page.filter(|_| self.modale.is_none()) {
+            self.modale = Some(Modale::Page(url));
         }
         // Un torrent qui partage après la fin ne prend pas de place dans la file.
         let mut actifs = self
@@ -528,25 +599,65 @@ impl App {
             .resizable(false)
             .show_separator_line(false)
             .show(ui, |ui| {
+                // Astuce suivante toutes les 12 s (fondu enchaîné), ou au clic.
+                let (mut cur, mut avant, mut depuis) = self.astuce;
+                if self.capture.is_none() && self.now - depuis >= ASTUCE_S {
+                    (avant, cur, depuis) = (cur, (cur + 1) % ASTUCES.len(), self.now);
+                }
+                let a = ((self.now - depuis) / FONDU_S).clamp(0.0, 1.0) as f32;
                 let fond = ui.painter().add(egui::Shape::Noop);
                 let cadre = egui::Frame::NONE
                     .inner_margin(Margin::same(14))
                     .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        let (r, _) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
-                        tuile_icone(ui.painter(), r, Icone::Eclair, GEL_VERT);
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new(t(l, "Done early? Take half."))
-                                .font(demi(13.5))
-                                .color(TITRE),
-                        );
-                        ui.add_space(-2.0);
-                        let m = t(
-                            l,
-                            "A connection that finishes early takes half of the largest remaining range.",
-                        );
-                        ui.label(egui::RichText::new(m).font(regulier(12.5)).color(TEXTE2));
+                        let w = ui.available_width();
+                        let p = ui.painter().clone();
+                        let textes = |k: usize| {
+                            let (_, titre, texte) = ASTUCES[k];
+                            (
+                                p.layout(t(l, titre).into(), demi(13.5), TITRE, w),
+                                p.layout(t(l, texte).into(), regulier(12.5), TEXTE2, w),
+                            )
+                        };
+                        // Hauteur fixe (la plus longue astuce) : la carte ne saute pas.
+                        let h = (0..ASTUCES.len())
+                            .map(|k| {
+                                let (g1, g2) = textes(k);
+                                g1.size().y + g2.size().y
+                            })
+                            .fold(0.0, f32::max);
+                        let (r, _) =
+                            ui.allocate_exact_size(vec2(w, 26.0 + 6.0 + h), Sense::hover());
+                        let a = if cur == avant { 1.0 } else { a };
+                        for (k, o) in [(avant, 1.0 - a), (cur, a)] {
+                            if o <= 0.0 {
+                                continue;
+                            }
+                            let mut p = ui.painter().clone();
+                            p.multiply_opacity(o);
+                            let (ic, _, _) = ASTUCES[k];
+                            let gel = if k % 2 == 0 { GEL_VERT } else { GEL_BLEU };
+                            tuile_icone(&p, Rect::from_min_size(r.min, Vec2::splat(26.0)), ic, gel);
+                            let (g1, g2) = textes(k);
+                            let y = r.top() + 32.0 + g1.size().y;
+                            p.galley(pos2(r.left(), r.top() + 32.0), g1, TITRE);
+                            p.galley(pos2(r.left(), y), g2, TEXTE2);
+                        }
+                        // Points : un par astuce, l'actuelle en bleu.
+                        let n = ASTUCES.len() as f32;
+                        for k in 0..ASTUCES.len() {
+                            let c = pos2(
+                                r.right() - 3.0 - (n - 1.0 - k as f32) * 10.0,
+                                r.top() + 13.0,
+                            );
+                            let col = if k == cur {
+                                mix(nuit(50), TITRE, a)
+                            } else if k == avant {
+                                mix(TITRE, nuit(50), a)
+                            } else {
+                                nuit(50)
+                            };
+                            ui.painter().circle_filled(c, 3.0, col);
+                        }
                     });
                 // Encart : verre plus clair, posé dans le verre de la barre.
                 let r = cadre.response.rect;
@@ -555,9 +666,33 @@ impl App {
                     egui::Shape::Vec(vec![
                         vdeg(r, 12, blanc(215), blanc(150)),
                         reflet(r.shrink(1.0), 11, 0.5),
-                        egui::Shape::rect_stroke(r, 12, Stroke::new(1.0, nuit(45)), StrokeKind::Inside),
+                        egui::Shape::rect_stroke(
+                            r,
+                            12,
+                            Stroke::new(1.0, nuit(45)),
+                            StrokeKind::Inside,
+                        ),
                     ]),
                 );
+                if ui
+                    .interact(r, egui::Id::unique("astuce"), Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    (avant, cur, depuis) = (cur, (cur + 1) % ASTUCES.len(), self.now);
+                }
+                self.astuce = (cur, avant, depuis);
+                // Images seulement pendant le fondu (30 i/s) ; sinon une seule, au prochain
+                // changement.
+                if self.capture.is_none() {
+                    let reste = (self.now - depuis).max(0.0);
+                    if reste < FONDU_S {
+                        ui.ctx().request_repaint_after(Duration::from_millis(33));
+                    } else {
+                        ui.ctx()
+                            .request_repaint_after(Duration::from_secs_f64(ASTUCE_S - reste));
+                    }
+                }
                 ui.add_space(14.0);
                 ui.label(
                     egui::RichText::new(format!(
@@ -670,16 +805,18 @@ impl App {
             Align2::LEFT_CENTER,
             titre,
             affiche(30.0),
+            f32::INFINITY,
         );
         if let Some(s) = sous {
-            let (rs, _) = ui.allocate_exact_size(vec2(r.width(), 22.0), Sense::hover());
-            texte_ciel(
+            let rs = texte_ciel(
                 ui.painter(),
-                rs.left_center(),
-                Align2::LEFT_CENTER,
+                ui.cursor().left_top() + vec2(0.0, 2.0),
+                Align2::LEFT_TOP,
                 s,
                 moyen(14.0),
+                r.width(),
             );
+            ui.allocate_exact_size(vec2(r.width(), rs.height() + 4.0), Sense::hover());
         }
         r
     }
@@ -773,9 +910,15 @@ impl App {
                     .on_hover_text(t(l, "Paste"))
             });
             if coller.clicked() {
-                self.paste_wait = self.now;
-                ui.ctx()
-                    .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                // Lecture directe du presse-papiers (texte seulement).
+                if let Some(s) = arboard::Clipboard::new()
+                    .and_then(|mut c| c.get_text())
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                {
+                    self.url = s;
+                }
             }
             let go = a_la_place(ui, bd, |ui| {
                 bouton_gel(
@@ -908,25 +1051,29 @@ impl App {
                 Icone::Telecharger,
             );
             ui.add_space(8.0);
-            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
-            texte_ciel(
-                ui.painter(),
-                r.center(),
-                Align2::CENTER_CENTER,
-                t(l, "No downloads yet"),
-                demi(17.0),
-            );
-            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
-            texte_ciel(
-                ui.painter(),
-                r.center(),
-                Align2::CENTER_CENTER,
-                t(
-                    l,
-                    "Paste a link above. Each file is split across up to 32 parallel connections.",
+            // Centré, renvoyé à la ligne dans la largeur disponible (moins une marge).
+            let w = ui.available_width();
+            for (s, police, h) in [
+                (t(l, "No downloads yet"), demi(17.0), 24.0),
+                (
+                    t(
+                        l,
+                        "Paste a link above. Each file is split across up to 32 parallel connections.",
+                    ),
+                    moyen(13.5),
+                    20.0,
                 ),
-                moyen(13.5),
-            );
+            ] {
+                let r = texte_ciel(
+                    ui.painter(),
+                    pos2(ui.max_rect().center().x, ui.cursor().top() + 2.0),
+                    Align2::CENTER_TOP,
+                    s,
+                    police,
+                    (w - 32.0).max(80.0),
+                );
+                ui.allocate_exact_size(vec2(w, r.height().max(h - 4.0) + 4.0), Sense::hover());
+            }
         });
     }
 
@@ -966,6 +1113,7 @@ impl App {
                     (Icone::Fermer, "Cancel", Act::Cancel),
                 ],
                 Status::Failed(m) if m == engine::ERR_PAGE => &[
+                    (Icone::Lien, "Open in browser", Act::Navigateur),
                     (Icone::Lecture, "Try as video", Act::Video),
                     (Icone::Fermer, "Remove from list", Act::Remove),
                 ],
@@ -1104,6 +1252,7 @@ impl App {
         match a {
             Act::Select => self.selected = Some(id),
             Act::Folder => open_folder(Path::new(&self.entries[i].dir)),
+            Act::Navigateur => open_folder(Path::new(&self.entries[i].url)),
             // Un torrent qui partage s'arrête « fini » (voir torrent::telecharger).
             Act::Pause => match self.jobs.get(&id).filter(|j| j.handle.is_some()) {
                 Some(j) => j.ctl.request_stop(),
@@ -1747,6 +1896,19 @@ impl App {
                             }
                         },
                     );
+                    separateur(ui);
+                    reglage(
+                        ui,
+                        t(l, "Watch the clipboard"),
+                        t(l, "Offers to download a file link as soon as you copy it."),
+                        |ui| {
+                            if interrupteur(ui, &mut self.settings.clipboard_watch).changed() {
+                                self.presse_actif
+                                    .store(self.settings.clipboard_watch, Ordering::Relaxed);
+                                self.lien_copie = None;
+                            }
+                        },
+                    );
                 });
                 ui.add_space(20.0);
                 self.reglages_v2(ui);
@@ -2088,6 +2250,8 @@ enum Act {
     Select,
     /// Lien de page web : réessayer avec yt-dlp.
     Video,
+    /// Lien de page web : l'ouvrir dans le navigateur.
+    Navigateur,
     Folder,
     Pause,
     Resume,
@@ -2107,21 +2271,6 @@ impl eframe::App for App {
             let h = self.bench.handle.take().map(|h| h.join());
             self.bench.result = h.map(|r| r.unwrap_or_else(|_| Err("panic".into())));
             self.bench.shown = now;
-        }
-        // « Coller » : le texte arrive par un événement Paste une image plus tard.
-        if self.paste_wait > 0.0 {
-            let colle = ctx.input(|i| {
-                i.events.iter().find_map(|e| match e {
-                    egui::Event::Paste(s) => Some(s.trim().to_string()),
-                    _ => None,
-                })
-            });
-            if let Some(s) = colle {
-                self.url = s;
-                self.paste_wait = 0.0;
-            } else if now - self.paste_wait > 1.0 {
-                self.paste_wait = 0.0;
-            }
         }
         if let Some(rx) = &self.picker {
             match rx.try_recv() {
@@ -2163,7 +2312,27 @@ impl eframe::App for App {
                 .collect()
         });
         for f in poses {
-            self.ajouter(f, None, None, true);
+            if f.to_ascii_lowercase().ends_with(".url") {
+                // Raccourci Internet (Windows) : la ligne « URL=… ».
+                let lien = std::fs::read_to_string(&f).ok().and_then(|t| {
+                    t.lines()
+                        .find_map(|l| l.trim().strip_prefix("URL=").map(str::to_string))
+                });
+                if let Some(u) = lien {
+                    self.ajouter(u, None, None, false);
+                }
+            } else {
+                self.ajouter(f, None, None, true);
+            }
+        }
+        // Lien copié ailleurs : bulle, sauf copie de l'appli ou lien déjà dans la file.
+        if let Some(l) = self.presse.as_ref().and_then(|rx| rx.try_iter().last()) {
+            if self.settings.clipboard_watch
+                && self.copie_app.as_ref() != Some(&l)
+                && !self.entries.iter().any(|e| e.url == l)
+            {
+                self.lien_copie = Some((l, now));
+            }
         }
         if self.capture.is_none() {
             if now >= self.maj_prochaine {
@@ -2244,7 +2413,18 @@ impl eframe::App for App {
             });
         self.modale(&ctx);
         self.bulle_maj(&ctx);
+        self.bulle_lien(&ctx);
+        self.zone_depot(&ctx);
         self.persist(now);
+        // Textes copiés par l'appli (Ctrl+C, bouton Copier) : à ne pas proposer.
+        if let Some(c) = ctx.output(|o| {
+            o.commands.iter().rev().find_map(|c| match c {
+                egui::OutputCommand::CopyText(t) => Some(t.trim().to_string()),
+                _ => None,
+            })
+        }) {
+            self.copie_app = Some(c);
+        }
         // Au repos, aucune image : on ne redessine que si quelque chose bouge ou télécharge
         // (les animations egui demandent elles-mêmes leurs images).
         let vivant = self
@@ -2254,7 +2434,6 @@ impl eframe::App for App {
             || self.bench.handle.is_some()
             || self.picker.is_some()
             || self.picker_torrent.is_some()
-            || self.paste_wait > 0.0
             || matches!(
                 self.maj.etat(),
                 maj::Etat::Recherche | maj::Etat::Telechargement(..)

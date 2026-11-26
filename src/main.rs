@@ -6,6 +6,7 @@ mod github;
 mod i18n;
 mod icone;
 mod maj;
+mod presse;
 mod serveur;
 mod store;
 mod torrent;

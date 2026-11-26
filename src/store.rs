@@ -29,6 +29,8 @@ pub struct Settings {
     pub handler_asked: bool,
     /// Dernière mise à jour de yt-dlp (secondes Unix).
     pub ytdlp_updated: u64,
+    /// Lien téléchargeable copié ailleurs : le proposer dans une bulle.
+    pub clipboard_watch: bool,
 }
 
 impl Default for Settings {
@@ -45,6 +47,7 @@ impl Default for Settings {
             torrent_handler: false,
             handler_asked: false,
             ytdlp_updated: 0,
+            clipboard_watch: true,
         }
     }
 }

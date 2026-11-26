@@ -514,9 +514,22 @@ pub fn orbe(p: &egui::Painter, c: Pos2, rayon: f32, g: Gel) {
 }
 
 /// Texte posé sur le ciel : blanc, ombre bleu nuit douce (lisible sur le fond).
-pub fn texte_ciel(p: &egui::Painter, pos: Pos2, ancre: Align2, t: &str, police: FontId) -> Rect {
-    let g = p.layout_no_wrap(t.to_string(), police, Color32::WHITE);
+/// `largeur` : retour à la ligne au-delà (`f32::INFINITY` = une seule ligne), lignes alignées
+/// selon `ancre`.
+pub fn texte_ciel(
+    p: &egui::Painter,
+    pos: Pos2,
+    ancre: Align2,
+    t: &str,
+    police: FontId,
+    largeur: f32,
+) -> Rect {
+    let mut job = egui::text::LayoutJob::simple(t.to_string(), police, Color32::WHITE, largeur);
+    job.halign = ancre.x();
+    let g = p.layout_job(job);
     let r = ancre.anchor_size(pos, g.size());
+    // Lignes centrées / à droite : la galerie déborde à gauche de son origine.
+    let r0 = r.min - g.rect.min.to_vec2();
     // Ombre portée + halo sombre tout autour (texte des icônes du bureau Vista).
     for (d, a) in [
         (vec2(0.0, 1.5), 110),
@@ -526,9 +539,9 @@ pub fn texte_ciel(p: &egui::Painter, pos: Pos2, ancre: Align2, t: &str, police: 
         (vec2(0.0, -0.8), 35),
         (vec2(0.0, 2.5), 40),
     ] {
-        p.galley_with_override_text_color(r.min + d, g.clone(), nuit(a));
+        p.galley_with_override_text_color(r0 + d, g.clone(), nuit(a));
     }
-    p.galley(r.min, g, Color32::WHITE);
+    p.galley(r0, g, Color32::WHITE);
     r
 }
 

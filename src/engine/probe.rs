@@ -12,7 +12,15 @@ pub fn probe(
     for (k, v) in headers {
         req = req.set(k, v);
     }
-    let resp = req.call().map_err(|e| format!("probe: {e}"))?;
+    let resp = match req.call() {
+        // Page de connexion ou anti-robot (Cloudflare…) : c'est une page web, pas le fichier.
+        Err(ureq::Error::Status(c, r))
+            if matches!(c, 401 | 403 | 429 | 503) && super::est_html(r.header("Content-Type")) =>
+        {
+            return Err(super::ERR_PAGE.into())
+        }
+        r => r.map_err(|e| format!("probe: {e}"))?,
+    };
     let entete = |n: &str| resp.header(n).map(str::to_string);
     let (size, ranges) = if resp.status() == 206 {
         // « bytes 0-0/12345 » ; « */ » inconnu : pas de découpage possible.

@@ -235,11 +235,15 @@ fn est_page(p: &Probe, url: &str) -> bool {
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
-    p.content_type
-        .as_deref()
-        .is_some_and(|c| c.trim_start().to_ascii_lowercase().starts_with("text/html"))
-        && !chemin.ends_with(".html")
-        && !chemin.ends_with(".htm")
+    est_html(p.content_type.as_deref()) && !chemin.ends_with(".html") && !chemin.ends_with(".htm")
+}
+
+/// Type de contenu HTML (`text/html`, `application/xhtml+xml`).
+fn est_html(c: Option<&str>) -> bool {
+    c.is_some_and(|c| {
+        let c = c.trim_start().to_ascii_lowercase();
+        c.starts_with("text/html") || c.starts_with("application/xhtml+xml")
+    })
 }
 
 enum Step {
@@ -541,6 +545,10 @@ fn fetch(sh: &Shared, w: usize, i: usize) -> Result<(), FetchErr> {
         req = req.set("Range", &format!("bytes={pos}-{}", end - 1));
     }
     let resp = req.call().map_err(classify)?;
+    // Une page web à la place du fichier (session expirée, anti-robot…) : ne rien écrire.
+    if est_html(resp.header("Content-Type")) && !est_html(sh.probe.content_type.as_deref()) {
+        return Err(FetchErr::Fatal(ERR_PAGE.into()));
+    }
     let change = || FetchErr::Fatal("remote file changed".into());
     if sh.ranged {
         if resp.status() != 206 {
@@ -762,6 +770,10 @@ mod tests {
         assert!(!est_page(&p("text/html"), "https://a.b/doc/page.html?x=1"));
         assert!(!est_page(&p("application/zip"), "https://a.b/f"));
         assert!(!est_page(&Probe::default(), "https://a.b/f"));
+        assert!(est_html(Some("application/xhtml+xml")));
+        assert!(est_html(Some(" Text/HTML; charset=UTF-8")));
+        assert!(!est_html(Some("application/octet-stream")));
+        assert!(!est_html(None));
     }
 
     #[test]
