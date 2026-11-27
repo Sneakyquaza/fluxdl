@@ -145,7 +145,21 @@ async function videoCookies(site, tab, settings) {
   }
 }
 
-// Lien de la PAGE vidéo → appli (choix du format) ; pas de repli navigateur (rien à télécharger)
+// Raison courte d'un échec vidéo (bouton près du lecteur, popup)
+function videoReason(res) {
+  const state = res.state;
+  if (state === "down") return t("floatNotRunning");
+  if (state === "unpaired") return t("videoNotPaired");
+  if (state === "noaccess") return t("videoNoAccess");
+  // Appli trop ancienne : ne connaît pas la demande (400 « bad kind », 404)
+  if (state === "bad" || res.status === 404) return t("videoUpdateApp");
+  if (state === "rate") return t("videoRate");
+  if (state === "kept" && res.status === 503) return t("videoBusy");
+  return t("videoRefused", [String(res.status ?? state)]);
+}
+
+// Lien de la PAGE vidéo → appli (choix du format) ; pas de repli navigateur (rien à télécharger).
+// Dernier essai gardé pour le popup (diagnostic).
 async function sendVideo(url, site, tab) {
   const settings = await getSettings();
   const body = { url, kind: "video" };
@@ -157,6 +171,8 @@ async function sendVideo(url, site, tab) {
   if (res.state === "unpaired" && (await pairOnce()) === "paired") res = await callApp("/add", body);
   if (FALLBACK_STATES.includes(res.state)) notify(t(res.state === "down" ? "notifVideoNotRunning" : "statusNotPaired"));
   else if (res.state !== "ok") notify(errorMessage(res));
+  res.reason = res.state === "ok" ? "" : videoReason(res);
+  await saveSettings({ lastVideo: { at: Date.now(), reason: res.reason } });
   return res;
 }
 
@@ -392,7 +408,7 @@ async function handleMessage(msg, sender) {
       const site = videoPageSite(msg.url);
       if (!site || videoSiteOf(sender.url) !== site) return { error: "url" };
       const res = await sendVideo(msg.url, site, sender.tab);
-      return { state: res.state, status: res.status };
+      return { state: res.state, status: res.status, reason: res.reason };
     }
     case "fluxdl-pair": {
       if (!fromOwnPage(sender)) return { error: "sender" };

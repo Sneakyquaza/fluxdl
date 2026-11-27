@@ -20,12 +20,17 @@
   let resetTimer = 0;
 
   const t = (k, subs) => api.i18n.getMessage(k, subs) || k;
+  // Lu tout de suite : une fois l'extension rechargée ou mise à jour, ce script reste dans
+  // l'onglet sans plus pouvoir appeler l'extension (i18n compris)
+  const RELOAD = t("videoReload");
 
   function send(msg) {
+    // Extension rechargée, onglet pas rafraîchi : contexte invalide
+    if (!api.runtime?.id) return Promise.resolve({ error: "reload" });
     try {
       return api.runtime.sendMessage(msg).catch(() => null);
     } catch {
-      return Promise.resolve(null); // extension rechargée : contexte invalide
+      return Promise.resolve({ error: "reload" });
     }
   }
 
@@ -395,19 +400,11 @@
     placeVideo();
   }
 
-  // Raison courte de l'échec (lisible sur une capture d'écran)
+  // Raison courte de l'échec (lisible sur une capture d'écran), donnée par l'arrière-plan
   function videoError(res) {
-    const state = res?.state;
-    if (state === "down") return t("floatNotRunning");
-    if (state === "unpaired") return t("videoNotPaired");
-    if (state === "noaccess") return t("videoNoAccess");
-    // Appli trop ancienne : ne connaît pas la demande (400 « bad kind », 404)
-    if (state === "bad" || res?.status === 404) return t("videoUpdateApp");
-    if (state === "rate") return t("videoRate");
-    if (state === "kept" && res.status === 503) return t("videoBusy");
-    if (state) return t("videoRefused", [String(res.status ?? state)]);
-    // Pas de réponse de l'arrière-plan (extension rechargée : recharger la page) ou refus
-    return t("videoInternal", [String(res?.error ?? "?")]);
+    if (res?.error === "reload") return RELOAD;
+    // Pas de réponse de l'arrière-plan, ou refus
+    return res?.reason || t("videoInternal", [String(res?.error ?? "?")]);
   }
 
   async function onVideoClick(e) {

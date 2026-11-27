@@ -118,10 +118,21 @@ pub fn texte(url: &str) -> Result<String, Erreur> {
 }
 
 /// Empreinte de `nom` dans un fichier d'empreintes : « <64 hex>  nom » ou « <64 hex> *nom »
-/// par ligne (SHA2-256SUMS, checksums.sha256), ou les 64 caractères seuls (`nom` vide ou
-/// fichier d'une seule ligne sans nom).
+/// par ligne (SHA2-256SUMS, checksums.sha256), les 64 caractères seuls (`nom` vide ou
+/// fichier d'une seule ligne sans nom), ou la sortie de Get-FileHash (deno : « Hash : <hex> »,
+/// « Path : …\nom »).
 pub fn empreinte(t: &str, nom: &str) -> Result<String, Erreur> {
     let hex = |h: &str| h.len() == 64 && h.bytes().all(|c| c.is_ascii_hexdigit());
+    let champ = |c: &str| {
+        t.lines()
+            .find_map(|l| l.trim().strip_prefix(c)?.trim_start().strip_prefix(':'))
+            .map(str::trim)
+    };
+    if let (Some(h), Some(p)) = (champ("Hash"), champ("Path")) {
+        if hex(h) && p.rsplit(['\\', '/']).next() == Some(nom) {
+            return Ok(h.to_ascii_lowercase());
+        }
+    }
     for l in t.lines() {
         let mut m = l.split_whitespace();
         let (Some(h), n) = (m.next(), m.next()) else {
@@ -269,6 +280,16 @@ mod tests {
         assert_eq!(empreinte(&sums, "yt-dlp_x86.exe").unwrap(), autre);
         assert!(empreinte(&sums, "absent.exe").is_err());
         assert!(empreinte("pas une empreinte", "x").is_err());
+        // Get-FileHash (deno-x86_64-pc-windows-msvc.zip.sha256sum, fins de ligne CRLF)
+        let ps = format!(
+            "\r\nAlgorithm : SHA256\r\nHash      : {}\r\nPath      : C:\\a\\deno\\deno-x86_64-pc-windows-msvc.zip\r\n\r\n",
+            h.to_uppercase()
+        );
+        assert_eq!(
+            empreinte(&ps, "deno-x86_64-pc-windows-msvc.zip").unwrap(),
+            h
+        );
+        assert!(empreinte(&ps, "deno.zip").is_err());
     }
 
     #[test]

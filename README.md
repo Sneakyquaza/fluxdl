@@ -45,8 +45,9 @@ A free, open-source multi-connection download manager (Windows + Linux, single e
   sound. On Windows, first use offers to download the official `yt-dlp.exe`
   (github.com/yt-dlp/yt-dlp, checked against `SHA2-256SUMS`) and the shared ffmpeg build
   (github.com/yt-dlp/FFmpeg-Builds, checked against `checksums.sha256`) into the app data
-  folder; yt-dlp updates itself weekly. On Linux the system `yt-dlp` and `ffmpeg` are used.
-  YouTube may need a JavaScript runtime (deno or node) installed for all formats.
+  folder, plus deno (github.com/denoland/deno, checked against its `.sha256sum`), the
+  JavaScript runtime YouTube now requires; yt-dlp updates itself weekly. On Linux the system
+  `yt-dlp` and `ffmpeg` are used, with deno or node from the `PATH` for YouTube.
 - **Torrents and magnet links** (librqbit, Apache-2.0): paste a magnet link, open or drop a
   `.torrent` file, pick the files, follow progress, peers, download and upload speed and a
   pieces map. Sharing after the download is off by default (optional ratio). Torrents resume
@@ -54,6 +55,15 @@ A free, open-source multi-connection download manager (Windows + Linux, single e
   not create is never overwritten. On Windows fluxdl can open magnet links and `.torrent`
   files (asked on the first torrent, toggle in Settings, current user only).
 - **Browser extension** (below).
+
+### New in 0.2.7
+- **YouTube videos no longer fail with "Requested format is not available" on Windows.**
+  YouTube now needs a JavaScript runtime: fluxdl downloads deno with yt-dlp and ffmpeg (if you
+  already have them, only deno is offered, 43 MB). M4A / MP3 fall back to the sound of the best
+  format when there is no audio-only one.
+- **Extension:** after the extension is reloaded or updated, an open tab's video button says
+  "Reload the page (F5)" instead of hanging. The popup shows the extension version and the last
+  video failure with its reason.
 
 ### New in 0.2.6
 - **Video button fixed.** fluxdl now accepts a video page right away instead of waiting for its

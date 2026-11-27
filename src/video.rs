@@ -1,8 +1,9 @@
 //! Vidéos par yt-dlp : formats lus avec `yt-dlp -J`, téléchargement confié à yt-dlp lui-même
-//! (progression lue sur `--progress-template`), fusion par ffmpeg. Windows : yt-dlp.exe et
-//! ffmpeg téléchargés depuis leurs releases GitHub officielles (empreintes vérifiées) dans le
-//! dossier de données, après accord ; yt-dlp mis à jour chaque semaine (`-U`). Linux : ceux du
-//! système.
+//! (progression lue sur `--progress-template`), fusion par ffmpeg. Windows : yt-dlp.exe,
+//! ffmpeg et deno (JavaScript exigé par YouTube : sans lui, plus aucun format utilisable,
+//! « Requested format is not available ») téléchargés depuis leurs releases GitHub officielles
+//! (empreintes vérifiées) dans le dossier de données, après accord ; yt-dlp mis à jour chaque
+//! semaine (`-U`). Linux : ceux du système.
 
 use crate::github::{self, Erreur, Fichier};
 use dlcore::engine::{Control, Outcome, Segment, WorkerStat};
@@ -85,10 +86,11 @@ impl Qualite {
                 "--merge-output-format",
                 "mp4",
             ],
-            Qualite::M4a => vec!["-f", "ba[ext=m4a]/ba", "-x", "--audio-format", "m4a"],
+            // Pas de son seul (formats image + son ensemble) : son extrait du meilleur format
+            Qualite::M4a => vec!["-f", "ba[ext=m4a]/ba/b", "-x", "--audio-format", "m4a"],
             Qualite::Mp3 => vec![
                 "-f",
-                "ba",
+                "ba/b",
                 "-x",
                 "--audio-format",
                 "mp3",
@@ -316,16 +318,17 @@ pub fn debut_possible(url: &str) -> bool {
 
 const MODELE: &str = "download:fluxdl %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s";
 
-/// Emplacements de yt-dlp et ffmpeg (dossier de ffmpeg, pour `--ffmpeg-location`).
+/// Emplacements de yt-dlp, ffmpeg (dossier de ffmpeg, pour `--ffmpeg-location`) et deno.
 #[derive(Clone, Debug, Default)]
 pub struct Outils {
     pub ytdlp: Option<PathBuf>,
     pub ffmpeg: Option<PathBuf>,
+    pub deno: Option<PathBuf>,
 }
 
 impl Outils {
     pub fn complets(&self) -> bool {
-        self.ytdlp.is_some() && self.ffmpeg.is_some()
+        self.ytdlp.is_some() && self.ffmpeg.is_some() && self.deno.is_some()
     }
 }
 
@@ -350,6 +353,7 @@ pub fn trouver() -> Outils {
     let d = dossier_outils();
     let yt = d.join(format!("yt-dlp{EXE}"));
     let ff = d.join("ffmpeg").join("bin");
+    let deno = d.join(format!("deno{EXE}"));
     Outils {
         ytdlp: yt.is_file().then_some(yt).or_else(|| dans_path("yt-dlp")),
         ffmpeg: ff
@@ -357,6 +361,7 @@ pub fn trouver() -> Outils {
             .is_file()
             .then_some(ff)
             .or_else(|| dans_path("ffmpeg").and_then(|f| f.parent().map(Path::to_path_buf))),
+        deno: deno.is_file().then_some(deno).or_else(|| dans_path("deno")),
     }
 }
 
@@ -376,15 +381,13 @@ fn args_communs(c: &mut Command, o: &Outils, cookies: Option<&Path>) {
         c.arg("--no-plugin-dirs");
     }
     c.env("PYTHONIOENCODING", "utf-8");
-    c.args([
-        "--encoding",
-        "utf-8",
-        "--no-playlist",
-        "--js-runtimes",
-        "deno",
-        "--js-runtimes",
-        "node",
-    ]);
+    c.args(["--encoding", "utf-8", "--no-playlist", "--js-runtimes"]);
+    // deno par son chemin complet (le nôtre n'est pas dans le PATH), sinon node du système
+    match &o.deno {
+        Some(d) => c.arg(format!("deno:{}", d.display())),
+        None => c.arg("deno"),
+    };
+    c.args(["--js-runtimes", "node"]);
     if let Some(f) = &o.ffmpeg {
         c.arg("--ffmpeg-location").arg(f);
     }
@@ -552,11 +555,12 @@ fn tuer(f: &mut std::process::Child) {
     let _ = f.wait();
 }
 
-/// Fichiers à télécharger (Windows) : yt-dlp.exe et ffmpeg (build partagé, plus petit).
+/// Fichiers à télécharger (Windows) : yt-dlp.exe, ffmpeg (build partagé, plus petit) et deno.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Paquet {
     pub ytdlp: Option<(Fichier, String)>,
     pub ffmpeg: Option<(Fichier, String)>,
+    pub deno: Option<(Fichier, String)>,
 }
 
 impl Paquet {
@@ -564,14 +568,22 @@ impl Paquet {
         self.ytdlp
             .iter()
             .chain(&self.ffmpeg)
+            .chain(&self.deno)
             .map(|f| f.0.size)
             .sum()
+    }
+
+    pub fn vide(&self) -> bool {
+        self.ytdlp.is_none() && self.ffmpeg.is_none() && self.deno.is_none()
     }
 }
 
 const YTDLP_DEPOT: &str = "yt-dlp/yt-dlp";
 const FFMPEG_DEPOT: &str = "yt-dlp/FFmpeg-Builds";
 const FFMPEG_ZIP: &str = "ffmpeg-master-latest-win64-gpl-shared.zip";
+/// Environnement JavaScript recommandé par yt-dlp (activé par défaut ; wiki « EJS »).
+const DENO_DEPOT: &str = "denoland/deno";
+const DENO_ZIP: &str = "deno-x86_64-pc-windows-msvc.zip";
 
 /// Lit les releases et les empreintes de ce qui manque (rien n'est encore téléchargé).
 pub fn preparer(o: &Outils) -> Result<Paquet, Erreur> {
@@ -594,6 +606,14 @@ pub fn preparer(o: &Outils) -> Result<Paquet, Erreur> {
         },
         ffmpeg: match o.ffmpeg {
             None => Some(lire(FFMPEG_DEPOT, FFMPEG_ZIP, "checksums.sha256")?),
+            Some(_) => None,
+        },
+        deno: match o.deno {
+            None => Some(lire(
+                DENO_DEPOT,
+                DENO_ZIP,
+                &format!("{DENO_ZIP}.sha256sum"),
+            )?),
             Some(_) => None,
         },
     })
@@ -621,25 +641,51 @@ pub fn installer(
         let r = extraire_ffmpeg(&zip, &d);
         let _ = std::fs::remove_file(&zip);
         r?;
+        base += f.size;
+    }
+    if let Some((f, sha)) = &p.deno {
+        let zip = d.join(DENO_ZIP);
+        github::telecharger(f, sha, &zip, stop, |n| progres(base + n, total))?;
+        let r = extraire_deno(&zip, &d);
+        let _ = std::fs::remove_file(&zip);
+        r?;
     }
     Ok(())
 }
 
-/// Le zip contient `ffmpeg-…-shared/bin/*` : extrait par tar.exe (Windows 10 et plus) dans un
-/// dossier temporaire, puis renommé en `ffmpeg/`.
-fn extraire_ffmpeg(zip: &Path, d: &Path) -> Result<(), Erreur> {
-    let tmp = d.join("ffmpeg.tmp");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).map_err(|_| "Cannot write the file.")?;
+/// Zip extrait par tar.exe (Windows 10 et plus) dans le dossier `tmp` (recréé vide).
+fn tar_x(zip: &Path, tmp: &Path) -> Result<bool, Erreur> {
+    let _ = std::fs::remove_dir_all(tmp);
+    std::fs::create_dir_all(tmp).map_err(|_| "Cannot write the file.")?;
     // Chemin complet : pas de tar.exe pris dans le dossier courant ou le PATH.
     let tar = crate::systeme::outil("tar");
-    let ok = commande(&tar)
+    Ok(commande(&tar)
         .arg("-xf")
         .arg(zip)
         .arg("-C")
-        .arg(&tmp)
+        .arg(tmp)
         .status()
-        .is_ok_and(|s| s.success());
+        .is_ok_and(|s| s.success()))
+}
+
+/// Le zip contient `deno.exe` seul : extrait dans un dossier temporaire, puis déplacé.
+fn extraire_deno(zip: &Path, d: &Path) -> Result<(), Erreur> {
+    let tmp = d.join("deno.tmp");
+    let exe = tmp.join("deno.exe");
+    let r = if tar_x(zip, &tmp)? && exe.is_file() {
+        std::fs::rename(&exe, d.join("deno.exe")).map_err(|_| "Cannot write the file.")
+    } else {
+        Err("Cannot unpack deno.")
+    };
+    let _ = std::fs::remove_dir_all(&tmp);
+    r
+}
+
+/// Le zip contient `ffmpeg-…-shared/bin/*` : extrait dans un dossier temporaire, puis renommé
+/// en `ffmpeg/`.
+fn extraire_ffmpeg(zip: &Path, d: &Path) -> Result<(), Erreur> {
+    let tmp = d.join("ffmpeg.tmp");
+    let ok = tar_x(zip, &tmp)?;
     let interne = std::fs::read_dir(&tmp)
         .ok()
         .and_then(|mut l| l.find_map(|e| e.ok().map(|e| e.path())))
@@ -699,10 +745,12 @@ mod tests {
     #[test]
     fn sans_config_ni_greffon() {
         let notre = dossier_outils().join(format!("yt-dlp{EXE}"));
+        let deno = dossier_outils().join(format!("deno{EXE}"));
         for (yt, greffons) in [(notre, true), (PathBuf::from("/usr/bin/yt-dlp"), false)] {
             let o = Outils {
                 ytdlp: Some(yt.clone()),
                 ffmpeg: None,
+                deno: greffons.then(|| deno.clone()),
             };
             let mut c = commande(&yt);
             args_communs(&mut c, &o, None);
@@ -712,6 +760,16 @@ mod tests {
                 .collect();
             assert_eq!(a.first().map(String::as_str), Some("--ignore-config"));
             assert_eq!(a.iter().any(|x| x == "--no-plugin-dirs"), greffons);
+            // Notre deno par son chemin complet (YouTube exige un environnement JavaScript)
+            let js = if greffons {
+                format!("deno:{}", deno.display())
+            } else {
+                "deno".into()
+            };
+            assert!(
+                a.windows(2).any(|w| w[0] == "--js-runtimes" && w[1] == js),
+                "{a:?}"
+            );
             assert_eq!(
                 c.get_current_dir(),
                 Some(crate::store::data_dir().as_path())

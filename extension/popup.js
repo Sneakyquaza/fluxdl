@@ -84,6 +84,15 @@ async function init() {
     if (res?.state === "paired") $("pairRow").hidden = true;
   });
 
+  // Diagnostic : version de l'extension (pas seulement de l'appli) et dernier échec vidéo
+  const diag = [t("popupExtVersion", [api.runtime.getManifest().version])];
+  const { lastVideo } = await api.storage.local.get("lastVideo");
+  if (lastVideo?.reason) {
+    const at = new Date(lastVideo.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    diag.push(t("popupLastVideoError", [at, lastVideo.reason]));
+  }
+  $("diag").textContent = diag.join(" · ");
+
   refreshStatus();
 }
 

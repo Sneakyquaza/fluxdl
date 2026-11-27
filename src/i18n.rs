@@ -257,8 +257,8 @@ const FR: &[(&str, &str)] = &[
         "Serveur local sur 127.0.0.1 seulement, pour l'extension fluxdl.",
     ),
     (
-        "Looking up the latest yt-dlp and ffmpeg…",
-        "Recherche des dernières versions de yt-dlp et ffmpeg…",
+        "Looking up the latest yt-dlp, ffmpeg and deno…",
+        "Recherche des dernières versions de yt-dlp, ffmpeg et deno…",
     ),
     (
         "Magnet links in your browser and .torrent files in Explorer will open here. You can change this later in Settings.",
@@ -323,8 +323,8 @@ const FR: &[(&str, &str)] = &[
     ("Video tools needed", "Outils vidéo nécessaires"),
     ("Videos", "Vidéos"),
     (
-        "Videos need yt-dlp (reads and downloads the video) and ffmpeg (merges picture and sound). fluxdl can download the official builds from GitHub and verify their checksums:",
-        "Les vidéos ont besoin de yt-dlp (lit et télécharge la vidéo) et de ffmpeg (réunit image et son). fluxdl peut télécharger les versions officielles depuis GitHub et vérifier leurs empreintes :",
+        "Videos need yt-dlp (reads and downloads the video), ffmpeg (merges picture and sound) and deno (JavaScript required by YouTube). fluxdl can download the official builds from GitHub and verify their checksums:",
+        "Les vidéos ont besoin de yt-dlp (lit et télécharge la vidéo), de ffmpeg (réunit image et son) et de deno (JavaScript exigé par YouTube). fluxdl peut télécharger les versions officielles depuis GitHub et vérifier leurs empreintes :",
     ),
     ("Windows only.", "Windows seulement."),
     ("Yes", "Oui"),

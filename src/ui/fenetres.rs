@@ -43,10 +43,8 @@ impl App {
                     EtatOutils::Lecture(rx) => {
                         if let Ok(r) = rx.try_recv() {
                             *etat = match r {
-                                Ok(p) if p.ytdlp.is_none() && p.ffmpeg.is_none() => {
-                                    EtatOutils::Erreur("Nothing to download.")
-                                }
-                                Ok(p) => EtatOutils::Pret(p),
+                                Ok(p) if p.vide() => EtatOutils::Erreur("Nothing to download."),
+                                Ok(p) => EtatOutils::Pret(Box::new(p)),
                                 Err(m) => EtatOutils::Erreur(m),
                             };
                         }
@@ -534,7 +532,7 @@ impl App {
                 titre_modale(ui, Icone::Lecture, t(l, "Video tools needed"));
                 match &etat {
                     EtatOutils::Lecture(_) => {
-                        attente(ui, t(l, "Looking up the latest yt-dlp and ffmpeg…"));
+                        attente(ui, t(l, "Looking up the latest yt-dlp, ffmpeg and deno…"));
                         fermer = boutons(ui, t(l, "Cancel"), "", false).is_some();
                     }
                     EtatOutils::Pret(p) => {
@@ -542,7 +540,7 @@ impl App {
                             ui,
                             t(
                                 l,
-                                "Videos need yt-dlp (reads and downloads the video) and ffmpeg (merges picture and sound). fluxdl can download the official builds from GitHub and verify their checksums:",
+                                "Videos need yt-dlp (reads and downloads the video), ffmpeg (merges picture and sound) and deno (JavaScript required by YouTube). fluxdl can download the official builds from GitHub and verify their checksums:",
                             ),
                         );
                         ui.add_space(8.0);
@@ -552,7 +550,12 @@ impl App {
                                 .map(|f| ("yt-dlp", "github.com/yt-dlp/yt-dlp", f.0.size))
                                 .chain(p.ffmpeg.iter().map(|f| {
                                     ("ffmpeg", "github.com/yt-dlp/FFmpeg-Builds", f.0.size)
-                                }));
+                                }))
+                                .chain(
+                                    p.deno
+                                        .iter()
+                                        .map(|f| ("deno", "github.com/denoland/deno", f.0.size)),
+                                );
                         for (nom, depot, taille) in lignes {
                             let (r, _) =
                                 ui.allocate_exact_size(vec2(LARGEUR, 40.0), Sense::hover());
@@ -1127,9 +1130,10 @@ impl App {
             // Espace avant « : » en français seulement.
             let sep = if l == Lang::Fr { " :" } else { ":" };
             let aide = format!(
-                "yt-dlp{sep} {}, ffmpeg{sep} {}",
+                "yt-dlp{sep} {}, ffmpeg{sep} {}, deno{sep} {}",
                 etat(&o.ytdlp),
-                etat(&o.ffmpeg)
+                etat(&o.ffmpeg),
+                etat(&o.deno)
             );
             let complets = o.complets();
             reglage(ui, t(l, "yt-dlp and ffmpeg"), &aide, |ui| {

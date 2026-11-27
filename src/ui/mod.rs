@@ -141,7 +141,7 @@ type Attente<T> = Option<Receiver<T>>;
 /// yt-dlp / ffmpeg à télécharger (Windows) : lecture des releases, accord, installation.
 enum EtatOutils {
     Lecture(Receiver<Result<video::Paquet, &'static str>>),
-    Pret(video::Paquet),
+    Pret(Box<video::Paquet>),
     /// Reçus / total, fin, arrêt demandé.
     Installation(
         Arc<Mutex<(u64, u64)>>,
@@ -2442,10 +2442,11 @@ impl App {
             "video_tools_fr" => {
                 self.modale = Some(Modale::Outils {
                     url: String::new(),
-                    etat: EtatOutils::Pret(video::Paquet {
+                    etat: EtatOutils::Pret(Box::new(video::Paquet {
                         ytdlp: Some((f("yt-dlp.exe", 23_627_865), String::new())),
                         ffmpeg: Some((f("ffmpeg.zip", 92_386_792), String::new())),
-                    }),
+                        deno: Some((f("deno.zip", 42_917_472), String::new())),
+                    })),
                 });
             }
             _ => {}
