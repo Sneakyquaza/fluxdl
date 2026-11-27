@@ -51,6 +51,12 @@ pub struct Options {
     pub max_retries: u32,
     /// En-têtes ajoutés à chaque requête (Referer, Cookie venus de l'extension).
     pub headers: Vec<(String, String)>,
+    /// Plus grande plage demandée en une requête (0 = tout le morceau) : la connexion enchaîne
+    /// les requêtes (CDN vidéo qui refuse ou bride les grosses plages, comme googlevideo).
+    pub max_request: u64,
+    /// Plages exigées : un serveur qui les refuse donne `ERR_PLAGES` au lieu du repli sur une
+    /// connexion (les vidéos repassent alors par yt-dlp).
+    pub require_ranges: bool,
 }
 
 impl Default for Options {
@@ -62,6 +68,8 @@ impl Default for Options {
             expected_sha256: None,
             max_retries: 6,
             headers: Vec::new(),
+            max_request: 0,
+            require_ranges: false,
         }
     }
 }
@@ -225,6 +233,8 @@ pub const ERR_EXPIRE: &str = "The link has expired or is no longer allowed.";
 pub const ERR_ENCODAGE: &str = "The server sends the file compressed; it cannot be saved as is.";
 /// Erreur de `run` (Windows) : FAT32 ne garde pas de fichier de 4 Gio ou plus.
 pub const ERR_FAT32: &str = "This drive (FAT32) cannot hold files of 4 GB or more.";
+/// Erreur de `run` avec `require_ranges` : le serveur ne découpe pas (pas de 206).
+pub const ERR_PLAGES: &str = "The server refuses ranges.";
 
 /// Requête GET avec redirections suivies à la main : le cookie (venu de l'extension) n'est
 /// renvoyé qu'au même hôte que `origine`, le Referer réduit à son origine vers un autre hôte.
@@ -365,6 +375,9 @@ pub fn run(
     if est_page(&p, url) {
         return Err(ERR_PAGE.into());
     }
+    if opts.require_ranges && !(p.ranges && p.size.is_some()) {
+        return Err(ERR_PLAGES.into());
+    }
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let name = match name {
         Some(n) => n.to_string(),
@@ -373,6 +386,7 @@ pub fn run(
     let target = dir.join(&name);
     ctl.lock().file_name = Some(name);
     match attempt(&agent, url, &p, &target, opts, ctl, false)? {
+        Step::Fallback if opts.require_ranges => Err(ERR_PLAGES.into()),
         // Un serveur a répondu 200 à une plage : tout reprendre sur une seule connexion.
         Step::Fallback => match attempt(&agent, url, &p, &target, opts, ctl, true)? {
             Step::Fallback => Err("server ignores ranges".into()),
@@ -850,7 +864,12 @@ fn fetch(sh: &Shared, w: usize, i: usize) -> Result<(), FetchErr> {
     if end != u64::MAX && pos >= end {
         return Ok(());
     }
-    let plage = sh.ranged.then(|| format!("bytes={pos}-{}", end - 1));
+    // Requête bornée (`max_request`) : la réponse finit avant le morceau, `worker` continue.
+    let fin = match sh.opts.max_request {
+        0 => end,
+        m => end.min(pos.saturating_add(m)),
+    };
+    let plage = sh.ranged.then(|| format!("bytes={pos}-{}", fin - 1));
     let (resp, _) = requete(
         &sh.agent,
         &sh.origine,
@@ -1089,7 +1108,7 @@ fn nom_fs(_: &File) -> Option<String> {
 
 /// Renomme le `.part` en `cible` sans jamais remplacer un fichier apparu entre-temps ; sinon
 /// « nom (1).ext »… Renvoie le chemin final.
-fn renommer_libre(part: &Path, cible: &Path) -> Result<PathBuf, String> {
+pub fn renommer_libre(part: &Path, cible: &Path) -> Result<PathBuf, String> {
     let dir = cible.parent().unwrap_or(Path::new("."));
     let nom = cible
         .file_name()

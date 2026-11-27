@@ -55,6 +55,8 @@ struct Cfg {
     vus: Mutex<Vec<String>>,
     /// Base d'un autre serveur (redirection vers un autre hôte).
     ailleurs: Mutex<String>,
+    /// Plus grande plage servie (0 = libre) ; au-delà : 403 (comme googlevideo).
+    max_plage: u64,
 }
 
 fn virtuel_octet(p: u64) -> u8 {
@@ -165,6 +167,11 @@ fn handle(c: &Cfg, mut s: TcpStream) -> std::io::Result<()> {
         Some((a, b.min(total - 1)))
     });
     let plage = plage.filter(|_| !(c.lie && n_req > 0) && !(c.full_odd && n_req % 2 == 1));
+    if c.max_plage > 0 && plage.is_some_and(|(a, b)| b + 1 - a > c.max_plage) {
+        return s.write_all(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbig",
+        );
+    }
     let mut tete = String::new();
     let (a, b) = match plage {
         Some((a, b)) => {
@@ -806,4 +813,25 @@ fn renommage_sans_ecraser() {
     assert_eq!(ctl.snapshot().file_name.as_deref(), Some("file (1).bin"));
     verifie(&p, &data);
     assert_eq!(std::fs::read(d.join("file.bin")).unwrap(), b"a moi");
+}
+
+#[test]
+fn requetes_bornees_et_plages_exigees() {
+    // 0.2.8 : CDN vidéo qui refuse les plages de plus de 256 Kio : chaque requête est bornée, la
+    // connexion enchaîne les requêtes sur son morceau.
+    let (c, url, data) = serveur(3 << 20, |c| c.max_plage = 256 << 10);
+    let d = dossier("bornees");
+    let mut o = opts(4);
+    o.max_request = 256 << 10;
+    o.require_ranges = true;
+    let (p, ctl) = telecharge(&url, &d, &o);
+    verifie(&p, &data);
+    assert!(ctl.snapshot().ranges);
+    assert!(c.requests.load(Ordering::SeqCst) >= 12);
+    // Plages refusées ou ignorées : erreur claire, pas de repli sur une connexion.
+    for f in [|c: &mut Cfg| c.ranges = false, |c: &mut Cfg| c.lie = true] {
+        let (_c, url, _) = serveur(1 << 20, f);
+        let e = engine::run(&url, &d, None, &o, &Arc::new(Control::default())).unwrap_err();
+        assert_eq!(e, engine::ERR_PLAGES);
+    }
 }

@@ -56,6 +56,12 @@ A free, open-source multi-connection download manager (Windows + Linux, single e
   files (asked on the first torrent, toggle in Settings, current user only).
 - **Browser extension** (below).
 
+### New in 0.2.8
+- **Faster videos.** When yt-dlp finds direct links (YouTube), the picture and the sound are
+  each split across your connections like a normal file (per-connection gauges, pause and
+  resume), then joined by ffmpeg without re-encoding. If the site refuses it, fluxdl quietly
+  goes back to yt-dlp alone. Fragmented streams (Twitch, HLS) fetch up to 16 fragments at once.
+
 ### New in 0.2.7
 - **YouTube videos no longer fail with "Requested format is not available" on Windows.**
   YouTube now needs a JavaScript runtime: fluxdl downloads deno with yt-dlp and ffmpeg (if you

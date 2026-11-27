@@ -635,6 +635,7 @@ impl App {
                 login,
             } => {
                 let o = self.outils.clone();
+                let n = e.connections;
                 let tache = video::Tache {
                     qualite: quality,
                     estimation: estimate,
@@ -653,7 +654,8 @@ impl App {
                         ),
                     };
                     // `f` vit jusqu'à la fin de yt-dlp, puis le fichier est effacé.
-                    video::telecharger(&o, &url, &dir, &tache, f.as_ref().map(|f| f.chemin()), &c)
+                    let f = f.as_ref().map(|f| f.chemin());
+                    video::telecharger(&o, &url, &dir, &tache, f, n, &c)
                 })
             }
             Kind::Torrent {
