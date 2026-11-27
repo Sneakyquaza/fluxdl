@@ -151,10 +151,13 @@ async function sendVideo(url, site, tab) {
   const body = { url, kind: "video" };
   const jar = await videoCookies(site, tab, settings);
   if (jar) body.video_cookies = jar;
-  const res = await callApp("/add", body, settings);
+  let res = await callApp("/add", body, settings);
+  // Pas de jeton (extension installée ou réinstallée) ou jeton refusé : appairage automatique
+  // (« Autoriser ? » dans l'appli), puis nouvel envoi
+  if (res.state === "unpaired" && (await pairOnce()) === "paired") res = await callApp("/add", body);
   if (FALLBACK_STATES.includes(res.state)) notify(t(res.state === "down" ? "notifVideoNotRunning" : "statusNotPaired"));
   else if (res.state !== "ok") notify(errorMessage(res));
-  return res.state;
+  return res;
 }
 
 async function sendToApp(url, extra, settings) {
@@ -334,7 +337,7 @@ api.contextMenus.onClicked.addListener(async (info, tab) => {
       notify(t("notifNotVideoPage"));
       return;
     }
-    if ((await sendVideo(info.pageUrl, site, tab)) === "ok") notify(t("notifVideoSent"));
+    if ((await sendVideo(info.pageUrl, site, tab)).state === "ok") notify(t("notifVideoSent"));
     return;
   }
   if (info.menuItemId === MENU_PAGE) {
@@ -388,7 +391,8 @@ async function handleMessage(msg, sender) {
       if (!fromTab || typeof msg.url !== "string" || msg.url.length > MAX_URL) return { error: "url" };
       const site = videoPageSite(msg.url);
       if (!site || videoSiteOf(sender.url) !== site) return { error: "url" };
-      return { state: await sendVideo(msg.url, site, sender.tab) };
+      const res = await sendVideo(msg.url, site, sender.tab);
+      return { state: res.state, status: res.status };
     }
     case "fluxdl-pair": {
       if (!fromOwnPage(sender)) return { error: "sender" };

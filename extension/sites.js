@@ -36,7 +36,8 @@ const VIDEO_SITES = [
     page: (u) => {
       const p = u.pathname;
       if (u.hostname === "clips.twitch.tv") return /^\/[\w-]{3,}\/?$/.test(p);
-      if (/^\/videos\/\d+\/?$/.test(p) || /^\/\w+\/clip\/[\w-]+\/?$/.test(p)) return true;
+      // Rediffusion : /videos/N, ancienne forme /<chaîne>/v/N ou /<chaîne>/video/N
+      if (/^\/(videos|\w+\/v(ideo)?)\/\d+\/?$/.test(p) || /^\/\w+\/clip\/[\w-]+\/?$/.test(p)) return true;
       // Chaîne : enregistre le live en cours (yt-dlp refuse si la chaîne est hors ligne)
       const m = /^\/(\w{3,25})\/?$/.exec(p);
       return !!m && !TWITCH_RESERVED.has(m[1].toLowerCase());

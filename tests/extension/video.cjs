@@ -42,6 +42,16 @@ function hostListTests() {
     ["https://notyoutube.com/watch?v=dQw4w9WgXcQ", null],
     ["https://youtube.com.evil.example/watch?v=dQw4w9WgXcQ", null],
     ["https://www.twitch.tv/videos/2123456789", "twitch"],
+    ["https://www.twitch.tv/videos/2123456789?t=1h2m3s", "twitch"],
+    ["https://m.twitch.tv/videos/2123456789", "twitch"],
+    ["https://www.twitch.tv/somechannel/v/2123456789", "twitch"],
+    ["https://www.twitch.tv/somechannel/video/2123456789", "twitch"],
+    ["https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLx0sYbCqOb8TBPRdmBHs5Iftvv9TPboYG&index=2", "youtube"],
+    ["https://www.youtube.com/watch?app=desktop&v=dQw4w9WgXcQ&t=1m2s", "youtube"],
+    ["https://music.youtube.com/watch?v=dQw4w9WgXcQ", "youtube"],
+    ["https://youtu.be/dQw4w9WgXcQ?si=abc&t=42", "youtube"],
+    ["https://www.youtube.com/shorts/abcdefghijk?feature=share", "youtube"],
+    ["https://www.youtube.com/live/jfKfPfyJRdk?si=x", "youtube"],
     ["https://www.twitch.tv/somechannel/clip/FunnyClipName-AbC123", "twitch"],
     ["https://clips.twitch.tv/FunnyClipName-AbC123", "twitch"],
     ["https://www.twitch.tv/somechannel", "twitch"],
@@ -53,6 +63,8 @@ function hostListTests() {
     ["pas une url", null],
   ];
   for (const [u, want] of cases) check(`page vidéo ${u}`, page(u) === want, `→ ${page(u)}`);
+  // Le bouton envoie location.href et l'arrière-plan exige le même site que l'onglet
+  for (const [u, want] of cases) if (want) check(`même site ${u}`, ctx.videoSiteOf(u) === ctx.videoPageSite(u));
   check("site sans être une page vidéo", ctx.videoSiteOf("https://www.youtube.com/")?.id === "youtube");
   const yt = ctx.VIDEO_SITES.find((s) => s.id === "youtube");
   check("cookies YouTube : youtube.com seulement", JSON.stringify(ctx.siteOrigins(yt, yt.cookieDomains)) === JSON.stringify(["*://youtube.com/*", "*://*.youtube.com/*"]));
@@ -71,22 +83,33 @@ function testBuild() {
   m.permissions.push("cookies"); // pas de dialogue de permission en headless
   m.host_permissions.push("*://localhost/*", "*://*.localhost/*");
   fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify(m, null, 2));
+  // Ombre ouverte : le test lit le libellé du bouton
+  const cs = path.join(dir, "content.js");
+  fs.writeFileSync(cs, fs.readFileSync(cs, "utf8").replaceAll('mode: "closed"', 'mode: "open"'));
   return dir;
 }
 
 // ---- Fausse appli : enregistre les /add ----
 const received = [];
+let addCode = 200; // réponse forcée de /add (503 timeout, 400 appli ancienne, 409…)
+let pairs = 0;
 function fakeApp() {
   return http
     .createServer((req, res) => {
       const cors = { "Access-Control-Allow-Origin": req.headers.origin || "*", "Access-Control-Allow-Headers": "content-type,x-fluxdl-token" };
       if (req.method === "OPTIONS") return res.writeHead(204, cors).end();
+      // Appairage accordé tout de suite (« Autoriser » cliqué)
+      if (req.url === "/pair") {
+        pairs++;
+        return res.writeHead(200, cors).end(JSON.stringify({ token: TOKEN }));
+      }
       if (req.headers["x-fluxdl-token"] !== TOKEN) return res.writeHead(401, cors).end("{}");
       let body = "";
       req.on("data", (c) => (body += c));
       req.on("end", () => {
         if (req.url === "/ping") return res.writeHead(200, cors).end(JSON.stringify({ app: "fluxdl", version: "0.2.4" }));
         if (req.url === "/add") {
+          if (addCode !== 200) return res.writeHead(addCode, cors).end(JSON.stringify({ ok: false, status: addCode === 503 ? "timeout" : "refused" }));
           received.push(JSON.parse(body));
           return res.writeHead(200, cors).end(JSON.stringify({ ok: true, status: "added" }));
         }
@@ -216,7 +239,36 @@ function fakeSite() {
   const st = await sw.evaluate((u) => (videoPageSite(u) ? sendVideo(u, videoPageSite(u), {}) : "not-video"), `${base}/feed`);
   check("menu : page non vidéo refusée", st === "not-video" && received.length === n);
   const st2 = await sw.evaluate((u) => sendVideo(u, videoPageSite(u), {}), `${base}/watch?v=menutest`);
-  check("menu : page vidéo envoyée", st2 === "ok" && received.at(-1).url.endsWith("menutest"));
+  check("menu : page vidéo envoyée", st2.state === "ok" && received.at(-1).url.endsWith("menutest"));
+
+  // Échec : raison courte sur le bouton (diagnostic depuis une capture)
+  const clickLabel = async (shot) => {
+    const b = await host.boundingBox();
+    await page.mouse.click(b.x + b.width / 2, b.y + b.height / 2);
+    await page.waitForTimeout(700);
+    const text = await page.locator("fluxdl-video button").textContent();
+    if (shot) await page.screenshot({ path: path.join(CAP, shot), clip: { x: player.x + player.width - 300, y: player.y, width: 300, height: 80 } });
+    await page.waitForTimeout(2000);
+    return text;
+  };
+  for (const [code, want] of [[503, "Appli occupée"], [400, "Appli à mettre à jour"], [404, "Appli à mettre à jour"], [409, "Refusé (409)"], [403, "Refusé (403)"]]) {
+    addCode = code;
+    const text = await clickLabel(code === 400 ? "ext_video_button_update.png" : null);
+    check(`libellé ${code} : ${want}`, text.endsWith(want), text);
+  }
+  addCode = 200;
+  // Pas de jeton (extension réinstallée) : appairage automatique puis envoi
+  await sw.evaluate(() => chrome.storage.local.set({ token: "" }));
+  const before = received.length;
+  const pairsBefore = pairs; // l'installation en a déjà fait une
+  const text = await clickLabel();
+  const tok = await sw.evaluate(() => chrome.storage.local.get("token"));
+  check("sans jeton : appairage auto puis envoi", pairs === pairsBefore + 1 && tok.token === TOKEN && received.length === before + 1 && text.endsWith("Envoyé"), `${pairs} ${text}`);
+  // Appli fermée : libellé dédié
+  app.close();
+  await page.waitForTimeout(200);
+  const down = await clickLabel();
+  check("appli fermée : « fluxdl fermé »", down.endsWith("fluxdl fermé"), down);
 
   // Interrupteur « bouton » coupé : plus de bouton vidéo
   await sw.evaluate(() => chrome.storage.local.set({ floatButton: false }));
@@ -225,7 +277,6 @@ function fakeSite() {
   check("bouton coupé dans les options : absent", !(await host.isVisible()));
 
   await ctx.close();
-  app.close();
   site.close();
   console.log(failures ? `${failures} échec(s)` : "tout est vert");
   console.log(`captures : ${CAP}`);

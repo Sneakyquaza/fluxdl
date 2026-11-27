@@ -5,9 +5,11 @@
 //! l'envoie toujours dès qu'elle ajoute l'en-tête du jeton (requête CORS), donc refusée.
 //! `GET /ping` → version ; `POST /add` {url, referrer?, filename?, cookies?} → file d'attente ;
 //! {url, kind: "video", video_cookies?: [{name, value, domain, path, secure, httpOnly, expiry}]}
-//! → page vidéo pour yt-dlp ;
-//! réponse donnée après la décision de l'appli : 200 `added` / `already_active` (le navigateur
-//! peut abandonner sa copie), 409 `already_done` / `refused`, 503 `timeout` (rien d'ajouté).
+//! → page vidéo pour yt-dlp, 200 `added` tout de suite (l'appli l'ouvre à son prochain tour,
+//! même fenêtre réduite : pas de copie du navigateur à garder, rien à attendre) ;
+//! fichier : réponse donnée après la décision de l'appli : 200 `added` / `already_active` (le
+//! navigateur peut abandonner sa copie), 409 `already_done` / `refused`, 503 `timeout` (rien
+//! d'ajouté).
 //! `POST /focus` (2e instance seulement) : montre la fenêtre.
 //! `POST /pair` {nonce} (sans jeton, origine d'extension exigée) : appairage automatique. La 1re
 //! requête ouvre « Autoriser ? » dans l'appli (202) ; l'extension la répète avec le même nonce
@@ -33,7 +35,8 @@ const DELAI_LECTURE: Duration = Duration::from_secs(2);
 /// Attente de la décision de l'appli pour un `/add` (l'extension attend un peu plus).
 pub const DELAI_DECISION: Duration = Duration::from_secs(5);
 const MAX_ENTETE: usize = 8 << 10;
-const MAX_CORPS: usize = 64 << 10;
+/// Vidéo avec cookies : 300 cookies (`cookies::MAX`) de 4 Kio au plus ≈ 1,3 Mo de JSON.
+const MAX_CORPS: usize = 2 << 20;
 /// Durée de vie d'une demande d'appairage (réponse comprise).
 pub const DELAI_APPAIRAGE: Duration = Duration::from_secs(60);
 /// Nouvelles demandes d'appairage au plus par minute.
@@ -633,7 +636,12 @@ fn servir(
             repondre(s, &r);
             return;
         }
-        let attendre = !d.url.is_empty();
+        // Vidéo : toujours acceptée par l'UI (page http(s) vérifiée ici) ; réponse sans attendre
+        // son tour (fenêtre réduite, UI occupée : plus de 503 « timeout »).
+        let attendre = !d.url.is_empty() && !d.video();
+        if d.video() {
+            r.corps = r#"{"ok":true,"status":"added"}"#.into();
+        }
         let dec = Arc::new(Decision::default());
         if attendre {
             d.decision = Some(dec.clone());
@@ -1022,6 +1030,48 @@ mod tests {
             .set("X-Fluxdl-Token", J)
             .call();
         assert!(matches!(r, Err(ureq::Error::Status(401, _))));
+    }
+
+    /// Vidéo : 200 `added` tout de suite, même si l'UI ne tourne pas (fenêtre réduite sous
+    /// Windows) ; la demande attend dans le canal, sans décision à donner. Gros pot de cookies
+    /// (300 × 4 Kio) accepté.
+    #[test]
+    fn video_repondue_sans_attendre_l_ui() {
+        let (tx, rx) = std::sync::mpsc::channel::<Demande>();
+        let port = lancer(
+            0,
+            Arc::new(Mutex::new(J.into())),
+            J.into(),
+            Arc::default(),
+            tx,
+            || {},
+        )
+        .unwrap();
+        let valeur = "v".repeat(4000);
+        let jarre: Vec<_> = (0..300)
+            .map(|i| serde_json::json!({"name": format!("c{i}"), "value": valeur, "domain": ".youtube.com"}))
+            .collect();
+        let corps = serde_json::json!({
+            "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "kind": "video",
+            "video_cookies": jarre,
+        })
+        .to_string();
+        assert!(corps.len() > 1 << 20);
+        let e = ext(J);
+        let debut = Instant::now();
+        let r = ureq::post(&format!("http://127.0.0.1:{port}/add"))
+            .set("Origin", &e[1].1)
+            .set("X-Fluxdl-Token", J)
+            .set("Content-Type", "application/json")
+            .send_string(&corps)
+            .unwrap();
+        assert!(debut.elapsed() < Duration::from_secs(2));
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.into_string().unwrap(), r#"{"ok":true,"status":"added"}"#);
+        let d = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(d.video() && d.decision.is_none());
+        assert_eq!(d.video_cookies.map(|c| c.len()), Some(300));
     }
 
     #[test]

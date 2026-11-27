@@ -19,7 +19,7 @@
   let hideTimer = 0;
   let resetTimer = 0;
 
-  const t = (k) => api.i18n.getMessage(k) || k;
+  const t = (k, subs) => api.i18n.getMessage(k, subs) || k;
 
   function send(msg) {
     try {
@@ -395,6 +395,21 @@
     placeVideo();
   }
 
+  // Raison courte de l'échec (lisible sur une capture d'écran)
+  function videoError(res) {
+    const state = res?.state;
+    if (state === "down") return t("floatNotRunning");
+    if (state === "unpaired") return t("videoNotPaired");
+    if (state === "noaccess") return t("videoNoAccess");
+    // Appli trop ancienne : ne connaît pas la demande (400 « bad kind », 404)
+    if (state === "bad" || res?.status === 404) return t("videoUpdateApp");
+    if (state === "rate") return t("videoRate");
+    if (state === "kept" && res.status === 503) return t("videoBusy");
+    if (state) return t("videoRefused", [String(res.status ?? state)]);
+    // Pas de réponse de l'arrière-plan (extension rechargée : recharger la page) ou refus
+    return t("videoInternal", [String(res?.error ?? "?")]);
+  }
+
   async function onVideoClick(e) {
     e.preventDefault();
     e.stopPropagation();
@@ -409,7 +424,7 @@
       setLabel("✓", t("floatSent"), vBtn);
     } else {
       vBtn.className = "big on err";
-      setLabel("✕", t(state === "down" ? "floatNotRunning" : "floatError"), vBtn);
+      setLabel("✕", videoError(res), vBtn);
     }
     clearTimeout(vReset);
     vReset = setTimeout(videoIdle, 2500);

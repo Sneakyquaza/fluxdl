@@ -55,6 +55,14 @@ A free, open-source multi-connection download manager (Windows + Linux, single e
   files (asked on the first torrent, toggle in Settings, current user only).
 - **Browser extension** (below).
 
+### New in 0.2.6
+- **Video button fixed.** fluxdl now accepts a video page right away instead of waiting for its
+  window (a minimized window could make the button show "Error"); the quality window opens as
+  soon as fluxdl wakes up. If the extension isn't paired yet, clicking the video button asks
+  fluxdl to pair ("Allow?") and then sends the video. On failure the button says why ("Not
+  paired", "Update the app", "App busy", "Refused (409)"…). Twitch VOD links in the older
+  `/<channel>/v/<id>` form are recognized.
+
 ### New in 0.2.5
 - **No more button on links that are really web pages.** A link that looks like a file
   (`file.zip`, `download` attribute) often leads to a file host's landing page, a login wall
