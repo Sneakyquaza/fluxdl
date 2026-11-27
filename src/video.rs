@@ -10,7 +10,7 @@ use crate::github::{self, Erreur, Fichier};
 use dlcore::engine::{self, Control, Live, Options, Outcome, Segment, WorkerStat};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -453,7 +453,7 @@ pub fn telecharger(
     // raccourci : son seul (extraction -x), passage et live restent à yt-dlp ; les passer au
     // moteur si les liens directs donnent satisfaction.
     if tache.section.is_none() && !tache.debut && !tache.qualite.audio() {
-        if let Some(d) = liens_directs(o, url, dir, tache, cookies) {
+        if let Some(d) = liens_directs(o, url, dir, tache, cookies, ctl) {
             match par_le_moteur(&d, o.ffmpeg.as_deref(), connexions, ctl) {
                 Ok(r) => return Ok(r),
                 Err(e) => {
@@ -570,6 +570,20 @@ struct Partie {
     /// envoyés, et seulement à l'hôte du lien (`engine::run`) ; jamais les cookies de l'extension.
     #[serde(default)]
     http_headers: BTreeMap<String, String>,
+    /// Taille annoncée par yt-dlp : jauge unique sur toutes les parties dès le début.
+    #[serde(default)]
+    filesize: Option<f64>,
+    #[serde(default)]
+    filesize_approx: Option<f64>,
+}
+
+impl Partie {
+    fn taille(&self) -> Option<u64> {
+        self.filesize
+            .or(self.filesize_approx)
+            .filter(|t| *t > 0.0)
+            .map(|t| t as u64)
+    }
 }
 
 #[derive(Deserialize)]
@@ -616,28 +630,54 @@ fn directs(sortie: &str, dir: &Path) -> Option<Directs> {
 }
 
 /// yt-dlp choisit le format (mêmes arguments que le téléchargement) sans rien télécharger.
+/// Arrêt demandé : yt-dlp est tué, `None`.
 fn liens_directs(
     o: &Outils,
     url: &str,
     dir: &Path,
     tache: &Tache,
     cookies: Option<&Path>,
+    ctl: &Control,
 ) -> Option<Directs> {
     let mut c = commande(o.ytdlp.as_ref()?);
     c.args(tache.args());
     args_communs(&mut c, o, cookies);
-    let s = c
+    let mut fils = c
         .args(["--print", "filename", "--print", "%()j", "-P"])
         .arg(dir)
         .arg("--")
         .arg(url)
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .spawn()
         .ok()?;
-    s.status
-        .success()
-        .then(|| directs(&String::from_utf8_lossy(&s.stdout), dir))?
+    let (tx, rx) = mpsc::channel();
+    let mut sortie = fils.stdout.take();
+    std::thread::spawn(move || {
+        let mut s = Vec::new();
+        if let Some(r) = &mut sortie {
+            let _ = r.read_to_end(&mut s);
+        }
+        let _ = tx.send(s);
+    });
+    let s = loop {
+        if ctl.stop.load(Ordering::Relaxed) {
+            tuer(&mut fils);
+            return None;
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(s) => break s,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tuer(&mut fils);
+                return None;
+            }
+        }
+    };
+    fils.wait()
+        .is_ok_and(|e| e.success())
+        .then(|| directs(&String::from_utf8_lossy(&s), dir))?
 }
 
 /// Noms des fichiers de la partie `i` sur `n` (`n` = 1 : directement le fichier final).
@@ -670,9 +710,51 @@ fn temporaires(d: &Directs) -> Vec<PathBuf> {
     v
 }
 
+/// Jauge unique sur toutes les parties, dans l'ordre de téléchargement (son d'abord) : finies
+/// pleines, celle en cours (`en_cours`) d'après son moteur (`l` : ses connexions), suivantes
+/// vides ; `avant` = octets reçus par les parties précédentes de cette session. Nom final affiché.
+fn jauge(ctl: &Control, nom: &str, tailles: &[Option<u64>], en_cours: usize, l: &Live, avant: u64) {
+    let mut segments = Vec::new();
+    let mut debut = 0;
+    for i in (0..tailles.len()).rev() {
+        let t = tailles[i].unwrap_or(0);
+        let vide = Segment {
+            start: debut,
+            pos: debut,
+            end: debut + t,
+            ..Default::default()
+        };
+        match i.cmp(&en_cours) {
+            std::cmp::Ordering::Greater => segments.push(Segment {
+                pos: debut + t,
+                ..vide
+            }),
+            std::cmp::Ordering::Equal => segments.extend(l.segments.iter().map(|s| Segment {
+                start: s.start + debut,
+                pos: s.pos + debut,
+                end: s.end + debut,
+                ..*s
+            })),
+            std::cmp::Ordering::Less => segments.push(vide),
+        }
+        debut += t;
+    }
+    let mut v = ctl.lock();
+    v.file_name = Some(nom.to_string());
+    // Taille inconnue tant qu'une partie n'a ni sonde ni estimation (la jauge ne recule pas).
+    v.size = tailles.iter().copied().sum();
+    v.ranges = true;
+    v.segments = segments;
+    v.workers = l.workers.clone();
+    v.steals = l.steals;
+    v.received = avant + l.received;
+    v.restarted |= l.restarted;
+    v.verifying = l.verifying;
+}
+
 /// Chaque partie par le moteur (plages exigées, jauges par connexion), son d'abord : la jauge
 /// finit sur l'image, la plus grosse ; puis fusion par ffmpeg (`-c copy`). Arrêt : les `.part`
-/// restent, la reprise repart de là (liens neufs, même fichier distant).
+/// et les parties finies restent, la reprise repart de là (liens neufs, même fichier distant).
 fn par_le_moteur(
     d: &Directs,
     ffmpeg: Option<&Path>,
@@ -686,8 +768,30 @@ fn par_le_moteur(
         None if n > 1 => return Err("ffmpeg missing".into()),
         None => PathBuf::new(),
     };
+    let nom = d.fichier.file_name().unwrap_or_default().to_string_lossy();
+    let mut tailles: Vec<_> = d.parties.iter().map(Partie::taille).collect();
     let mut faits = vec![PathBuf::new(); n];
+    let mut avant = 0;
+    jauge(ctl, &nom, &tailles, n - 1, &Live::default(), 0);
     for (i, p) in d.parties.iter().enumerate().rev() {
+        let cible = dir.join(nom_partie(d, i));
+        // Reprise : partie finie (renommée depuis son .part) lors d'un essai précédent.
+        if n > 1 && !engine::part_path(&cible).exists() {
+            if let Some(m) = std::fs::metadata(&cible).ok().filter(|m| m.is_file()) {
+                tailles[i] = Some(m.len());
+                let pleine = Live {
+                    segments: vec![Segment {
+                        pos: m.len(),
+                        end: m.len(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                jauge(ctl, &nom, &tailles, i, &pleine, avant);
+                faits[i] = cible;
+                continue;
+            }
+        }
         let url = p.url.as_deref().unwrap_or("");
         let googlevideo = url
             .split("://")
@@ -701,17 +805,43 @@ fn par_le_moteur(
             require_ranges: true,
             ..Default::default()
         };
-        match engine::run(url, dir, Some(&nom_partie(d, i)), &opts, ctl)? {
+        // Moteur sur son propre `Control`, recopié dans la jauge unique (il remet tout à zéro).
+        let partie = Arc::new(Control::default());
+        let h = {
+            let (url, dir, nom_p, c) = (
+                url.to_string(),
+                dir.to_path_buf(),
+                nom_partie(d, i),
+                partie.clone(),
+            );
+            std::thread::spawn(move || engine::run(&url, &dir, Some(&nom_p), &opts, &c))
+        };
+        loop {
+            let fini = h.is_finished();
+            if ctl.stop.load(Ordering::Relaxed) {
+                partie.request_stop();
+            }
+            let l = partie.snapshot();
+            tailles[i] = l.size.or(tailles[i]);
+            jauge(ctl, &nom, &tailles, i, &l, avant);
+            if fini {
+                avant += l.received;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        match h.join().unwrap_or_else(|_| Err("panic".into()))? {
             Outcome::Done(f) => faits[i] = f,
             Outcome::Stopped => return Ok(Outcome::Stopped),
         }
     }
     if n == 1 {
-        return Ok(Outcome::Done(faits.remove(0)));
+        let f = faits.remove(0);
+        ctl.lock().file_name = f.file_name().map(|n| n.to_string_lossy().into_owned());
+        return Ok(Outcome::Done(f));
     }
-    // raccourci : ffmpeg n'est pas interrompu par un arrêt (copie sans réencodage, rapide).
     let sortie = fusion(d);
-    let ok = commande(&ff)
+    let mut fils = commande(&ff)
         .args(["-nostdin", "-v", "error", "-y", "-i"])
         .arg(&faits[0])
         .arg("-i")
@@ -721,8 +851,24 @@ fn par_le_moteur(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
+        .spawn()
+        .map_err(|_| "ffmpeg merge failed")?;
+    // Arrêt pendant la fusion : fusion partielle effacée, parties gardées pour la reprise.
+    let ok = loop {
+        if ctl.stop.load(Ordering::Relaxed) {
+            tuer(&mut fils);
+            let _ = std::fs::remove_file(&sortie);
+            return Ok(Outcome::Stopped);
+        }
+        match fils.try_wait() {
+            Ok(Some(s)) => break s.success(),
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => {
+                tuer(&mut fils);
+                break false;
+            }
+        }
+    };
     if !ok {
         return Err("ffmpeg merge failed".into());
     }
@@ -1270,6 +1416,187 @@ mod tests {
         );
         let args = std::fs::read_to_string(d.join("args.txt")).unwrap();
         assert!(args.contains("--concurrent-fragments 4"), "{args}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 0.2.9 : une seule jauge pour le son puis l'image, qui ne repart pas de zéro.
+    #[test]
+    fn jauge_unique_sur_les_parties() {
+        let ctl = Control::default();
+        let tailles = [Some(200), Some(100)];
+        let seg = |pos, end| Segment {
+            start: 0,
+            pos,
+            end,
+            worker: Some(0),
+            stolen: false,
+        };
+        let en = |segments, received| Live {
+            segments,
+            received,
+            workers: vec![WorkerStat::default()],
+            ..Default::default()
+        };
+        let etapes = [
+            (1, Live::default(), 0),
+            (1, en(vec![seg(50, 100)], 50), 0),
+            (1, en(vec![seg(100, 100)], 100), 0),
+            (0, Live::default(), 100),
+            (0, en(vec![seg(80, 200)], 80), 100),
+        ];
+        let mut faits = Vec::new();
+        for (i, l, avant) in &etapes {
+            jauge(&ctl, "F.mp4", &tailles, *i, l, *avant);
+            let v = ctl.snapshot();
+            assert_eq!((v.size, v.file_name.as_deref()), (Some(300), Some("F.mp4")));
+            faits.push((v.done(), v.received));
+        }
+        assert_eq!(
+            faits,
+            [(0, 0), (50, 50), (100, 100), (100, 100), (180, 180)]
+        );
+        // Image en cours : décalée après le son, connexion gardée.
+        let v = ctl.snapshot();
+        assert_eq!(
+            v.segments[1],
+            Segment {
+                start: 100,
+                pos: 180,
+                end: 300,
+                ..seg(0, 0)
+            }
+        );
+        assert_eq!(v.workers.len(), 1);
+        jauge(&ctl, "F.mp4", &[None, Some(100)], 1, &Live::default(), 0);
+        assert_eq!(ctl.snapshot().size, None);
+    }
+
+    /// 0.2.9 : image + son par le moteur : jauge cumulée monotone, nom final affiché ; arrêt
+    /// pendant la fusion (parties gardées) puis reprise sans retélécharger ; arrêt pendant
+    /// `--print`.
+    #[cfg(unix)]
+    #[test]
+    fn video_jauge_nom_arret_reprise() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Instant;
+        let d = std::env::temp_dir().join(format!("fluxdl-test-video2-{}", std::process::id()));
+        let (dl, ff) = (d.join("dl"), d.join("ff"));
+        std::fs::create_dir_all(&dl).unwrap();
+        std::fs::create_dir_all(&ff).unwrap();
+        let script = |f: PathBuf, corps: String| {
+            std::fs::write(&f, format!("#!/bin/sh\n{corps}")).unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+            f
+        };
+        let yt = script(
+            d.join("yt-dlp"),
+            format!(
+                "case \"$*\" in\n*\"--print filename\"*) [ -e '{0}/dort' ] && exec sleep 30; cat '{0}/sortie.txt' ;;\n*) printf yt > '{1}/ytdlp.mp4'; echo 'fluxdl-fichier {1}/ytdlp.mp4' ;;\nesac\n",
+                d.display(),
+                dl.display()
+            ),
+        );
+        // Faux ffmpeg : écrit la fusion (dernier argument), puis dort si demandé.
+        script(
+            ff.join("ffmpeg"),
+            format!(
+                "for a; do o=$a; done\nprintf fusion > \"$o\"\n[ -e '{}/ff_dort' ] && exec sleep 30\nexit 0\n",
+                d.display()
+            ),
+        );
+        let o = Outils {
+            ytdlp: Some(yt),
+            ffmpeg: Some(ff),
+            ..Default::default()
+        };
+        let lance = |ctl: &Arc<Control>| {
+            let (o, dl, ctl) = (o.clone(), dl.clone(), ctl.clone());
+            std::thread::spawn(move || {
+                let tache = Tache {
+                    qualite: Qualite::Best,
+                    estimation: None,
+                    section: None,
+                    debut: false,
+                };
+                telecharger(
+                    &o,
+                    "https://www.youtube.com/watch?v=x",
+                    &dl,
+                    &tache,
+                    None,
+                    4,
+                    &ctl,
+                )
+            })
+        };
+        let v: Vec<u8> = (0..2u32 << 20).map(|i| (i * 7 % 251) as u8).collect();
+        let a: Vec<u8> = (0..1u32 << 20).map(|i| (i * 3 % 241) as u8).collect();
+        let total = (v.len() + a.len()) as u64;
+        let (lv, la) = (v.len(), a.len());
+        let base = serveur(vec![("/v".into(), v), ("/a".into(), a)], true);
+        let sortie = |base: &str| {
+            let j = format!(
+                r#"{{"requested_formats":[{{"url":"{base}/v","protocol":"https","filesize":{lv}}},{{"url":"{base}/a","protocol":"https","filesize_approx":{la}}}]}}"#
+            );
+            std::fs::write(
+                d.join("sortie.txt"),
+                format!("{}/G.mp4\n{j}\n", dl.display()),
+            )
+            .unwrap();
+        };
+        sortie(&base);
+        std::fs::write(d.join("ff_dort"), "").unwrap();
+        let ctl = Arc::new(Control::default());
+        let h = lance(&ctl);
+        let fusion = dl.join("G.fluxdl.mp4");
+        let t0 = Instant::now();
+        let mut vus = Vec::new();
+        while !fusion.exists() {
+            assert!(!h.is_finished() && t0.elapsed() < Duration::from_secs(20));
+            let l = ctl.snapshot();
+            vus.push((l.done(), l.size, l.file_name));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(vus.windows(2).all(|w| w[0].0 <= w[1].0), "{vus:?}");
+        for (_, size, nom) in &vus {
+            if nom.is_some() {
+                assert_eq!((nom.as_deref(), *size), (Some("G.mp4"), Some(total)));
+            }
+        }
+        let l = ctl.snapshot();
+        assert_eq!((l.done(), l.file_name.as_deref()), (total, Some("G.mp4")));
+        // Arrêt pendant la fusion : rendu vite, fusion partielle effacée, parties gardées.
+        ctl.request_stop();
+        let t = Instant::now();
+        assert_eq!(h.join().unwrap(), Ok(Outcome::Stopped));
+        assert!(t.elapsed() < Duration::from_secs(2));
+        assert!(!fusion.exists());
+        let taille = |n: &str| std::fs::metadata(dl.join(n)).map(|m| m.len() as usize).ok();
+        assert_eq!(
+            (taille("G.mp4.fluxdl0"), taille("G.mp4.fluxdl1")),
+            (Some(lv), Some(la))
+        );
+        // Reprise : liens morts (404), les parties finies ne sont pas redemandées.
+        std::fs::remove_file(d.join("ff_dort")).unwrap();
+        sortie(&format!("{base}/absent"));
+        let ctl = Arc::new(Control::default());
+        assert_eq!(
+            lance(&ctl).join().unwrap(),
+            Ok(Outcome::Done(dl.join("G.mp4")))
+        );
+        assert_eq!(std::fs::read(dl.join("G.mp4")).unwrap(), b"fusion");
+        let l = ctl.snapshot();
+        assert_eq!((l.done(), l.size), (total, Some(total)));
+        assert!(taille("G.mp4.fluxdl0").is_none() && taille("G.mp4.fluxdl1").is_none());
+        // Arrêt pendant `--print` (yt-dlp qui dort) : yt-dlp tué, rendu vite.
+        std::fs::write(d.join("dort"), "").unwrap();
+        let ctl = Arc::new(Control::default());
+        let h = lance(&ctl);
+        std::thread::sleep(Duration::from_millis(300));
+        ctl.request_stop();
+        let t = Instant::now();
+        assert_eq!(h.join().unwrap(), Ok(Outcome::Stopped));
+        assert!(t.elapsed() < Duration::from_secs(2));
         let _ = std::fs::remove_dir_all(&d);
     }
 

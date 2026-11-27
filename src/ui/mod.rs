@@ -1771,7 +1771,8 @@ impl App {
         if matches!(e.kind, Kind::Torrent { .. }) {
             return self.detail_torrent(ui, e, j, &lv);
         }
-        if matches!(e.kind, Kind::Video { .. }) {
+        // Vidéo en liens directs (moteur, `ranges`) : carte et connexions comme un fichier.
+        if matches!(e.kind, Kind::Video { .. }) && !lv.ranges {
             self.section(ui, t(l, "Progress"), t(l, "downloaded by yt-dlp"));
             ui.add_space(4.0);
             carte_fichier(ui, &lv, 12.0);
