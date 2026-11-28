@@ -859,6 +859,7 @@ pub fn telecharger(
     c.args(["--newline", "--progress", "--no-simulate", "--continue"])
         .arg("--concurrent-fragments")
         .arg(connexions.clamp(1, 16).to_string())
+        .args(limite_ytdlp(ctl))
         .args(["--progress-template", MODELE])
         .args(["--print", "after_move:fluxdl-fichier %(filepath)s"])
         .arg("-P")
@@ -1144,6 +1145,23 @@ fn jauge(ctl: &Control, nom: &str, tailles: &[Option<u64>], en_cours: usize, l: 
     v.verifying = l.verifying;
 }
 
+/// `--limit-rate` : la plus basse des limites de l'entrée au lancement (yt-dlp ne la change pas
+/// en cours ; une nouvelle limite vaut au prochain lancement).
+/// raccourci : la limite globale n'est pas partagée avec les autres téléchargements pendant
+/// que yt-dlp tourne seul ; la lui faire suivre si l'écart gêne.
+fn limite_ytdlp(ctl: &Control) -> Vec<String> {
+    match ctl
+        .limites
+        .iter()
+        .map(|s| s.debit())
+        .filter(|&d| d > 0)
+        .min()
+    {
+        Some(d) => vec!["--limit-rate".into(), d.to_string()],
+        None => Vec::new(),
+    }
+}
+
 /// Chaque partie par le moteur (plages exigées, jauges par connexion), son d'abord : la jauge
 /// finit sur l'image, la plus grosse ; puis fusion par ffmpeg (`-c copy`). Arrêt : les `.part`
 /// et les parties finies restent, la reprise repart de là (liens neufs, même fichier distant).
@@ -1197,8 +1215,9 @@ fn par_le_moteur(
             require_ranges: true,
             ..Default::default()
         };
-        // Moteur sur son propre `Control`, recopié dans la jauge unique (il remet tout à zéro).
-        let partie = Arc::new(Control::default());
+        // Moteur sur son propre `Control`, recopié dans la jauge unique (il remet tout à zéro) ;
+        // mêmes limites de débit que l'entrée (changées en direct).
+        let partie = Arc::new(Control::avec_limites(ctl.limites.clone()));
         let h = {
             let (url, dir, nom_p, c) = (
                 url.to_string(),
@@ -1732,7 +1751,11 @@ mod tests {
         };
         let lance = |sortie: String| {
             std::fs::write(d.join("sortie.txt"), sortie).unwrap();
-            let ctl = Arc::new(Control::default());
+            // Limites de l'entrée (globale illimitée, propre 50 Mo/s) : `--limit-rate` à yt-dlp.
+            let ctl = Arc::new(Control::avec_limites(vec![
+                Arc::new(engine::Seau::new(0)),
+                Arc::new(engine::Seau::new(50_000_000)),
+            ]));
             let r = telecharger(
                 &o,
                 "https://www.youtube.com/watch?v=x",
@@ -1811,6 +1834,7 @@ mod tests {
         );
         let args = std::fs::read_to_string(d.join("args.txt")).unwrap();
         assert!(args.contains("--concurrent-fragments 4"), "{args}");
+        assert!(args.contains("--limit-rate 50000000"), "{args}");
         let _ = std::fs::remove_dir_all(&d);
     }
 

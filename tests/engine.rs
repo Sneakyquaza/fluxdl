@@ -835,3 +835,87 @@ fn requetes_bornees_et_plages_exigees() {
         assert_eq!(e, engine::ERR_PLAGES);
     }
 }
+
+/// Débit moyen (octets/s) d'un téléchargement lancé sur `ctl`, sonde comprise.
+fn debit_sur(url: &str, d: &Path, n: usize, ctl: &Arc<Control>) -> (PathBuf, f64) {
+    let t = Instant::now();
+    let r = engine::run(url, d, None, &opts(n), ctl).unwrap();
+    let Outcome::Done(p) = r else {
+        panic!("arrêté")
+    };
+    let l = ctl.snapshot();
+    (p, l.received as f64 / t.elapsed().as_secs_f64())
+}
+
+#[test]
+fn limite_de_debit_sur_4_connexions() {
+    // 0.2.9 : 2 Mo/s pour les 4 connexions ensemble (seau partagé), à ±20 %.
+    let (_c, url, data) = serveur(3 << 20, |_| {});
+    let d = dossier("limite4");
+    let ctl = Arc::new(Control::avec_limites(vec![Arc::new(engine::Seau::new(
+        2_000_000,
+    ))]));
+    let (p, v) = debit_sur(&url, &d, 4, &ctl);
+    verifie(&p, &data);
+    assert_eq!(ctl.snapshot().workers.len(), 4);
+    eprintln!("limite 2 Mo/s : {:.2} Mo/s", v / 1e6);
+    assert!((1.6e6..=2.4e6).contains(&v), "{:.2} Mo/s", v / 1e6);
+}
+
+#[test]
+fn limite_changee_en_cours() {
+    // Limite propre au téléchargement changée en direct : 1 Mo/s, puis 4 Mo/s, puis aucune.
+    let (_c, url, data) = serveur(8 << 20, |_| {});
+    let d = dossier("limite_change");
+    let globale = Arc::new(engine::Seau::new(0));
+    let propre = Arc::new(engine::Seau::new(1_000_000));
+    let ctl = Arc::new(Control::avec_limites(vec![globale, propre.clone()]));
+    let h = {
+        let (url, d, ctl) = (url.clone(), d.clone(), ctl.clone());
+        std::thread::spawn(move || engine::run(&url, &d, None, &opts(4), &ctl))
+    };
+    let recu = || ctl.snapshot().received as f64;
+    std::thread::sleep(Duration::from_millis(600));
+    let a = recu();
+    assert!((0.3e6..=0.9e6).contains(&a), "1 Mo/s : {a} o en 0,6 s");
+    propre.regler(4_000_000);
+    std::thread::sleep(Duration::from_millis(500));
+    let b = recu() - a;
+    assert!((1.3e6..=2.7e6).contains(&b), "4 Mo/s : {b} o en 0,5 s");
+    // Sans limite : le reste (plus de 5 Mo) arrive tout de suite.
+    propre.regler(0);
+    let t = Instant::now();
+    let Outcome::Done(p) = h.join().unwrap().unwrap() else {
+        panic!("arrêté")
+    };
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    verifie(&p, &data);
+}
+
+#[test]
+fn limite_globale_partagee_par_2_telechargements() {
+    // Un seul seau pour deux téléchargements en même temps : 2 Mo/s à eux deux.
+    let globale = Arc::new(engine::Seau::new(2_000_000));
+    let fils: Vec<_> = (0..2)
+        .map(|i| {
+            let (_c, url, data) = serveur(3 << 19, |_| {});
+            let d = dossier(&format!("limite_globale{i}"));
+            let ctl = Arc::new(Control::avec_limites(vec![globale.clone()]));
+            std::thread::spawn(move || {
+                let _c = _c;
+                let (p, _) = debit_sur(&url, &d, 4, &ctl);
+                verifie(&p, &data);
+                ctl.snapshot().received
+            })
+        })
+        .collect();
+    let t = Instant::now();
+    let total: u64 = fils.into_iter().map(|f| f.join().unwrap()).sum();
+    let v = total as f64 / t.elapsed().as_secs_f64();
+    eprintln!(
+        "limite globale 2 Mo/s, 2 téléchargements : {:.2} Mo/s",
+        v / 1e6
+    );
+    assert_eq!(total, 3 << 20);
+    assert!((1.6e6..=2.4e6).contains(&v), "{:.2} Mo/s", v / 1e6);
+}

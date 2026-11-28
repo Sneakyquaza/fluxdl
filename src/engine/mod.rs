@@ -10,7 +10,9 @@
 //! NTFS remplit de zéros, dans l'appel d'écriture même, tout ce qui précède une écriture loin
 //! dans le fichier (des Go), ce qui bloquait les connexions, la pause et l'annulation.
 
+mod limite;
 mod probe;
+pub use limite::Seau;
 pub use probe::{name_from_disposition, name_from_url, probe, sanitize};
 
 use serde::{Deserialize, Serialize};
@@ -43,8 +45,6 @@ pub struct Options {
     pub connections: usize,
     /// Plus petit morceau qu'on découpe ou qu'on vole.
     pub min_chunk: u64,
-    /// Limite de débit globale en octets/s (0 = aucune).
-    pub speed_limit: u64,
     /// Empreinte attendue (hex), vérifiée à la fin.
     pub expected_sha256: Option<String>,
     /// Échecs de suite sans progrès avant qu'une connexion abandonne.
@@ -64,7 +64,6 @@ impl Default for Options {
         Options {
             connections: 8,
             min_chunk: 1 << 20,
-            speed_limit: 0,
             expected_sha256: None,
             max_retries: 6,
             headers: Vec::new(),
@@ -158,6 +157,9 @@ impl Live {
 pub struct Control {
     pub stop: AtomicBool,
     live: Mutex<Live>,
+    /// Limites de débit appliquées à chaque lecture (globale partagée, propre au téléchargement),
+    /// réglables en direct.
+    pub limites: Vec<Arc<Seau>>,
 }
 
 impl Control {
@@ -165,6 +167,13 @@ impl Control {
         Control {
             stop: AtomicBool::new(false),
             live: Mutex::new(live),
+            limites: Vec::new(),
+        }
+    }
+    pub fn avec_limites(limites: Vec<Arc<Seau>>) -> Self {
+        Control {
+            limites,
+            ..Default::default()
         }
     }
     pub fn snapshot(&self) -> Live {
@@ -432,7 +441,6 @@ struct Shared {
     opts: Options,
     ctl: Arc<Control>,
     ranged: bool,
-    started: Instant,
     /// Arrêt de toutes les connexions (erreur fatale ou repli).
     abort: AtomicBool,
     fallback: AtomicBool,
@@ -562,7 +570,6 @@ fn attempt(
         opts: opts.clone(),
         ctl: ctl.clone(),
         ranged,
-        started: Instant::now(),
         abort: AtomicBool::new(false),
         fallback: AtomicBool::new(false),
         error: Mutex::new(None),
@@ -969,34 +976,32 @@ fn fetch(sh: &Shared, w: usize, i: usize) -> Result<(), FetchErr> {
         }
         write_at(&sh.file, &buf[..k], pos).map_err(|e| FetchErr::Fatal(format!("write: {e}")))?;
         pos += k as u64;
-        let attente = {
+        let fini = {
             let mut l = sh.ctl.lock();
             l.segments[i].pos = pos;
             l.received += k as u64;
             l.workers[w].bytes += k as u64;
-            if pos >= l.segments[i].end || pos >= limite {
-                return Ok(());
-            }
-            limit_wait(sh, l.received)
+            pos >= l.segments[i].end || pos >= limite
         };
-        // Limite de débit : attente par petits pas, interrompue par un arrêt.
+        // Limites de débit (globale, du téléchargement) : la plus longue attente, par petits
+        // pas, interrompue par un arrêt ou un changement de limite. Fin du morceau : la dette
+        // reste dans le seau, payée par les lectures suivantes.
+        let limites = &sh.ctl.limites;
+        let attente = limites.iter().filter_map(|s| s.prendre(k as u64)).max();
+        if fini {
+            return Ok(());
+        }
         if let Some(d) = attente {
+            let avant: Vec<u64> = limites.iter().map(|s| s.debit()).collect();
             let fin = Instant::now() + d;
-            while Instant::now() < fin && !sh.halted() {
+            while Instant::now() < fin
+                && !sh.halted()
+                && limites.iter().map(|s| s.debit()).eq(avant.iter().copied())
+            {
                 std::thread::sleep((fin - Instant::now()).min(Duration::from_millis(50)));
             }
         }
     }
-}
-
-/// Limite globale : attente pour que `recu` octets ne dépassent pas le débit permis.
-fn limit_wait(sh: &Shared, recu: u64) -> Option<Duration> {
-    let debit = sh.opts.speed_limit;
-    if debit == 0 {
-        return None;
-    }
-    let prevu = Duration::from_secs_f64(recu as f64 / debit as f64);
-    prevu.checked_sub(sh.started.elapsed())
 }
 
 /// Morceaux repris cohérents : ils couvrent `[0, taille)` sans trou ni chevauchement, chaque

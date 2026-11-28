@@ -10,6 +10,7 @@ mod icone;
 mod instance;
 mod maj;
 mod motw;
+mod plan;
 mod presse;
 mod serveur;
 mod store;

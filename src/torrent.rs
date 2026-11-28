@@ -144,6 +144,17 @@ impl Moteur {
         Ok(Moteur { rt, session, api })
     }
 
+    /// Limite de réception de toute la session (octets/s, 0 = aucune), changée en direct.
+    /// librqbit 9.1 n'a qu'une limite par session : pas de limite par torrent, et elle n'est pas
+    /// partagée avec les téléchargements HTTP (même valeur que la limite globale, à part).
+    pub fn limiter(&self, debit: u64) {
+        let v = std::num::NonZeroU32::new(debit.min(u32::MAX as u64) as u32);
+        let r = &self.session.ratelimits;
+        if r.get_download_bps() != v {
+            r.set_download_bps(v);
+        }
+    }
+
     #[cfg(test)]
     pub fn adresse(&self) -> Option<SocketAddr> {
         self.session.listen_addr()

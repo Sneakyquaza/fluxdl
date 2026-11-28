@@ -292,6 +292,49 @@ impl App {
                 }
                 return false;
             }
+            Modale::FinCompte { eteindre, depuis } => {
+                let reste = (COMPTE_FIN_S - (self.now - depuis)).max(0.0);
+                let (titre, quoi) = if eteindre {
+                    (t(l, "The PC will shut down"), t(l, "Shutting down in"))
+                } else {
+                    (t(l, "The PC will go to sleep"), t(l, "Going to sleep in"))
+                };
+                titre_modale(ui, Icone::Pause, titre);
+                paragraphe(ui, t(l, "All downloads are finished."));
+                ui.add_space(14.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new(quoi).font(moyen(14.0)).color(TEXTE2));
+                    ui.label(
+                        egui::RichText::new(format!("{:.0} s", reste.ceil()))
+                            .font(affiche(52.0))
+                            .color(TITRE),
+                    );
+                });
+                ui.add_space(6.0);
+                let (r, _) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), 12.0), Sense::hover());
+                jauge(
+                    ui.painter(),
+                    r,
+                    (reste / COMPTE_FIN_S) as f32,
+                    teinte(0.55),
+                    true,
+                );
+                ui.add_space(18.0);
+                let annuler = ui
+                    .vertical_centered(|ui| {
+                        bouton_principal(ui, t(l, "Cancel"), Some(Icone::Fermer), vec2(220.0, 44.0))
+                    })
+                    .inner;
+                if !annuler.has_focus() {
+                    annuler.request_focus();
+                }
+                if annuler.clicked() {
+                    return true;
+                }
+                self.modale = Some(Modale::FinCompte { eteindre, depuis });
+                return false;
+            }
             Modale::Guide(g) => return self.contenu_guide(ui, g),
             Modale::Appairage {
                 depuis,

@@ -8,9 +8,9 @@ mod guide;
 use crate::i18n::t;
 use crate::maj::{self, Maj};
 use crate::serveur::{self, Demande, Statut};
-use crate::store::{self, Entry, Kind, Lang, Settings, Status};
-use crate::{torrent, video};
-use dlcore::engine::{self, Control, Live, Options, Outcome, Segment, WorkerStat};
+use crate::store::{self, Entry, Fin, Kind, Lang, Settings, Status};
+use crate::{plan, torrent, video};
+use dlcore::engine::{self, Control, Live, Options, Outcome, Seau, Segment, WorkerStat};
 use dlcore::APP_NAME;
 use draw::*;
 use eframe::egui::{
@@ -212,7 +212,15 @@ enum Modale {
         origine: String,
         navigateur: &'static str,
     },
+    /// Tout est fini : veille ou arrêt du PC dans 60 s (depuis `depuis`, horloge de l'appli),
+    /// sauf « Annuler ».
+    FinCompte { eteindre: bool, depuis: f64 },
 }
+
+/// Compte à rebours avant la veille ou l'arrêt du PC.
+const COMPTE_FIN_S: f64 = 60.0;
+/// Limites proposées dans le menu (Mo/s, 0 = illimitée).
+const LIMITES: [f32; 5] = [0.0, 1.0, 5.0, 10.0, 50.0];
 
 /// Phase du comparatif (1 = une connexion, 2 = N) et son contrôle.
 type Phase = (u8, Arc<Control>);
@@ -292,6 +300,19 @@ pub struct App {
     /// Cookies de connexion par page vidéo (extension, option par site) : en mémoire seulement,
     /// oubliés quand plus aucune vidéo de la page n'attend (fin, retrait, fenêtre fermée).
     jarres: HashMap<String, Arc<Vec<crate::cookies::Cookie>>>,
+    /// Limite globale, partagée par les connexions de tous les téléchargements HTTP et vidéo.
+    globale: Arc<Seau>,
+    /// Limite d'un téléchargement choisie dans le panneau de détail (dessiné sans `&mut`).
+    limite_choisie: std::cell::Cell<Option<(u64, f32)>>,
+    /// Planification : file en attente de l'heure de démarrage ; dernière minute vue ; mis en
+    /// pause par l'heure d'arrêt (repartent en attente, pas « en pause par l'utilisateur »).
+    plan_arme: bool,
+    plan_vu: u16,
+    plan_suspendus: Vec<u64>,
+    /// Un téléchargement a fini pendant cette session (l'action de fin n'a lieu qu'après).
+    fini_session: bool,
+    /// Veille (`false`) ou arrêt du PC (`true`) : `systeme::veille_ou_arret`, faux en test.
+    executer: fn(bool),
 }
 
 impl App {
@@ -353,8 +374,17 @@ impl App {
             inconnues: Vec::new(),
             cjk: false,
             jarres: HashMap::new(),
+            globale: Arc::new(Seau::new(0)),
+            limite_choisie: Default::default(),
+            plan_arme: false,
+            plan_vu: crate::systeme::minute_locale(),
+            plan_suspendus: Vec::new(),
+            fini_session: false,
+            executer: crate::systeme::veille_ou_arret,
         };
         if let Some(d) = capture {
+            // Captures : jamais de vraie veille ni d'arrêt du PC.
+            app.executer = |_| {};
             app.demo();
             app.capture = Some((d, 0));
             return app;
@@ -362,6 +392,12 @@ impl App {
         if let Some(s) = store::load(SETTINGS) {
             app.settings = s;
         }
+        // Veille et arrêt du PC : jamais repris d'une session à l'autre.
+        if matches!(app.settings.end_action, Fin::Veille | Fin::Eteindre) {
+            app.settings.end_action = Fin::Rien;
+        }
+        app.plan_arme =
+            plan::arme_au_depart(app.plan_vu, app.settings.plan_start, app.settings.plan_stop);
         (app.entries, app.inconnues) = store::load_queue(&store::data_dir(), QUEUE);
         app.presse_actif
             .store(app.settings.clipboard_watch, Ordering::Relaxed);
@@ -498,6 +534,7 @@ impl App {
             kind,
             referrer: None,
             cookies: None,
+            speed_limit_mb: 0.0,
         });
         self.selected = Some(self.next_id);
         self.born.insert(self.next_id, self.now);
@@ -750,7 +787,11 @@ impl App {
     fn start(&mut self, i: usize) {
         let e = &mut self.entries[i];
         e.status = Status::Running;
-        let ctl = Arc::new(Control::default());
+        // Limites : globale (partagée) puis celle du téléchargement (index 1, voir `schedule`).
+        let ctl = Arc::new(Control::avec_limites(vec![
+            self.globale.clone(),
+            Arc::new(Seau::new(mo_s(e.speed_limit_mb))),
+        ]));
         let (url, dir, name, c) = (
             e.url.clone(),
             PathBuf::from(&e.dir),
@@ -768,7 +809,6 @@ impl App {
                 }
                 let opts = Options {
                     connections: e.connections,
-                    speed_limit: (self.settings.speed_limit_mb.max(0.0) * 1e6) as u64,
                     expected_sha256: e.sha256.clone(),
                     headers,
                     ..Default::default()
@@ -829,10 +869,20 @@ impl App {
     fn schedule(&mut self, now: f64) {
         let mut page = None;
         let mut fini = false;
+        if let Some((id, v)) = self.limite_choisie.take() {
+            if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+                e.speed_limit_mb = v;
+                self.last_save = f64::NEG_INFINITY;
+            }
+        }
         for e in &mut self.entries {
             let Some(j) = self.jobs.get_mut(&e.id) else {
                 continue;
             };
+            // Limite propre changée en direct (sans effet sur un torrent).
+            if let Some(s) = j.ctl.limites.get(1) {
+                s.regler(mo_s(e.speed_limit_mb));
+            }
             let l = j.ctl.snapshot();
             j.sample(now, &l);
             if l.file_name.is_some() {
@@ -868,9 +918,19 @@ impl App {
                     }
                     // Cookies inutiles une fois fini : ils ne restent pas dans queue.json.
                     e.cookies = None;
+                    self.fini_session = true;
                     Status::Done
                 }
-                Some(Ok(Outcome::Stopped)) => Status::Paused,
+                // Mis en pause par l'heure d'arrêt : repart à la prochaine heure de démarrage.
+                Some(Ok(Outcome::Stopped)) => {
+                    match self.plan_suspendus.iter().position(|&i| i == e.id) {
+                        Some(k) => {
+                            self.plan_suspendus.swap_remove(k);
+                            Status::Queued
+                        }
+                        None => Status::Paused,
+                    }
+                }
                 Some(Err(m)) => {
                     if m == engine::ERR_PAGE {
                         page = Some(e.url.clone());
@@ -925,7 +985,8 @@ impl App {
             let e = &self.entries[i];
             // Petit fichier de taille connue : passe devant, sans attendre les gros.
             let petit = e.size.is_some_and(|s| s.saturating_sub(e.done) < PETIT);
-            if e.status == Status::Queued && (actifs < MAX_ACTIFS || petit) {
+            // Planification : tout attend l'heure de démarrage (ou « Démarrer maintenant »).
+            if e.status == Status::Queued && !self.plan_arme && (actifs < MAX_ACTIFS || petit) {
                 self.start(i);
                 actifs += usize::from(!petit);
             }
@@ -942,6 +1003,7 @@ impl App {
                     | Modale::Torrent { rx: Some(_), .. }
                     | Modale::Outils { .. }
                     | Modale::Appairage { .. }
+                    | Modale::FinCompte { .. }
             )
         )
     }
@@ -949,6 +1011,67 @@ impl App {
     /// Torrent fini qui partage encore.
     fn partage(&self, id: u64) -> bool {
         self.jobs.get(&id).is_some_and(|j| j.ctl.lock().seeding)
+    }
+
+    /// Heure de démarrage passée : la file part ; heure d'arrêt : ce qui tourne se met en pause
+    /// et attend le prochain démarrage.
+    fn planifier_file(&mut self) {
+        let m = crate::systeme::minute_locale();
+        let s = &self.settings;
+        let (arme, pause) =
+            plan::planifier(self.plan_arme, self.plan_vu, m, s.plan_start, s.plan_stop);
+        (self.plan_arme, self.plan_vu) = (arme, m);
+        if !pause {
+            return;
+        }
+        for e in &self.entries {
+            if e.status != Status::Running || self.partage(e.id) {
+                continue;
+            }
+            if let Some(j) = self.jobs.get(&e.id).filter(|j| j.handle.is_some()) {
+                j.ctl.request_stop();
+                self.plan_suspendus.push(e.id);
+            }
+        }
+    }
+
+    /// Tout est fini (rien en échec ni en pause, au moins un fini pendant cette session) :
+    /// fermer fluxdl, ou compte à rebours avant la veille / l'arrêt du PC (fenêtre devant).
+    /// Compte à rebours écoulé : file et réglages écrits, puis la commande du système.
+    fn action_de_fin(&mut self, ctx: &egui::Context) {
+        if let Some(Modale::FinCompte { eteindre, depuis }) = self.modale {
+            if self.now - depuis >= COMPTE_FIN_S {
+                self.modale = None;
+                // Une seule fois : il faut la rechoisir pour la prochaine fois.
+                self.settings.end_action = Fin::Rien;
+                if self.capture.is_none() {
+                    store::save_queue(&store::data_dir(), QUEUE, &self.entries, &self.inconnues);
+                    store::save(SETTINGS, &self.settings);
+                }
+                (self.executer)(eteindre);
+            }
+            return;
+        }
+        let action = self.settings.end_action;
+        if action == Fin::Rien
+            || self.modale.is_some()
+            || !plan::fin_atteinte(self.entries.iter().map(|e| &e.status), self.fini_session)
+        {
+            return;
+        }
+        self.fini_session = false;
+        if action == Fin::Fermer {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        self.modale = Some(Modale::FinCompte {
+            eteindre: action == Fin::Eteindre,
+            depuis: self.now,
+        });
+        montrer(ctx);
+        ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+            egui::UserAttentionType::Critical,
+        ));
     }
 
     fn persist(&mut self, now: f64) {
@@ -1195,44 +1318,97 @@ impl App {
     fn downloads(&mut self, ui: &mut Ui) {
         let l = self.settings.lang;
         let r = self.page_title(ui, t(l, "Downloads"), None);
-        // Débit total en direct, à droite du titre.
+        // Débit total en direct et limite globale, à droite du titre ; clic = menu des limites
+        // (illimitée, 1… 50 Mo/s, personnalisée).
         let (mut total, mut n) = (0.0, 0);
         for e in self.entries.iter().filter(|e| e.status == Status::Running) {
             n += 1;
             total += self.jobs.get(&e.id).map_or(0.0, |j| j.speed);
         }
-        if n > 0 {
-            let v = format!("{}/s", octets(total as u64));
-            let g = ui.painter().layout_no_wrap(v, demi(14.0), TEXTE);
-            let a = format!("{n} {}", compte(l, n, "active"));
-            let ga = ui.painter().layout_no_wrap(a, regulier(12.5), TEXTE3);
-            let larg = 16.0 + 16.0 + 8.0 + g.size().x + 10.0 + ga.size().x + 16.0;
-            let b = Rect::from_min_size(
-                pos2(r.right() - larg, r.center().y - 17.0),
-                vec2(larg, 34.0),
-            );
-            let p = ui.painter();
-            p.add(verre(ui.ctx(), b, 17, 0.7));
-            p.add(reflet(b.shrink(1.0), 16, 0.6));
-            orbe(p, pos2(b.left() + 22.0, b.center().y), 9.0, GEL_VERT);
+        let titre_w = ui
+            .painter()
+            .layout_no_wrap(t(l, "Downloads").into(), affiche(30.0), TEXTE)
+            .size()
+            .x;
+        let p = ui.painter().clone();
+        let g = (n > 0)
+            .then(|| p.layout_no_wrap(format!("{}/s", octets(total as u64)), demi(14.0), TEXTE));
+        let gl = p.layout_no_wrap(
+            format!("{} ▾", texte_limite(l, self.settings.speed_limit_mb)),
+            moyen(13.0),
+            TITRE,
+        );
+        let mut ga = (n > 0).then(|| {
+            p.layout_no_wrap(
+                format!("{n} {}", compte(l, n, "active")),
+                regulier(12.5),
+                TEXTE3,
+            )
+        });
+        let vitesse_w = g.as_ref().map_or(0.0, |g| 40.0 + g.size().x + 14.0);
+        let limite_w = 16.0 + 20.0 + gl.size().x + 16.0;
+        // Colonne étroite : « 2 actives » s'efface avant de toucher le titre.
+        let mut larg = vitesse_w + ga.as_ref().map_or(0.0, |a| a.size().x + 10.0) + limite_w;
+        if r.right() - larg < r.left() + titre_w + 16.0 {
+            larg -= ga.take().map_or(0.0, |a| a.size().x + 10.0);
+        }
+        let b = Rect::from_min_size(
+            pos2(r.right() - larg, r.center().y - 17.0),
+            vec2(larg, 34.0),
+        );
+        let rep = ui
+            .interact(b, egui::Id::unique("limite_globale"), Sense::click())
+            .on_hover_text(t(l, "Speed limit for all downloads"));
+        let h = survol(ui, &rep);
+        if h > 0.0 {
+            p.add(lueur(
+                b.expand(3.0),
+                teinte(0.5).gamma_multiply(0.5 * h),
+                10.0,
+            ));
+        }
+        p.add(verre(ui.ctx(), b, 17, 0.7 + 0.2 * h));
+        p.add(reflet(b.shrink(1.0), 16, 0.6));
+        let mut x = b.left();
+        if let Some(g) = g {
+            orbe(&p, pos2(x + 22.0, b.center().y), 9.0, GEL_VERT);
             icone(
-                p,
-                Rect::from_center_size(pos2(b.left() + 22.0, b.center().y), Vec2::splat(11.0)),
+                &p,
+                Rect::from_center_size(pos2(x + 22.0, b.center().y), Vec2::splat(11.0)),
                 Icone::Telecharger,
                 Color32::WHITE,
             );
-            let x = b.left() + 40.0;
-            let ga_w = ga.size().x;
-            p.galley(pos2(x, b.center().y - g.size().y / 2.0), g.clone(), TEXTE);
             p.galley(
-                pos2(b.right() - 16.0 - ga_w, b.center().y - ga.size().y / 2.0),
-                ga,
-                TEXTE3,
+                pos2(x + 40.0, b.center().y - g.size().y / 2.0),
+                g.clone(),
+                TEXTE,
             );
+            x += 40.0 + g.size().x + 10.0;
+            if let Some(ga) = ga {
+                p.galley(
+                    pos2(x, b.center().y - ga.size().y / 2.0),
+                    ga.clone(),
+                    TEXTE3,
+                );
+                x += ga.size().x + 10.0;
+            }
+            // Séparateur entre le débit et la limite.
+            p.vline(x, b.y_range().shrink(8.0), Stroke::new(1.0, nuit(40)));
+        }
+        icone(
+            &p,
+            Rect::from_center_size(pos2(x + 24.0, b.center().y), Vec2::splat(14.0)),
+            Icone::Eclair,
+            TITRE,
+        );
+        p.galley(pos2(x + 36.0, b.center().y - gl.size().y / 2.0), gl, TITRE);
+        if let Some(v) = popup_limite(&rep, l, self.settings.speed_limit_mb) {
+            self.settings.speed_limit_mb = v;
         }
         ui.add_space(18.0);
         self.paste_card(ui);
         ui.add_space(20.0);
+        self.bandeau_plan(ui);
         let mut action = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -1251,6 +1427,63 @@ impl App {
         if let Some((i, a)) = action {
             self.act(i, a);
         }
+    }
+
+    /// File en attente de l'heure de démarrage : « Démarre à 02:00 » et « Démarrer maintenant ».
+    fn bandeau_plan(&mut self, ui: &mut Ui) {
+        let l = self.settings.lang;
+        let Some(debut) = self.settings.plan_start.filter(|_| self.plan_arme) else {
+            return;
+        };
+        let maintenant = carte(ui, Margin::symmetric(14, 10), |ui| {
+            let w = ui.available_width();
+            ui.set_width(w);
+            let (r, _) = ui.allocate_exact_size(vec2(w, 36.0), Sense::hover());
+            let p = ui.painter();
+            orbe(p, pos2(r.left() + 16.0, r.center().y), 14.0, GEL_BLEU);
+            icone_relief(
+                p,
+                Rect::from_center_size(pos2(r.left() + 16.0, r.center().y), Vec2::splat(14.0)),
+                Icone::Pause,
+            );
+            let titre = format!("{} {}", t(l, "Starts at"), plan::hhmm(debut));
+            let aide = match self.settings.plan_stop {
+                Some(f) => format!(
+                    "{} {}.",
+                    t(l, "Downloads wait until then. Pause at"),
+                    plan::hhmm(f)
+                ),
+                None => t(l, "Downloads wait until then.").into(),
+            };
+            texte(
+                ui,
+                pos2(r.left() + 40.0, r.center().y),
+                Align2::LEFT_CENTER,
+                &titre,
+                demi(15.0),
+                TITRE,
+            );
+            let txt = t(l, "Start now");
+            let bw = ui
+                .painter()
+                .layout_no_wrap(txt.into(), demi(13.5), TEXTE)
+                .size()
+                .x
+                + 64.0;
+            let b = Rect::from_min_size(pos2(r.right() - bw, r.center().y - 18.0), vec2(bw, 36.0));
+            let clic = a_la_place(ui, b, |ui| {
+                bouton_gel(ui, txt, Some(Icone::Lecture), b.size(), GEL_VERT)
+            })
+            .clicked();
+            // Aide sous le titre, renvoyée à la ligne (colonne étroite).
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(aide).font(regulier(12.5)).color(TEXTE2));
+            clic
+        });
+        if maintenant {
+            self.plan_arme = false;
+        }
+        ui.add_space(14.0);
     }
 
     /// Barre « coller un lien » : champ, Coller, Télécharger ; dossier, SHA-256, connexions.
@@ -1797,11 +2030,47 @@ impl App {
             g,
             TEXTE3,
         );
+        // Limite propre au téléchargement (en plus de la globale) ; torrents : globale seulement.
+        ui.add_space(14.0);
+        if matches!(e.kind, Kind::Torrent { .. }) {
+            ui.label(
+                egui::RichText::new(t(
+                    l,
+                    "Speed limit: torrents follow the global limit only (shared by all torrents).",
+                ))
+                .font(regulier(12.5))
+                .color(TEXTE3),
+            );
+        } else {
+            if let Some(v) = menu_limite(ui, l, e.speed_limit_mb, 30.0) {
+                self.limite_choisie.set(Some((e.id, v)));
+            }
+            ui.label(
+                egui::RichText::new(t(l, "this download, on top of the global limit"))
+                    .font(regulier(12.5))
+                    .color(TEXTE3),
+            );
+            // yt-dlp seul (HLS, son, passage…) : `--limit-rate` fixé à son lancement.
+            let ytdlp = matches!(e.kind, Kind::Video { .. })
+                && e.status == Status::Running
+                && self.jobs.get(&e.id).is_some_and(|j| !j.ctl.lock().ranges);
+            if ytdlp {
+                ui.label(
+                    egui::RichText::new(t(
+                        l,
+                        "Downloaded by yt-dlp: a new limit applies at its next start (pause, then resume).",
+                    ))
+                    .font(regulier(12.0))
+                    .color(ATTENTION),
+                );
+            }
+        }
         let Some(j) = self.jobs.get(&e.id) else {
             ui.add_space(28.0);
             ui.label(
                 egui::RichText::new(match e.status {
                     Status::Done => t(l, "Download complete."),
+                    Status::Queued if self.plan_arme => t(l, "Waiting for the scheduled start."),
                     Status::Queued => t(
                         l,
                         "Waiting: it starts as soon as one of the running downloads finishes.",
@@ -2347,7 +2616,7 @@ impl App {
                     reglage(
                         ui,
                         t(l, "Speed limit"),
-                        t(l, "Per download. Off means no limit."),
+                        t(l, "Shared by all downloads, also in the main window. Off means no limit."),
                         |ui| {
                             let mut on = self.settings.speed_limit_mb > 0.0;
                             if interrupteur(ui, &mut on).changed() {
@@ -2378,6 +2647,8 @@ impl App {
                         },
                     );
                 });
+                ui.add_space(20.0);
+                self.reglages_plan(ui);
                 ui.add_space(20.0);
                 self.reglages_v2(ui);
                 carte(ui, Margin::symmetric(20, 6), |ui| {
@@ -2440,6 +2711,91 @@ impl App {
             });
     }
 
+    /// Carte « Planification » : heure de démarrage de la file, heure de pause, action de fin.
+    fn reglages_plan(&mut self, ui: &mut Ui) {
+        let l = self.settings.lang;
+        // Heure (minutes depuis minuit) : interrupteur, valeur, curseur par pas de 5 min.
+        let heure = |ui: &mut Ui, v: &mut Option<u16>, defaut: u16| {
+            let mut on = v.is_some();
+            let mut change = interrupteur(ui, &mut on).changed();
+            if change {
+                *v = on.then_some(defaut);
+            }
+            if let Some(m) = v {
+                ui.add_space(8.0);
+                boite_valeur(ui, &plan::hhmm(*m), 64.0);
+                let mut f = *m as f64;
+                if curseur(ui, &mut f, (0.0, 1435.0), false, 5.0, 200.0).changed() {
+                    *m = ((f / 5.0).round() * 5.0) as u16;
+                    change = true;
+                }
+            }
+            change
+        };
+        let mut change = false;
+        carte(ui, Margin::symmetric(20, 6), |ui| {
+            ui.set_width(ui.available_width());
+            titre_section(ui, t(l, "Scheduling"));
+            reglage(
+                ui,
+                t(l, "Start the queue at"),
+                t(
+                    l,
+                    "Downloads wait until this time (local time), then start.",
+                ),
+                |ui| change |= heure(ui, &mut self.settings.plan_start, 120),
+            );
+            if self.settings.plan_start.is_some() {
+                separateur(ui);
+                reglage(
+                    ui,
+                    t(l, "Pause at"),
+                    t(
+                        l,
+                        "Running downloads pause and wait for the next start time.",
+                    ),
+                    |ui| change |= heure(ui, &mut self.settings.plan_stop, 480),
+                );
+            }
+            separateur(ui);
+            reglage(
+                ui,
+                t(l, "When everything is done"),
+                t(
+                    l,
+                    "Sleep and shut down: 60 s countdown you can cancel. Never after a failed or paused download; not kept after a restart.",
+                ),
+                |_| {},
+            );
+            // Quatre choix : sur leur propre ligne, sous l'aide (trop larges à côté).
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                segmente(
+                    ui,
+                    &mut self.settings.end_action,
+                    &[
+                        (Fin::Rien, t(l, "Nothing")),
+                        (Fin::Fermer, t(l, "Quit fluxdl")),
+                        (Fin::Veille, t(l, "Sleep")),
+                        (Fin::Eteindre, t(l, "Shut down")),
+                    ],
+                );
+            });
+            ui.add_space(12.0);
+        });
+        if self.settings.plan_start.is_none() {
+            self.settings.plan_stop = None;
+        }
+        // Heures changées : la file attend (ou non) selon la nouvelle plage.
+        if change {
+            self.plan_vu = crate::systeme::minute_locale();
+            self.plan_arme = plan::arme_au_depart(
+                self.plan_vu,
+                self.settings.plan_start,
+                self.settings.plan_stop,
+            );
+        }
+    }
+
     /// Captures d'écran (--capture) : une image par vue, puis fermeture.
     fn capture_step(&mut self, ctx: &egui::Context) {
         let Some((dir, frame)) = &mut self.capture else {
@@ -2449,7 +2805,7 @@ impl App {
         let f = *frame;
         let dir = dir.clone();
         // Assez d'images entre le changement de vue et la capture pour finir les animations.
-        let vues: [(Tab, Lang, &str); 24] = [
+        let vues: [(Tab, Lang, &str); 28] = [
             (Tab::Downloads, Lang::En, "downloads"),
             (Tab::Benchmark, Lang::En, "benchmark"),
             (Tab::Settings, Lang::En, "settings"),
@@ -2473,6 +2829,10 @@ impl App {
             (Tab::Downloads, Lang::Fr, "playlist_fr"),
             (Tab::Downloads, Lang::En, "playlist_choice_en"),
             (Tab::Downloads, Lang::Fr, "playlist_private_fr"),
+            (Tab::Downloads, Lang::Fr, "lotD_downloads_fr"),
+            (Tab::Settings, Lang::Fr, "lotD_settings_plan_fr"),
+            (Tab::Settings, Lang::En, "lotD_settings_plan_en"),
+            (Tab::Downloads, Lang::Fr, "lotD_countdown_fr"),
             (Tab::Downloads, Lang::Fr, "narrow_900x600_fr"),
         ];
         for (i, (tab, lang, nom)) in vues.into_iter().enumerate() {
@@ -2502,6 +2862,7 @@ impl App {
         self.settings.extension_asked = nom != "extension_bubble_fr";
         self.maj.mettre(maj::Etat::Rien);
         self.selected = Some(1);
+        self.plan_arme = nom == "lotD_downloads_fr";
         let f = |nom: &str, size| crate::github::Fichier {
             name: nom.into(),
             browser_download_url: format!("https://github.com/x/{nom}"),
@@ -2675,6 +3036,22 @@ impl App {
                 ))
             }
             "settings_video_fr" => self.defile = Some(1150.0),
+            "lotD_downloads_fr" => {
+                self.settings.speed_limit_mb = 5.0;
+                self.settings.plan_start = Some(120);
+                self.settings.plan_stop = Some(480);
+                self.entries[0].speed_limit_mb = 10.0;
+            }
+            "lotD_settings_plan_fr" | "lotD_settings_plan_en" => {
+                self.settings.end_action = Fin::Eteindre;
+                self.defile = Some(300.0);
+            }
+            "lotD_countdown_fr" => {
+                self.modale = Some(Modale::FinCompte {
+                    eteindre: true,
+                    depuis: self.now - 18.0,
+                })
+            }
             "torrent_pieces_fr" => self.selected = Some(5),
             "cancel_fr" => {
                 self.modale = Some(Modale::Annuler {
@@ -2785,6 +3162,7 @@ impl App {
             kind: Kind::Http,
             referrer: None,
             cookies: None,
+            speed_limit_mb: 0.0,
         };
         self.entries = vec![
             entree(
@@ -2934,10 +3312,20 @@ impl eframe::App for App {
         // Horloge à nous : fenêtre masquée, l'heure d'egui reste celle de la dernière image.
         let now = self.horloge.elapsed().as_secs_f64();
         UNITES_FR.store(self.settings.lang == Lang::Fr, Ordering::Relaxed);
+        // Limite globale changée en direct ; torrents : limite de leur session (à part).
+        let globale = mo_s(self.settings.speed_limit_mb);
+        self.globale.regler(globale);
+        if let Some(m) = torrent::lance() {
+            m.limiter(globale);
+        }
         if self.capture.is_none() {
+            self.planifier_file();
             self.schedule(now);
         }
         self.now = now;
+        if self.capture.is_none() {
+            self.action_de_fin(ctx);
+        }
         if self.bench.handle.as_ref().is_some_and(|h| h.is_finished()) {
             let h = self.bench.handle.take().map(|h| h.join());
             self.bench.result = h.map(|r| r.unwrap_or_else(|_| Err("panic".into())));
@@ -3050,21 +3438,23 @@ impl eframe::App for App {
         self.persist(now);
         // Au repos, aucune image : on ne repasse que si quelque chose bouge ou télécharge
         // (les animations egui demandent elles-mêmes leurs images).
-        let vivant = self
-            .entries
-            .iter()
-            .any(|e| matches!(e.status, Status::Running | Status::Queued))
-            || !self.orphelins.is_empty()
-            || self.bench.handle.is_some()
-            || self.picker.is_some()
-            || self.picker_torrent.is_some()
-            || matches!(
-                self.maj.etat(),
-                maj::Etat::Recherche | maj::Etat::Telechargement(..)
-            )
-            || self.modale_attend();
+        let vivant =
+            self.entries.iter().any(|e| {
+                e.status == Status::Running || e.status == Status::Queued && !self.plan_arme
+            }) || !self.orphelins.is_empty()
+                || self.bench.handle.is_some()
+                || self.picker.is_some()
+                || self.picker_torrent.is_some()
+                || matches!(
+                    self.maj.etat(),
+                    maj::Etat::Recherche | maj::Etat::Telechargement(..)
+                )
+                || self.modale_attend();
         if vivant {
             ctx.request_repaint_after(Duration::from_millis(250));
+        } else if self.plan_arme {
+            // File en attente de l'heure de démarrage : un passage toutes les 20 s suffit.
+            ctx.request_repaint_after(Duration::from_secs(20));
         }
     }
 
@@ -3275,6 +3665,65 @@ fn octets_parts(n: u64) -> (String, &'static str) {
     } else {
         (v, ["B", "kB", "MB", "GB"][i])
     }
+}
+
+/// Mo/s → octets/s (0 = illimitée).
+fn mo_s(v: f32) -> u64 {
+    (v.max(0.0) * 1e6) as u64
+}
+
+/// « 5 Mo/s » ou « Illimitée ».
+fn texte_limite(l: Lang, v: f32) -> String {
+    if v > 0.0 {
+        format!("{v:.0} {}/s", octets_parts(1_000_000).1)
+    } else {
+        t(l, "Unlimited").into()
+    }
+}
+
+/// Bouton « Limite : 5 Mo/s ▾ » et son menu ; nouvelle valeur (Mo/s) si elle change.
+fn menu_limite(ui: &mut Ui, l: Lang, v: f32, hauteur: f32) -> Option<f32> {
+    let txt = format!("{} {} ▾", t(l, "Limit:"), texte_limite(l, v));
+    let w = ui
+        .painter()
+        .layout_no_wrap(txt.clone(), demi(13.5), TEXTE)
+        .size()
+        .x
+        + 52.0;
+    let rep = bouton_secondaire(ui, &txt, Some(Icone::Eclair), vec2(w, hauteur));
+    popup_limite(&rep, l, v)
+}
+
+/// Menu des limites sous `rep` (illimitée, 1, 5, 10, 50 Mo/s, personnalisée) ; nouvelle
+/// valeur (Mo/s) si elle change.
+fn popup_limite(rep: &Response, l: Lang, v: f32) -> Option<f32> {
+    let mut nv = v;
+    egui::Popup::menu(rep)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.set_min_width(260.0);
+            for c in LIMITES {
+                let r = ui.selectable_label(nv == c, texte_limite(l, c));
+                if r.clicked() {
+                    nv = c;
+                    ui.close();
+                }
+            }
+            ui.separator();
+            ui.label(
+                egui::RichText::new(t(l, "Custom"))
+                    .font(moyen(13.0))
+                    .color(TEXTE2),
+            );
+            ui.horizontal(|ui| {
+                let mut f = if nv > 0.0 { nv as f64 } else { 20.0 };
+                boite_valeur(ui, &texte_limite(l, f as f32), 84.0);
+                if curseur(ui, &mut f, (1.0, 1000.0), true, 1.0, 150.0).changed() {
+                    nv = f.round() as f32;
+                }
+            });
+        });
+    (nv != v).then_some(nv)
 }
 
 /// Ligne de réglage : titre et aide à gauche (centrés verticalement), contrôle à droite.
@@ -3585,6 +4034,53 @@ mod tests {
         app.schedule(1.0);
         let n = |s: Status| app.entries.iter().filter(|e| e.status == s).count();
         assert_eq!((n(Status::Running), n(Status::Queued)), (MAX_ACTIFS, 2));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 0.2.9 : action de fin jamais au lancement ni après un échec ou une pause ; compte à
+    /// rebours de 60 s puis la commande (fausse ici : jamais de vraie veille ni d'arrêt).
+    #[test]
+    fn action_de_fin_apres_compte_a_rebours() {
+        static APPELS: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+        let d = std::env::temp_dir().join(format!("fluxdl-test-fin-{}", std::process::id()));
+        let ctx = egui::Context::default();
+        // Mode capture gardé : rien n'est écrit dans le vrai dossier de données.
+        let mut app = App::new(&ctx, Some(d.join("cap")), None);
+        ctx.run_ui(Default::default(), |_| {})
+            .textures_delta
+            .clear();
+        app.executer = |e| APPELS.lock().unwrap().push(e);
+        app.jobs.clear();
+        app.modale = None;
+        for e in &mut app.entries {
+            e.status = Status::Done;
+        }
+        app.settings.end_action = Fin::Eteindre;
+        app.now = 100.0;
+        // Tout est fini dès le lancement : rien.
+        app.action_de_fin(&ctx);
+        assert!(app.modale.is_none());
+        app.fini_session = true;
+        for autre in [Status::Failed("x".into()), Status::Paused] {
+            app.entries[0].status = autre;
+            app.action_de_fin(&ctx);
+            assert!(app.modale.is_none());
+        }
+        app.entries[0].status = Status::Done;
+        app.action_de_fin(&ctx);
+        assert!(matches!(
+            app.modale,
+            Some(Modale::FinCompte { eteindre: true, .. })
+        ));
+        app.now += 59.0;
+        app.action_de_fin(&ctx);
+        assert!(APPELS.lock().unwrap().is_empty());
+        app.now += 1.5;
+        app.action_de_fin(&ctx);
+        assert_eq!(*APPELS.lock().unwrap(), [true]);
+        assert!(app.modale.is_none());
+        // Une seule fois : l'action est remise à « Rien ».
+        assert_eq!(app.settings.end_action, Fin::Rien);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

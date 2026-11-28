@@ -192,8 +192,120 @@ const FR: &[(&str, &str)] = &[
     ("Browse", "Parcourir"),
     ("Speed limit", "Limite de débit"),
     (
-        "Per download. Off means no limit.",
-        "Par téléchargement. Désactivée : aucune limite.",
+        "Shared by all downloads, also in the main window. Off means no limit.",
+        "Commune à tous les téléchargements, aussi dans la fenêtre principale. Désactivée : aucune limite.",
+    ),
+    (
+        "Speed limit for all downloads",
+        "Limite de débit de tous les téléchargements",
+    ),
+    (
+        "Unlimited",
+        "Illimitée",
+    ),
+    (
+        "Limit:",
+        "Limite :",
+    ),
+    (
+        "Custom",
+        "Personnalisée",
+    ),
+    (
+        "Starts at",
+        "Démarre à",
+    ),
+    (
+        "Downloads wait until then. Pause at",
+        "Les téléchargements attendent jusque-là. Pause à",
+    ),
+    (
+        "Downloads wait until then.",
+        "Les téléchargements attendent jusque-là.",
+    ),
+    (
+        "Start now",
+        "Démarrer maintenant",
+    ),
+    (
+        "Speed limit: torrents follow the global limit only (shared by all torrents).",
+        "Limite de débit : les torrents suivent seulement la limite globale (commune à tous les torrents).",
+    ),
+    (
+        "this download, on top of the global limit",
+        "ce téléchargement, en plus de la limite globale",
+    ),
+    (
+        "Downloaded by yt-dlp: a new limit applies at its next start (pause, then resume).",
+        "Téléchargé par yt-dlp : une nouvelle limite s'applique à son prochain démarrage (pause, puis reprise).",
+    ),
+    (
+        "Waiting for the scheduled start.",
+        "En attente de l'heure de démarrage.",
+    ),
+    (
+        "Scheduling",
+        "Planification",
+    ),
+    (
+        "Start the queue at",
+        "Démarrer la file à",
+    ),
+    (
+        "Downloads wait until this time (local time), then start.",
+        "Les téléchargements attendent cette heure (heure locale), puis démarrent.",
+    ),
+    (
+        "Pause at",
+        "Pause à",
+    ),
+    (
+        "Running downloads pause and wait for the next start time.",
+        "Les téléchargements en cours se mettent en pause jusqu'à la prochaine heure de démarrage.",
+    ),
+    (
+        "When everything is done",
+        "Quand tout est fini",
+    ),
+    (
+        "Sleep and shut down: 60 s countdown you can cancel. Never after a failed or paused download; not kept after a restart.",
+        "Veille et arrêt : compte à rebours de 60 s, annulable. Jamais après un téléchargement en échec ou en pause ; pas gardé au prochain lancement.",
+    ),
+    (
+        "Nothing",
+        "Rien",
+    ),
+    (
+        "Quit fluxdl",
+        "Fermer fluxdl",
+    ),
+    (
+        "Sleep",
+        "Veille",
+    ),
+    (
+        "Shut down",
+        "Éteindre",
+    ),
+    (
+        "The PC will shut down",
+        "Le PC va s'éteindre",
+    ),
+    (
+        "Shutting down in",
+        "Arrêt dans",
+    ),
+    (
+        "The PC will go to sleep",
+        "Le PC va se mettre en veille",
+    ),
+    (
+        "Going to sleep in",
+        "Mise en veille dans",
+    ),
+    (
+        "All downloads are finished.",
+        "Tous les téléchargements sont finis.",
     ),
     ("Language", "Langue"),
     ("Applies immediately.", "S'applique tout de suite."),

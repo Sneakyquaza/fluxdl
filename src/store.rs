@@ -26,7 +26,7 @@ pub struct Settings {
     pub connections: usize,
     pub folder: String,
     pub lang: Lang,
-    /// Limite globale par téléchargement en Mo/s (0 = aucune).
+    /// Limite globale en Mo/s, partagée par tous les téléchargements (0 = aucune).
     pub speed_limit_mb: f32,
     /// Serveur local pour l'extension navigateur : actif, port, jeton d'appairage.
     pub server: bool,
@@ -49,6 +49,25 @@ pub struct Settings {
     /// Sous-titres, miniature, chapitres, conteneur : derniers choix de la fenêtre des formats
     /// (langue des sous-titres non gardée : celle de l'interface si la vidéo l'a).
     pub video_options: crate::video::Sortie,
+    /// Planification : la file démarre à cette heure, se met en pause à celle-là (minutes depuis
+    /// minuit, heure locale ; `None` = aucune).
+    pub plan_start: Option<u16>,
+    pub plan_stop: Option<u16>,
+    /// Quand tout est fini. Veille et arrêt du PC ne sont pas gardés d'une session à l'autre
+    /// (remis à `Rien` au lancement).
+    pub end_action: Fin,
+}
+
+/// Action quand tous les téléchargements sont finis.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum Fin {
+    #[default]
+    Rien,
+    /// Fermer fluxdl.
+    Fermer,
+    /// Mettre le PC en veille, éteindre le PC (compte à rebours de 60 s, annulable).
+    Veille,
+    Eteindre,
 }
 
 impl Default for Settings {
@@ -74,6 +93,9 @@ impl Default for Settings {
                 chapters: true,
                 ..Default::default()
             },
+            plan_start: None,
+            plan_stop: None,
+            end_action: Fin::Rien,
         }
     }
 }
@@ -136,6 +158,9 @@ pub struct Entry {
     pub referrer: Option<String>,
     #[serde(default)]
     pub cookies: Option<String>,
+    /// Limite propre à ce téléchargement en Mo/s (0 = aucune), en plus de la globale.
+    #[serde(default)]
+    pub speed_limit_mb: f32,
 }
 
 /// Erreur d'un téléchargement commencé dont le `.part` a disparu (effacé à la main).
@@ -332,6 +357,7 @@ mod tests {
             kind: Kind::Http,
             referrer: None,
             cookies: None,
+            speed_limit_mb: 0.0,
         };
         // .part effacé à la main : ni reprise ni fichier recréé.
         for st in [Status::Running, Status::Queued, Status::Paused] {

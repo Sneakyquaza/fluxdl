@@ -89,6 +89,59 @@ pub fn url_web(url: &str) -> bool {
         && !url.chars().any(|c| c.is_control() || c == ' ' || c == '"')
 }
 
+/// Veille ou arrêt du PC : outil (`outil`) et arguments, construits sans rien lancer.
+pub fn commande_fin(eteindre: bool, windows: bool) -> (&'static str, &'static [&'static str]) {
+    match (windows, eteindre) {
+        (true, true) => ("shutdown", &["/s", "/t", "0"]),
+        (true, false) => ("rundll32", &["powrprof.dll,SetSuspendState", "0,1,0"]),
+        (false, true) => ("systemctl", &["poweroff"]),
+        (false, false) => ("systemctl", &["suspend"]),
+    }
+}
+
+/// Lance la veille ou l'arrêt du PC (`App` le reçoit en paramètre : les tests en mettent un faux).
+pub fn veille_ou_arret(eteindre: bool) {
+    let (nom, args) = commande_fin(eteindre, cfg!(windows));
+    if let Err(e) = commande(&outil(nom)).args(args).spawn() {
+        eprintln!("fluxdl: {nom}: {e}");
+    }
+}
+
+/// Minute de la journée à l'heure locale (0 à 1439).
+pub fn minute_locale() -> u16 {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        #[derive(Default)]
+        struct SystemTime {
+            annee: u16,
+            mois: u16,
+            jour_semaine: u16,
+            jour: u16,
+            heure: u16,
+            minute: u16,
+            seconde: u16,
+            ms: u16,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetLocalTime(t: *mut SystemTime);
+        }
+        let mut t = SystemTime::default();
+        unsafe { GetLocalTime(&mut t) };
+        t.heure * 60 + t.minute
+    }
+    #[cfg(not(windows))]
+    {
+        let maintenant = unsafe { libc::time(std::ptr::null_mut()) };
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if unsafe { libc::localtime_r(&maintenant, &mut tm) }.is_null() {
+            return 0;
+        }
+        (tm.tm_hour * 60 + tm.tm_min) as u16
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +173,22 @@ mod tests {
             assert!(p.is_absolute());
             assert!(p.ends_with(format!("System32\\{n}.exe")));
         }
+    }
+
+    /// 0.2.9 : veille et arrêt du PC construits sans être lancés.
+    #[test]
+    fn commandes_de_fin() {
+        assert_eq!(
+            commande_fin(true, true),
+            ("shutdown", &["/s", "/t", "0"][..])
+        );
+        assert_eq!(
+            commande_fin(false, true),
+            ("rundll32", &["powrprof.dll,SetSuspendState", "0,1,0"][..])
+        );
+        assert_eq!(commande_fin(true, false), ("systemctl", &["poweroff"][..]));
+        assert_eq!(commande_fin(false, false), ("systemctl", &["suspend"][..]));
+        assert!(minute_locale() < 1440);
     }
 
     #[test]
