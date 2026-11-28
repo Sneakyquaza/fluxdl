@@ -64,6 +64,8 @@ pub struct Settings {
     /// réussie (bouton « Extraire » compris).
     pub auto_extract: bool,
     pub extract_delete: bool,
+    /// « Réduire les animations » : aucune animation (durées à 0).
+    pub reduce_motion: bool,
 }
 
 /// Action quand tous les téléchargements sont finis.
@@ -108,6 +110,7 @@ impl Default for Settings {
             sort_folders: Default::default(),
             auto_extract: false,
             extract_delete: false,
+            reduce_motion: false,
         }
     }
 }

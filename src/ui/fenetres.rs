@@ -126,22 +126,46 @@ impl App {
 
     /// Voile sur toute la fenêtre (bloque les clics dessous) et fenêtre de verre centrée.
     pub(super) fn modale(&mut self, ctx: &egui::Context) {
-        if self.modale.is_none() {
+        // Voile en fondu : 0,2 s à l'ouverture, 0,12 s à la fermeture.
+        let ouverte = self.modale.is_some();
+        let v = anim::bool(ctx, egui::Id::unique("voile-fondu"), ouverte, 0.2, 0.12);
+        let ecran = ctx.content_rect();
+        if v > 0.0 {
+            egui::Area::new(egui::Id::unique("voile"))
+                .order(egui::Order::Middle)
+                .fixed_pos(ecran.min)
+                .fade_in(false)
+                .show(ctx, |ui| {
+                    let sens = if ouverte {
+                        Sense::click()
+                    } else {
+                        Sense::hover()
+                    };
+                    let (r, _) = ui.allocate_exact_size(ecran.size(), sens);
+                    ui.painter().rect_filled(r, 0.0, nuit((70.0 * v) as u8));
+                });
+        }
+        if !ouverte {
             return;
         }
-        let ecran = ctx.content_rect();
-        egui::Area::new(egui::Id::unique("voile"))
-            .order(egui::Order::Middle)
-            .fixed_pos(ecran.min)
-            .show(ctx, |ui| {
-                let (r, _) = ui.allocate_exact_size(ecran.size(), Sense::click());
-                ui.painter().rect_filled(r, 0.0, nuit(70));
-            });
+        // Ouverture : fondu et échelle 0,96 → 1 autour du centre (0,22 s, sortie quintique).
+        let a = anim::impulsion(ctx, egui::Id::unique("modale-ouvre"), true, 0.22, true)
+            .map_or(1.0, anim::sortie_quintique);
+        let couche = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("modale"));
+        let c = ecran.center().to_vec2();
+        ctx.set_transform_layer(
+            couche,
+            egui::emath::TSTransform::from_translation(c)
+                * egui::emath::TSTransform::from_scaling(0.96 + 0.04 * a)
+                * egui::emath::TSTransform::from_translation(-c),
+        );
         let mut fermer = false;
         egui::Area::new(egui::Id::unique("modale"))
             .order(egui::Order::Foreground)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .fade_in(false)
             .show(ctx, |ui| {
+                ui.multiply_opacity(a);
                 let fond = ui.painter().add(egui::Shape::Noop);
                 let rep = egui::Frame::NONE
                     .inner_margin(Margin::same(24))
@@ -1165,10 +1189,11 @@ impl App {
                         let (n, tot) = *p.lock().unwrap_or_else(|e| e.into_inner());
                         attente(ui, t(l, "Downloading and checking…"));
                         let (r, _) = ui.allocate_exact_size(vec2(LARGEUR, 14.0), Sense::hover());
+                        let v = n as f32 / tot.max(1) as f32;
                         jauge(
                             ui.painter(),
                             r,
-                            n as f32 / tot.max(1) as f32,
+                            anim::valeur(ui.ctx(), egui::Id::unique("jauge-outils"), v, 0.4),
                             rgb(0x3c, 0xbf, 0x2a),
                             true,
                         );
@@ -1400,11 +1425,16 @@ impl App {
         };
         let ecran = ctx.content_rect();
         let taille = vec2(380.0, 112.0);
-        let pos = ecran.max - taille - vec2(28.0, 26.0);
+        // Entrée : glisse depuis le bas à droite en fondu (0,35 s).
+        let a = anim::impulsion(ctx, egui::Id::unique("bulle-maj-entre"), true, 0.35, true)
+            .map_or(1.0, anim::sortie_quintique);
+        let pos = ecran.max - taille - vec2(28.0, 26.0) + vec2(36.0, 28.0) * (1.0 - a);
         egui::Area::new(egui::Id::unique("bulle-maj"))
             .order(egui::Order::Foreground)
             .fixed_pos(pos)
+            .fade_in(false)
             .show(ctx, |ui| {
+                ui.multiply_opacity(a);
                 let (r, _) = ui.allocate_exact_size(taille, Sense::hover());
                 let p = ui.painter();
                 p.add(lueur(
@@ -1463,10 +1493,11 @@ impl App {
                             pos2(x, bas.center().y - 6.0),
                             vec2(bas.width(), 12.0),
                         );
+                        let v = *n as f32 / (*tot).max(1) as f32;
                         jauge(
                             p,
                             j,
-                            *n as f32 / (*tot).max(1) as f32,
+                            anim::valeur(ui.ctx(), egui::Id::unique("jauge-maj"), v, 0.4),
                             rgb(0x3c, 0xbf, 0x2a),
                             true,
                         );
@@ -2010,7 +2041,7 @@ pub(super) fn boutons_avec(
         let rep = ui
             .scope_builder(UiBuilder::new().max_rect(b), |ui| {
                 ui.add_enabled_ui(actif, |ui| {
-                    bouton_gel(ui, ok, Some(icone), b.size(), couleur)
+                    bouton_gel_ouvert(ui, ok, Some(icone), b.size(), couleur, true)
                 })
                 .inner
             })
@@ -2045,13 +2076,18 @@ fn choix_radio(ui: &mut Ui, actif: bool, dispo: bool, nom: &str, droite: &str) -
     );
     let p = ui.painter().clone();
     let h = if dispo { survol(ui, &rep) } else { 0.0 };
-    selection(&p, r, 8.0, if actif { 1.0 } else { 0.45 * h });
+    // Choix en fondu : la sélection et l'orbe bleue montent, l'orbe grandit un peu.
+    let a = anim::bool(ui.ctx(), rep.id.with("choisi"), actif, 0.18, 0.14);
+    selection(&p, r, 8.0, a + (1.0 - a) * 0.45 * h);
     let c = pos2(r.left() + 18.0, r.center().y);
-    if actif {
-        orbe(&p, c, 7.5, GEL_BLEU);
-    } else {
+    if a < 1.0 {
         p.circle_filled(c, 7.5, blanc(230));
         p.circle_stroke(c, 7.5, Stroke::new(1.0, nuit(90)));
+    }
+    if a > 0.0 {
+        let mut po = p.clone();
+        po.multiply_opacity(a);
+        orbe(&po, c, 7.5 * (0.7 + 0.3 * a), GEL_BLEU);
     }
     let col = if dispo {
         TEXTE

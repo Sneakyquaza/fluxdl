@@ -309,6 +309,11 @@ const FR: &[(&str, &str)] = &[
     ),
     ("Language", "Langue"),
     ("Applies immediately.", "S'applique tout de suite."),
+    ("Reduce animations", "Réduire les animations"),
+    (
+        "No fades or movements. Also on when Windows animations are turned off.",
+        "Ni fondus ni mouvements. Aussi actif quand les animations de Windows sont coupées.",
+    ),
     ("MIT license, free and open source.", "licence MIT, libre et gratuit."),
     (
         "Up to 32 connections per file. Unfinished downloads resume where they stopped, even after a crash.",

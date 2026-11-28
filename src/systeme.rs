@@ -142,6 +142,25 @@ pub fn minute_locale() -> u16 {
     }
 }
 
+/// Animations coupées dans le système (Windows : « Afficher les animations dans Windows »
+/// désactivé). Linux : non lu (raccourci : réglage GNOME/KDE à lire par gsettings/kreadconfig
+/// si on le demande).
+pub fn animations_coupees() -> bool {
+    #[cfg(windows)]
+    {
+        const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
+        #[link(name = "user32")]
+        extern "system" {
+            fn SystemParametersInfoW(action: u32, param: u32, valeur: *mut i32, ini: u32) -> i32;
+        }
+        let mut on: i32 = 1;
+        let ok = unsafe { SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &mut on, 0) };
+        ok != 0 && on == 0
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

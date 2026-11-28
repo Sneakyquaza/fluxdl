@@ -9,6 +9,8 @@ use eframe::egui::{
 };
 use std::sync::{Arc, OnceLock};
 
+use super::anim;
+
 pub const fn rgb(r: u8, g: u8, b: u8) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
@@ -502,6 +504,16 @@ pub fn gel_de(c: Color32) -> Gel {
     }
 }
 
+/// Gel rendu transparent (fondu d'apparition).
+pub fn gel_alpha(g: Gel, a: f32) -> Gel {
+    Gel {
+        haut: g.haut.gamma_multiply(a),
+        bas: g.bas.gamma_multiply(a),
+        bord: g.bord.gamma_multiply(a),
+        lueur: g.lueur.gamma_multiply(a),
+    }
+}
+
 fn gel_mix(a: Gel, b: Gel, t: f32) -> Gel {
     Gel {
         haut: mix(a.haut, b.haut, t),
@@ -514,48 +526,61 @@ fn gel_mix(a: Gel, b: Gel, t: f32) -> Gel {
 /// Surface gel : dégradé, lueur intérieure en bas, reflet en haut, double liseré.
 /// `ombre` : petite ombre portée (boutons) ; `presse` : enfoncé (reflet atténué).
 pub fn gel(p: &egui::Painter, r: Rect, rayon: f32, g: Gel, ombre: bool, presse: bool) {
+    gel_anime(p, r, rayon, g, ombre, if presse { 1.0 } else { 0.0 }, 0.0);
+}
+
+/// `gel` animé : `presse` 0..1 (enfoncé d'1 px, ombre réduite, reflet atténué), `survol` 0..1
+/// (la lueur du bas monte et s'élargit, le reflet s'éclaircit).
+pub fn gel_anime(
+    p: &egui::Painter,
+    r: Rect,
+    rayon: f32,
+    g: Gel,
+    ombre: bool,
+    presse: f32,
+    survol: f32,
+) {
+    let r = r.translate(vec2(0.0, presse));
     if ombre {
         p.add(
             egui::Shadow {
-                offset: [0, 2],
+                offset: [0, if presse > 0.5 { 1 } else { 2 }],
                 blur: 6,
                 spread: 0,
-                color: nuit(if presse { 25 } else { 50 }),
+                color: nuit((50.0 - 25.0 * presse) as u8),
             }
             .as_shape(r, rayon),
         );
     }
-    let (haut, bas) = if presse {
-        (mix(g.haut, g.bas, 0.35), g.bas)
-    } else {
-        (g.haut, g.bas)
-    };
-    p.add(vdeg(r, rayon, haut, bas));
+    p.add(vdeg(r, rayon, mix(g.haut, g.bas, 0.35 * presse), g.bas));
     if r.height() >= 10.0 {
+        // Survol : la lueur monte, s'élargit (sans déborder dans les coins arrondis) et
+        // s'avive.
+        let (w, h) = (r.width(), r.height());
+        let large = egui::lerp(
+            (w - h * 0.9).max(w * 0.55)..=(w - h * 0.6).max(w * 0.6),
+            survol,
+        );
         let l = Rect::from_center_size(
-            pos2(r.center().x, r.bottom() - r.height() * 0.12),
-            vec2(
-                (r.width() - r.height() * 0.6).max(r.width() * 0.6),
-                r.height() * 0.5,
-            ),
+            pos2(r.center().x, r.bottom() - h * (0.12 + 0.08 * survol)),
+            vec2(large, h * (0.5 + 0.15 * survol)),
         );
         p.with_clip_rect(r.shrink(1.0)).add(lueur(
             l,
-            g.lueur.gamma_multiply(0.55),
-            r.height() * 0.45,
+            g.lueur.gamma_multiply(0.55 + 0.2 * survol),
+            h * 0.45,
         ));
     }
     let i = r.shrink2(vec2(1.5, 1.0));
-    p.add(reflet(
-        i,
-        (rayon - 1.0).max(0.0),
-        if presse { 0.45 } else { 0.95 },
-    ));
+    p.add(reflet(i, (rayon - 1.0).max(0.0), 0.95 - 0.5 * presse));
+    if survol > 0.0 {
+        p.add(reflet(i, (rayon - 1.0).max(0.0), 0.25 * survol));
+    }
     if r.height() >= 8.0 {
         p.rect_stroke(
             r.shrink(1.0),
             (rayon - 1.0).max(0.0),
-            Stroke::new(1.0, blanc(if presse { 40 } else { 95 })),
+            Stroke::new(1.0, blanc((95.0 - 55.0 * presse + 40.0 * survol) as u8)),
             StrokeKind::Inside,
         );
     }
@@ -960,8 +985,18 @@ pub fn pastille(ui: &Ui, gauche_centre: Pos2, t: &str, c: Color32) -> Rect {
 
 /// Fond de survol animé (0 → 1) d'un élément interactif.
 pub fn survol(ui: &Ui, r: &Response) -> f32 {
-    ui.ctx()
-        .animate_bool_with_time(r.id.with("survol"), r.hovered(), 0.12)
+    anim::bool(ui.ctx(), r.id.with("survol"), r.hovered(), 0.15, 0.22)
+}
+
+/// Enfoncement animé (0 → 1) : descend vite, remonte en douceur.
+fn pression(ui: &Ui, r: &Response) -> f32 {
+    anim::bool(
+        ui.ctx(),
+        r.id.with("presse"),
+        r.is_pointer_button_down_on(),
+        0.06,
+        0.2,
+    )
 }
 
 /// Sélection Windows 7 (ligne de liste choisie ou survolée) : dégradé bleu très clair,
@@ -1001,24 +1036,13 @@ pub fn selection(p: &egui::Painter, r: Rect, rayon: f32, force: f32) {
 pub fn bouton_icone_ici(ui: &Ui, r: Rect, id: egui::Id, i: Icone, aide: &str) -> Response {
     let rep = ui.interact(r, id, Sense::click());
     let h = survol(ui, &rep);
+    // Anneau du focus sous le bouton : le halo ne voile pas le gel.
+    anneau_focus(ui, &rep, r, r.height() / 2.0);
     let p = ui.painter();
     if h > 0.0 {
         let b = r.shrink(1.0);
-        let g = gel_mix(GEL_ARGENT, GEL_ARGENT_SURVOL, 0.6);
-        let g = Gel {
-            haut: g.haut.gamma_multiply(h),
-            bas: g.bas.gamma_multiply(h),
-            bord: g.bord.gamma_multiply(h),
-            lueur: g.lueur.gamma_multiply(h),
-        };
-        gel(
-            p,
-            b,
-            b.height() / 2.0,
-            g,
-            false,
-            rep.is_pointer_button_down_on(),
-        );
+        let g = gel_alpha(gel_mix(GEL_ARGENT, GEL_ARGENT_SURVOL, 0.6), h);
+        gel_anime(p, b, b.height() / 2.0, g, false, pression(ui, &rep), 0.0);
     }
     let c = mix(TEXTE2, TEXTE, h);
     icone(
@@ -1027,7 +1051,6 @@ pub fn bouton_icone_ici(ui: &Ui, r: Rect, id: egui::Id, i: Icone, aide: &str) ->
         i,
         c,
     );
-    anneau_focus(ui, &rep, r, r.height() / 2.0);
     rep.on_hover_text(aide)
 }
 
@@ -1137,27 +1160,72 @@ fn etiquette(p: &egui::Painter, r: Rect, t: &str, i: Option<Icone>, relief: bool
 
 /// Bouton gel coloré (bleu ou vert) : halo de la couleur au survol, texte blanc en relief.
 pub fn bouton_gel(ui: &mut Ui, t: &str, i: Option<Icone>, taille: Vec2, g: Gel) -> Response {
+    bouton_gel_ouvert(ui, t, i, taille, g, false)
+}
+
+/// `bouton_gel` ; `a_l_ouverture` : le reflet balaie aussi quand le bouton apparaît (bouton
+/// principal d'une fenêtre qui s'ouvre), pas seulement quand il devient disponible.
+pub fn bouton_gel_ouvert(
+    ui: &mut Ui,
+    t: &str,
+    i: Option<Icone>,
+    taille: Vec2,
+    g: Gel,
+    a_l_ouverture: bool,
+) -> Response {
     let (r, rep) = ui.allocate_exact_size(taille, Sense::click());
     let h = survol(ui, &rep);
+    let pr = pression(ui, &rep);
+    // Anneau du focus sous le bouton : le halo ne voile pas le gel.
+    anneau_focus(ui, &rep, r, r.height() / 2.0);
     let p = ui.painter();
     if h > 0.0 {
-        p.add(lueur(r.expand(4.0), g.lueur.gamma_multiply(0.6 * h), 10.0));
+        p.add(lueur(
+            r.expand(3.0 + 2.0 * h),
+            g.lueur.gamma_multiply(0.55 * h * (1.0 - 0.5 * pr)),
+            10.0,
+        ));
     }
     let g = Gel {
         haut: mix(g.haut, Color32::WHITE, 0.12 * h),
         ..g
     };
-    gel(
-        p,
-        r,
-        r.height() / 2.0,
-        g,
-        true,
-        rep.is_pointer_button_down_on(),
-    );
-    etiquette(p, r, t, i, true, Color32::WHITE);
-    anneau_focus(ui, &rep, r, r.height() / 2.0);
+    gel_anime(p, r, r.height() / 2.0, g, true, pr, h);
+    let rb = r.translate(vec2(0.0, pr));
+    if let Some(k) = anim::impulsion(
+        ui.ctx(),
+        rep.id.with("balai"),
+        ui.is_enabled(),
+        0.9,
+        a_l_ouverture,
+    ) {
+        balai(p, rb, k);
+    }
+    etiquette(p, rb, t, i, true, Color32::WHITE);
     rep
+}
+
+/// Reflet qui balaie une fois un bouton gel (`k` : 0 → 1), oblique, plus fort au milieu.
+fn balai(p: &egui::Painter, r: Rect, k: f32) {
+    // Entrée et sortie douces : le reflet traverse à vitesse régulière au milieu.
+    let k = 0.5 - 0.5 * (std::f32::consts::PI * k).cos();
+    let bande = (r.height() * 1.1).max(28.0);
+    let x = r.left() - bande + (r.width() + bande * 2.0) * k;
+    // Plus faible près des bouts arrondis : ni coupure nette ni débord dans les coins.
+    let bout = r.height();
+    let a = ((x - r.left()) / bout).clamp(0.0, 1.0) * ((r.right() - x) / bout).clamp(0.0, 1.0);
+    let clip = p.with_clip_rect(r.shrink(1.5).intersect(p.clip_rect()));
+    let haut = Rect::from_center_size(
+        pos2(x + bande * 0.15, r.top() + r.height() * 0.3),
+        vec2(bande * 0.55, r.height() * 0.7),
+    );
+    let bas = Rect::from_center_size(
+        pos2(x - bande * 0.15, r.top() + r.height() * 0.7),
+        vec2(bande * 0.55, r.height() * 0.7),
+    );
+    for b in [haut, bas] {
+        clip.add(lueur(b, blanc((150.0 * a) as u8), bande * 0.3));
+    }
 }
 
 /// Bouton principal : gel bleu.
@@ -1169,38 +1237,53 @@ pub fn bouton_principal(ui: &mut Ui, t: &str, i: Option<Icone>, taille: Vec2) ->
 pub fn bouton_secondaire(ui: &mut Ui, t: &str, i: Option<Icone>, taille: Vec2) -> Response {
     let (r, rep) = ui.allocate_exact_size(taille, Sense::click());
     let h = survol(ui, &rep);
+    let pr = pression(ui, &rep);
+    // Anneau du focus sous le bouton : le halo ne voile pas le gel.
+    anneau_focus(ui, &rep, r, r.height() / 2.0);
     let p = ui.painter();
-    gel(
+    gel_anime(
         p,
         r,
         r.height() / 2.0,
         gel_mix(GEL_ARGENT, GEL_ARGENT_SURVOL, h),
         true,
-        rep.is_pointer_button_down_on(),
+        pr,
+        0.5 * h,
     );
-    etiquette(p, r, t, i, false, TEXTE);
-    anneau_focus(ui, &rep, r, r.height() / 2.0);
+    etiquette(p, r.translate(vec2(0.0, pr)), t, i, false, TEXTE);
     rep
 }
 
 /// Anneau autour d'un élément qui a le focus clavier : blanc puis bleu, visible sur le verre
-/// comme sur un bouton bleu ou vert.
+/// comme sur un bouton bleu ou vert ; halo aqua qui pulse deux fois à l'arrivée du focus puis
+/// reste fixe (pas d'image au repos).
 fn anneau_focus(ui: &Ui, rep: &Response, r: Rect, rayon: f32) {
-    if rep.has_focus() {
-        let p = ui.painter();
-        p.rect_stroke(
-            r.expand(1.0),
-            rayon + 1.0,
-            Stroke::new(1.5, Color32::WHITE),
-            StrokeKind::Outside,
-        );
-        p.rect_stroke(
-            r.expand(2.5),
-            rayon + 2.5,
-            Stroke::new(2.0, ACCENT),
-            StrokeKind::Outside,
-        );
+    let a = anim::bool(ui.ctx(), rep.id.with("focus"), rep.has_focus(), 0.18, 0.12);
+    let pouls = anim::impulsion(ui.ctx(), rep.id.with("pouls"), rep.has_focus(), 1.4, true)
+        .map_or(0.0, |k| {
+            (std::f32::consts::PI * 2.0 * k).sin().powi(2) * (1.0 - k)
+        });
+    if a <= 0.0 {
+        return;
     }
+    let p = ui.painter();
+    p.add(lueur(
+        r.expand(4.0 + 2.0 * pouls),
+        rgb(0x5c, 0xc8, 0xff).gamma_multiply(a * (0.45 + 0.4 * pouls)),
+        8.0,
+    ));
+    p.rect_stroke(
+        r.expand(1.0),
+        rayon + 1.0,
+        Stroke::new(1.5, Color32::WHITE.gamma_multiply(a)),
+        StrokeKind::Outside,
+    );
+    p.rect_stroke(
+        r.expand(2.5),
+        rayon + 2.5,
+        Stroke::new(2.0, ACCENT.gamma_multiply(a)),
+        StrokeKind::Outside,
+    );
 }
 
 /// Bouton rond brillant (curseur, interrupteur).
@@ -1217,19 +1300,23 @@ pub fn interrupteur(ui: &mut Ui, on: &mut bool) -> Response {
         *on = !*on;
         rep.mark_changed();
     }
-    let a = ui.ctx().animate_bool_with_time(rep.id, *on, 0.16);
+    let v = anim::progres(ui.ctx(), rep.id, *on, 0.24, 0.24);
+    // Couleur en fondu, bouton qui glisse avec un ressort léger.
+    let (a, k) = if *on {
+        (anim::sortie_cubique(v), anim::ressort(v))
+    } else {
+        (
+            1.0 - anim::sortie_cubique(1.0 - v),
+            1.0 - anim::ressort(1.0 - v),
+        )
+    };
     let h = survol(ui, &rep);
+    // Anneau du focus sous le bouton : le halo ne voile pas le gel.
+    anneau_focus(ui, &rep, r, 12.0);
     let p = ui.painter();
     creux(p, r, 12.0);
     if a > 0.0 {
-        let g = GEL_BLEU;
-        let g = Gel {
-            haut: g.haut.gamma_multiply(a),
-            bas: g.bas.gamma_multiply(a),
-            bord: g.bord.gamma_multiply(a),
-            lueur: g.lueur.gamma_multiply(a),
-        };
-        gel(p, r, 12.0, g, false, false);
+        gel(p, r, 12.0, gel_alpha(GEL_BLEU, a), false, false);
     }
     p.rect_stroke(
         r,
@@ -1237,9 +1324,8 @@ pub fn interrupteur(ui: &mut Ui, on: &mut bool) -> Response {
         Stroke::new(1.0, nuit((70.0 * (1.0 - a)) as u8)),
         StrokeKind::Inside,
     );
-    let x = egui::lerp(r.left() + 12.0..=r.right() - 12.0, a);
+    let x = egui::lerp(r.left() + 12.0..=r.right() - 12.0, k);
     bouton_rond(p, pos2(x, r.center().y), 10.0, h);
-    anneau_focus(ui, &rep, r, 12.0);
     rep
 }
 
@@ -1251,9 +1337,7 @@ pub fn segmente<T: PartialEq + Copy>(ui: &mut Ui, v: &mut T, options: &[(T, &str
     let p = ui.painter().clone();
     gel(&p, r, 17.0, GEL_ARGENT, true, false);
     let i = options.iter().position(|o| o.0 == *v).unwrap_or(0);
-    let x = ui
-        .ctx()
-        .animate_value_with_time(rep.id.with("glisse"), i as f32, 0.18);
+    let x = anim::valeur(ui.ctx(), rep.id.with("glisse"), i as f32, 0.22);
     let sel = Rect::from_min_size(pos2(r.left() + 3.0 + x * l, r.top() + 3.0), vec2(l, 28.0));
     gel(&p, sel, 14.0, GEL_BLEU, false, false);
     for (k, (val, nom)) in options.iter().enumerate() {
@@ -1431,20 +1515,28 @@ pub fn coche(ui: &mut Ui, on: &mut bool, t: &str, droite: &str) -> Response {
     let p = ui.painter();
     selection(p, r, 6.0, 0.45 * h);
     let b = Rect::from_center_size(pos2(r.left() + 14.0, r.center().y), Vec2::splat(16.0));
-    if *on {
+    // Coche en fondu : le gel bleu monte sur le creux, la coche grandit un peu.
+    let a = anim::bool(ui.ctx(), rep.id.with("coche"), *on, 0.16, 0.12);
+    if a < 1.0 {
+        creux(p, b, 4.0);
+        p.rect_stroke(b, 4.0, Stroke::new(1.0, nuit(90)), StrokeKind::Inside);
+    }
+    if a > 0.0 {
+        let mut p = p.clone();
+        p.multiply_opacity(a);
+        let p = &p;
         gel(p, b, 4.0, GEL_BLEU, false, false);
+        let c = b.center();
+        let e = 0.8 + 0.2 * a;
         trait_(
             p,
             &[
-                b.min + vec2(3.8, 8.3),
-                b.min + vec2(6.8, 11.3),
-                b.min + vec2(12.2, 4.8),
+                c + (vec2(3.8, 8.3) - vec2(8.0, 8.0)) * e,
+                c + (vec2(6.8, 11.3) - vec2(8.0, 8.0)) * e,
+                c + (vec2(12.2, 4.8) - vec2(8.0, 8.0)) * e,
             ],
             Stroke::new(2.0, Color32::WHITE),
         );
-    } else {
-        creux(p, b, 4.0);
-        p.rect_stroke(b, 4.0, Stroke::new(1.0, nuit(90)), StrokeKind::Inside);
     }
     let dw = p
         .layout_no_wrap(droite.to_string(), regulier(12.5), TEXTE3)
@@ -1509,9 +1601,7 @@ pub fn connexions(
             r.left() + 28.0..=droite - if vole_ici { bv + 8.0 } else { 0.0 },
             r.center().y - 3.5..=r.center().y + 3.5,
         );
-        let frac = ui
-            .ctx()
-            .animate_value_with_time(rep.id.with("frac"), frac, 0.45);
+        let frac = anim::valeur(ui.ctx(), rep.id.with("frac"), frac, 0.4);
         let cj = if actif {
             c
         } else {
@@ -1730,9 +1820,7 @@ pub fn curseur(
         teinte(0.55),
         false,
     );
-    let h = ui
-        .ctx()
-        .animate_bool_with_time(rep.id, rep.hovered() || rep.dragged(), 0.12);
+    let h = anim::bool(ui.ctx(), rep.id, rep.hovered() || rep.dragged(), 0.15, 0.22);
     let c = pos2(x, r.center().y);
     if h > 0.0 {
         p.add(lueur(

@@ -1,6 +1,7 @@
 //! Fenêtre egui : barre latérale, file de téléchargements, panneau de détail par connexion,
 //! comparatif, réglages.
 
+mod anim;
 mod draw;
 mod fenetres;
 mod guide;
@@ -289,6 +290,8 @@ pub struct App {
     now: f64,
     /// Instant d'ajout de chaque nouveau téléchargement (apparition en fondu).
     born: HashMap<u64, f64>,
+    /// Cartes retirées de la liste (place, entrée, depuis) : fondu et repli de hauteur.
+    partants: Vec<(usize, Entry, f64)>,
     /// Carte d'astuces : (actuelle, précédente, depuis quand).
     astuce: (usize, usize, f64),
     /// Sélecteur de dossier ouvert dans un fil.
@@ -404,6 +407,7 @@ impl App {
             logo,
             now: 0.0,
             born: HashMap::new(),
+            partants: Vec::new(),
             astuce: (0, 0, 0.0),
             picker: None,
             picker_torrent: None,
@@ -656,7 +660,14 @@ impl App {
             speed_limit_mb: 0.0,
         });
         self.selected = Some(self.next_id);
-        self.born.insert(self.next_id, self.now);
+        // Plusieurs ajouts d'un coup : apparitions en cascade (35 ms), 0,4 s au plus.
+        let depart = self
+            .born
+            .values()
+            .filter(|b| **b > self.now - 0.5)
+            .fold(self.now, |m, b| m.max(b + anim::duree(0.035) as f64))
+            .min(self.now + anim::duree(0.4) as f64);
+        self.born.insert(self.next_id, depart);
         self.next_id += 1;
         self.tab = Tab::Downloads;
         self.entries.last_mut().expect("entrée ajoutée")
@@ -1519,9 +1530,7 @@ impl App {
         let pas = 42.0;
         let (zone, _) = ui.allocate_exact_size(vec2(w, pas * items.len() as f32), Sense::hover());
         let idx = items.iter().position(|i| i.0 == self.tab).unwrap_or(0) as f32;
-        let y = ui
-            .ctx()
-            .animate_value_with_time(egui::Id::unique("nav"), idx, 0.18);
+        let y = anim::valeur(ui.ctx(), egui::Id::unique("nav"), idx, 0.25);
         let ind = Rect::from_min_size(pos2(zone.left(), zone.top() + y * pas), vec2(w, 38.0));
         let p = ui.painter().clone();
         selection(&p, ind, 8.0, 1.0);
@@ -1711,13 +1720,27 @@ impl App {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 10.0;
-                if self.entries.is_empty() {
+                // Cartes retirées : fondu et repli de hauteur (0,22 s), à leur ancienne place.
+                let d = anim::duree(0.22) as f64;
+                let now = self.now;
+                self.partants.retain(|p| now - p.2 < d);
+                if self.entries.is_empty() && self.partants.is_empty() {
                     self.empty_list(ui);
                 }
-                for (i, e) in self.entries.iter().enumerate() {
+                for i in 0..=self.entries.len() {
+                    for (_, e, t) in self.partants.iter().filter(|p| p.0 == i) {
+                        self.carte_partante(ui, e, ((now - t) / d) as f32);
+                    }
+                    let Some(e) = self.entries.get(i) else {
+                        break;
+                    };
                     if let Some(a) = self.entry_card(ui, e) {
                         action = Some((i, a));
                     }
+                }
+                // Places au-delà de la fin (plusieurs retraits).
+                for (_, e, t) in self.partants.iter().filter(|p| p.0 > self.entries.len()) {
+                    self.carte_partante(ui, e, ((now - t) / d) as f32);
                 }
                 ui.add_space(14.0);
             });
@@ -2370,28 +2393,64 @@ impl App {
         });
     }
 
+    /// Carte qui quitte la liste (`k` : 0 → 1) : fondu, hauteur repliée, sans action.
+    fn carte_partante(&self, ui: &mut Ui, e: &Entry, k: f32) {
+        ui.ctx().request_repaint();
+        let a = anim::sortie_cubique(k);
+        let w = ui.available_width();
+        // Carte (84 px) + espacement (10 px) qui se replient ensemble.
+        let h = 94.0 * (1.0 - a);
+        let (r, _) = ui.allocate_exact_size(vec2(w, (h - 10.0).max(0.0)), Sense::hover());
+        if h < 10.0 {
+            ui.add_space(h - 10.0);
+        }
+        let mut c = ui
+            .new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(r.min, vec2(w, 84.0))));
+        c.set_clip_rect(r.expand2(vec2(12.0, 0.0)).intersect(ui.clip_rect()));
+        // Le fondu finit avant le repli : pas de bande de verre tronquée à la fin.
+        c.multiply_opacity(1.0 - anim::sortie_cubique(k * 1.6));
+        let _ = self.entry_card(&mut c, e);
+    }
+
     fn entry_card(&self, ui: &mut Ui, e: &Entry) -> Option<Act> {
         let l = self.settings.lang;
         let job = self.jobs.get(&e.id);
         let (etat, ce) = self.status_label(e);
         let mut action = None;
-        let apparition = self
-            .born
-            .get(&e.id)
-            .map_or(1.0, |b| ((self.now - b) / 0.35).clamp(0.0, 1.0) as f32);
+        // Apparition : fondu et glissement de 8 px vers le haut (0,35 s, sortie cubique).
+        let apparition = self.born.get(&e.id).map_or(1.0, |b| {
+            ((self.now - b) as f32 / anim::duree(0.35).max(f32::EPSILON)).clamp(0.0, 1.0)
+        });
         if apparition < 1.0 {
             ui.ctx().request_repaint();
         }
-        let a = 1.0 - (1.0 - apparition).powi(3);
+        let a = anim::sortie_cubique(apparition);
         ui.scope(|ui| {
             ui.multiply_opacity(a);
             let w = ui.available_width();
             let (r, rep) = ui.allocate_exact_size(vec2(w, 84.0), Sense::click());
-            let r = r.translate(vec2(0.0, 10.0 * (1.0 - a)));
+            let r = r.translate(vec2(0.0, 8.0 * (1.0 - a)));
             let sel = self.selected == Some(e.id);
             let h = survol(ui, &rep);
             let p = ui.painter().clone();
             p.add(verre(ui.ctx(), r, 12, 0.66 + 0.1 * h));
+            // Terminé : bref éclat vert doux sur la bordure (pas au lancement de l'appli).
+            if let Some(k) = anim::impulsion(
+                ui.ctx(),
+                egui::Id::unique(("fini", e.id)),
+                e.status == Status::Done,
+                0.9,
+                false,
+            ) {
+                let f = (std::f32::consts::PI * k.sqrt()).sin();
+                p.add(lueur(r.expand(2.0), SUCCES.gamma_multiply(0.35 * f), 10.0));
+                p.rect_stroke(
+                    r,
+                    12,
+                    Stroke::new(1.5, mix(SUCCES, Color32::WHITE, 0.35).gamma_multiply(f)),
+                    StrokeKind::Inside,
+                );
+            }
             // Choisie : sélection Windows 7 par-dessus le verre.
             selection(&p, r.shrink(3.0), 9.0, if sel { 1.0 } else { 0.35 * h });
             // Pas encore de nom (échec avant la sonde) : fin du chemin plutôt que l'URL entière.
@@ -2468,9 +2527,7 @@ impl App {
                 (Some(s), _) if s > 0 => e.done as f32 / s as f32,
                 _ => 0.0,
             };
-            let fa = ui
-                .ctx()
-                .animate_value_with_time(rep.id.with("progres"), frac, 0.5);
+            let fa = anim::valeur(ui.ctx(), egui::Id::unique(("progres", e.id)), frac, 0.4);
             let barre = Rect::from_min_size(pos2(x0, r.top() + 42.0), vec2(x1 - x0, 9.0));
             match e.status {
                 // Barre de progression Vista : vert, reflet qui balaie.
@@ -2642,7 +2699,8 @@ impl App {
                     self.hist_sale = true;
                 }
                 delete_parts(&self.entries[i], false);
-                self.entries.remove(i);
+                let e = self.entries.remove(i);
+                self.partants.push((i, e, self.now));
                 self.born.remove(&id);
                 self.jobs.remove(&id);
                 if self.selected == Some(id) {
@@ -2659,6 +2717,7 @@ impl App {
             return;
         };
         let e = self.entries.remove(i);
+        self.partants.push((i, e.clone(), self.now));
         self.born.remove(&id);
         if self.selected == Some(id) {
             self.selected = None;
@@ -3127,6 +3186,7 @@ impl App {
                 TEXTE2,
             );
             let (r, _) = ui.allocate_exact_size(vec2(w, 10.0), Sense::hover());
+            let frac = anim::valeur(ui.ctx(), egui::Id::unique(("outil", titre)), frac, 0.4);
             jauge(ui.painter(), r, frac, ACCENT, true);
         };
         let message = |ui: &mut Ui, m: &str, c: Color32| {
@@ -3613,6 +3673,15 @@ impl App {
                                 &mut self.settings.lang,
                                 &[(Lang::En, "English"), (Lang::Fr, "Français")],
                             );
+                        },
+                    );
+                    separateur(ui);
+                    reglage(
+                        ui,
+                        t(l, "Reduce animations"),
+                        t(l, "No fades or movements. Also on when Windows animations are turned off."),
+                        |ui| {
+                            interrupteur(ui, &mut self.settings.reduce_motion);
                         },
                     );
                 });
@@ -4694,6 +4763,16 @@ impl eframe::App for App {
             }
         }
         self.capture_step(&ctx);
+        // « Réduire les animations » : nos durées et celles d'egui (fondus des zones) à 0.
+        // Captures (--capture) : sans animation, chaque vue est prise dans son état final.
+        let a = if anim::reduire(self.settings.reduce_motion || self.capture.is_some()) {
+            0.0
+        } else {
+            anim::duree(0.2)
+        };
+        if ctx.global_style().animation_time != a {
+            ctx.global_style_mut(|s| s.animation_time = a);
+        }
         let ecran = ctx.content_rect();
         fond(&ctx.layer_painter(egui::LayerId::background()), ecran);
         // Panneaux de verre posés sur le fond, à 12 px des bords de la fenêtre.
@@ -4783,11 +4862,20 @@ impl eframe::App for App {
                     top: 22,
                     bottom: 0,
                 }))
-                .show(ui, |ui| match self.tab {
-                    Tab::Downloads => self.downloads(ui),
-                    Tab::History => self.page_historique(ui),
-                    Tab::Benchmark => self.benchmark(ui),
-                    Tab::Settings => self.settings_tab(ui),
+                .show(ui, |ui| {
+                    // Changement de page : fondu et glissement de 6 px vers le haut (0,15 s).
+                    let id = egui::Id::unique(("page", self.tab as u8));
+                    if let Some(k) = anim::impulsion(&ctx, id, true, 0.15, true) {
+                        let a = anim::sortie_cubique(k);
+                        ui.multiply_opacity(a);
+                        ui.add_space(6.0 * (1.0 - a));
+                    }
+                    match self.tab {
+                        Tab::Downloads => self.downloads(ui),
+                        Tab::History => self.page_historique(ui),
+                        Tab::Benchmark => self.benchmark(ui),
+                        Tab::Settings => self.settings_tab(ui),
+                    }
                 });
         }
         self.modale(&ctx);
