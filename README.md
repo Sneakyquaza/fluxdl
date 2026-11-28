@@ -56,6 +56,15 @@ A free, open-source multi-connection download manager (Windows + Linux, single e
   files (asked on the first torrent, toggle in Settings, current user only).
 - **Browser extension** (below).
 
+### New in 0.2.9
+- **Videos:** one progress bar for picture + sound, real name from the start, Stop works at every step. Subtitles (language, embedded or .srt), embedded thumbnail and chapters, MP4 or original, MP3.
+- **Playlists and channels:** paste a YouTube playlist or channel, tick the videos you want.
+- **Speed limit** (global and per download, live) and **scheduler** (start/stop time, close, sleep or shut down when done, with a 60 s cancelable countdown).
+- **After download:** optional sorting into folders by type, zip/7z extraction, SHA-256 check.
+- **Grab all links of a page** from the extension, with type/extension filters.
+- **History** with search, filters and Retry.
+- **Smoother Aero:** animated gel buttons, cards, sidebar and windows ("Reduce animations" in Settings); clearer error messages; usable at 900×600.
+
 ### New in 0.2.8
 - **Faster videos.** When yt-dlp finds direct links (YouTube), the picture and the sound are
   each split across your connections like a normal file (per-connection gauges, pause and
