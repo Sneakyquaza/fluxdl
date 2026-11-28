@@ -10,6 +10,16 @@ pub enum Lang {
     Fr,
 }
 
+impl Lang {
+    /// Code de langue (sous-titres dans la langue de l'interface).
+    pub fn code(self) -> &'static str {
+        match self {
+            Lang::En => "en",
+            Lang::Fr => "fr",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -36,6 +46,9 @@ pub struct Settings {
     /// Vidéo envoyée par l'extension fenêtre réduite : ajoutée sans question dans cette qualité
     /// (fenêtre visible : choix du format, cette qualité cochée d'avance).
     pub video_quality: crate::video::Qualite,
+    /// Sous-titres, miniature, chapitres, conteneur : derniers choix de la fenêtre des formats
+    /// (langue des sous-titres non gardée : celle de l'interface si la vidéo l'a).
+    pub video_options: crate::video::Sortie,
 }
 
 impl Default for Settings {
@@ -55,6 +68,12 @@ impl Default for Settings {
             clipboard_watch: true,
             extension_asked: false,
             video_quality: crate::video::Qualite::Best,
+            // Miniature et chapitres intégrés (sans ffmpeg, ignorés au téléchargement).
+            video_options: crate::video::Sortie {
+                thumbnail: true,
+                chapters: true,
+                ..Default::default()
+            },
         }
     }
 }
@@ -85,6 +104,9 @@ pub enum Kind {
         from_start: bool,
         #[serde(default)]
         login: bool,
+        /// Sous-titres, miniature, chapitres, conteneur (absent avant 0.2.9 : rien d'ajouté).
+        #[serde(default)]
+        options: crate::video::Sortie,
     },
     /// `.torrent` gardé sous `torrents/<hash>.torrent` ; `started` : fichiers déjà à nous
     /// (reprise permise), `files` : fichiers choisis (tous si aucun).

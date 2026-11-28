@@ -165,6 +165,8 @@ enum Modale {
         de: String,
         a: String,
         debut: bool,
+        /// Sous-titres, miniature, chapitres, conteneur (défaut : réglages).
+        sortie: video::Sortie,
     },
     /// Outils vidéo manquants ; `url` : vidéo à ouvrir ensuite (vide depuis les réglages).
     Outils { url: String, etat: EtatOutils },
@@ -525,6 +527,7 @@ impl App {
             de: String::new(),
             a: String::new(),
             debut: false,
+            sortie: self.settings.video_options.clone(),
         });
     }
 
@@ -571,6 +574,11 @@ impl App {
                     section: None,
                     from_start: false,
                     login,
+                    // Sous-titres du site dans la langue de l'interface (absents : rien).
+                    options: video::Sortie {
+                        sub_lang: Some(self.settings.lang.code().into()),
+                        ..self.settings.video_options.clone()
+                    },
                 },
             );
             return Statut::Ajoute;
@@ -633,6 +641,7 @@ impl App {
                 section,
                 from_start,
                 login,
+                options,
             } => {
                 let o = self.outils.clone();
                 let n = e.connections;
@@ -641,6 +650,7 @@ impl App {
                     estimation: estimate,
                     section,
                     debut: from_start,
+                    sortie: options,
                 };
                 let jarre = self.jarres.get(&url).cloned();
                 std::thread::spawn(move || {
@@ -2293,7 +2303,7 @@ impl App {
         let f = *frame;
         let dir = dir.clone();
         // Assez d'images entre le changement de vue et la capture pour finir les animations.
-        let vues: [(Tab, Lang, &str); 20] = [
+        let vues: [(Tab, Lang, &str); 21] = [
             (Tab::Downloads, Lang::En, "downloads"),
             (Tab::Benchmark, Lang::En, "benchmark"),
             (Tab::Settings, Lang::En, "settings"),
@@ -2302,6 +2312,7 @@ impl App {
             (Tab::Settings, Lang::Fr, "settings_extension_fr"),
             (Tab::Downloads, Lang::Fr, "video_formats_fr"),
             (Tab::Downloads, Lang::Fr, "video_live_fr"),
+            (Tab::Downloads, Lang::En, "video_options_en"),
             (Tab::Settings, Lang::Fr, "settings_video_fr"),
             (Tab::Downloads, Lang::Fr, "torrent_pieces_fr"),
             (Tab::Downloads, Lang::Fr, "video_tools_fr"),
@@ -2375,11 +2386,55 @@ impl App {
                             ch(video::Qualite::Mp3, true, 10_300_000),
                         ],
                         en_direct: false,
+                        sous_titres: demo_sous_titres(),
                     })),
                     choix: video::Qualite::P1080,
                     de: "00:02:00".into(),
                     a: "00:05:30".into(),
                     debut: false,
+                    sortie: video::Sortie {
+                        subtitles: true,
+                        sub_lang: Some("fr".into()),
+                        thumbnail: true,
+                        chapters: true,
+                        ..Default::default()
+                    },
+                });
+            }
+            "video_options_en" => {
+                // Sous-titres automatiques en .srt, MP4.
+                self.outils.ffmpeg = Some(PathBuf::from("ffmpeg"));
+                self.modale = Some(Modale::Video {
+                    url: "https://www.youtube.com/watch?v=aqz-KE-bpKQ".into(),
+                    rx: None,
+                    infos: Some(Ok(video::Infos {
+                        titre: "Big Buck Bunny 60fps 4K - Official Blender Foundation Short Film"
+                            .into(),
+                        duree: Some(634.0),
+                        hauteur_max: 2160,
+                        choix: vec![
+                            (video::Qualite::Best, true, Some(2_431_000_000)),
+                            (video::Qualite::P1080, true, Some(402_000_000)),
+                            (video::Qualite::P720, true, Some(188_000_000)),
+                            (video::Qualite::M4a, true, Some(10_300_000)),
+                            (video::Qualite::Mp3, true, Some(10_300_000)),
+                        ],
+                        en_direct: false,
+                        sous_titres: demo_sous_titres(),
+                    })),
+                    choix: video::Qualite::Best,
+                    de: String::new(),
+                    a: String::new(),
+                    debut: false,
+                    sortie: video::Sortie {
+                        subtitles: true,
+                        sub_lang: Some("de".into()),
+                        sub_auto: true,
+                        srt: true,
+                        thumbnail: true,
+                        chapters: false,
+                        mp4: true,
+                    },
                 });
             }
             "video_live_fr" => {
@@ -2402,14 +2457,16 @@ impl App {
                             (video::Qualite::Mp3, true, None),
                         ],
                         en_direct: true,
+                        sous_titres: Vec::new(),
                     })),
                     choix: video::Qualite::Best,
                     de: String::new(),
                     a: String::new(),
                     debut: true,
+                    sortie: video::Sortie::default(),
                 });
             }
-            "settings_video_fr" => self.defile = Some(900.0),
+            "settings_video_fr" => self.defile = Some(1150.0),
             "torrent_pieces_fr" => self.selected = Some(5),
             "cancel_fr" => {
                 self.modale = Some(Modale::Annuler {
@@ -2622,6 +2679,7 @@ impl App {
             section: None,
             from_start: false,
             login: false,
+            options: video::Sortie::default(),
         };
         self.entries.insert(1, tor);
         self.entries.insert(3, vid);
@@ -3032,6 +3090,25 @@ fn reglage(ui: &mut Ui, titre: &str, aide: &str, controle: impl FnOnce(&mut Ui))
     );
     // Contrôle vide (ex. yt-dlp sous Linux) : la ligne suivante reste sous celle-ci.
     ui.advance_cursor_after_rect(r);
+}
+
+/// Sous-titres des captures de la fenêtre des formats.
+fn demo_sous_titres() -> Vec<video::SousTitre> {
+    [
+        ("en", "English", false),
+        ("fr", "Français", false),
+        ("de", "Deutsch", true),
+        ("en", "English", true),
+        ("es", "Español", true),
+        ("fr", "Français", true),
+    ]
+    .into_iter()
+    .map(|(c, n, auto)| video::SousTitre {
+        code: c.into(),
+        nom: n.into(),
+        auto,
+    })
+    .collect()
 }
 
 /// Titre au-dessus d'une carte de réglages.

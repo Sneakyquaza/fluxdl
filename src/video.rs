@@ -77,20 +77,12 @@ impl Qualite {
     pub fn args(self) -> Vec<&'static str> {
         match self {
             Qualite::Best => vec!["-f", "bv*+ba/b"],
-            Qualite::P1080 => vec![
-                "-f",
-                "bv*[height<=1080]+ba/b[height<=1080]/b",
-                "--merge-output-format",
-                "mp4",
-            ],
-            Qualite::P720 => vec![
-                "-f",
-                "bv*[height<=720]+ba/b[height<=720]/b",
-                "--merge-output-format",
-                "mp4",
-            ],
-            // Pas de son seul (formats image + son ensemble) : son extrait du meilleur format
-            Qualite::M4a => vec!["-f", "ba[ext=m4a]/ba/b", "-x", "--audio-format", "m4a"],
+            // Conteneur : MP4 ou original selon `Sortie::mp4`.
+            Qualite::P1080 => vec!["-f", "bv*[height<=1080]+ba/b[height<=1080]/b"],
+            Qualite::P720 => vec!["-f", "bv*[height<=720]+ba/b[height<=720]/b"],
+            // Pas de son seul (formats image + son ensemble) : son extrait du meilleur format.
+            // M4a = son original sans conversion (M4A ou Opus, nom gardé pour queue.json).
+            Qualite::M4a => vec!["-f", "ba/b", "-x"],
             Qualite::Mp3 => vec![
                 "-f",
                 "ba/b",
@@ -114,6 +106,58 @@ pub struct Infos {
     pub choix: Vec<(Qualite, bool, Option<u64>)>,
     /// Live en cours (`is_live`) : pas de section, « depuis le début » possible sur YouTube.
     pub en_direct: bool,
+    /// Sous-titres proposés : ceux du site puis les automatiques, par code.
+    pub sous_titres: Vec<SousTitre>,
+}
+
+/// Une langue de sous-titres (`subtitles` / `automatic_captions` de `yt-dlp -J`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SousTitre {
+    /// Code yt-dlp (« fr », « en-US »), passé tel quel à `--sub-langs`.
+    pub code: String,
+    pub nom: String,
+    /// Sous-titres automatiques (`--write-auto-subs`).
+    pub auto: bool,
+}
+
+/// Langue de l'interface (« fr ») parmi les sous-titres : ceux du site d'abord, puis les
+/// automatiques ; le code le plus court (« fr » avant « fr-CA »). Aucun : pas de sous-titres.
+pub fn sous_titres_par_defaut<'a>(s: &'a [SousTitre], langue: &str) -> Option<&'a SousTitre> {
+    let va = |c: &str| c == langue || c.strip_prefix(langue).is_some_and(|r| r.starts_with('-'));
+    [false, true].into_iter().find_map(|auto| {
+        s.iter()
+            .filter(|p| p.auto == auto && va(&p.code))
+            .min_by_key(|p| p.code.len())
+    })
+}
+
+/// Ce qui s'ajoute à la vidéo (réglages par défaut et queue.json) : sous-titres, miniature,
+/// chapitres (ffmpeg requis), conteneur.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Sortie {
+    /// Case « Sous-titres » ; langue choisie (code yt-dlp ; aucune = pas de sous-titres) et
+    /// si ce sont les automatiques.
+    pub subtitles: bool,
+    pub sub_lang: Option<String>,
+    pub sub_auto: bool,
+    /// Fichier .srt à côté plutôt qu'intégrés à la vidéo.
+    pub srt: bool,
+    pub thumbnail: bool,
+    pub chapters: bool,
+    /// MP4 (H.264/AAC si possible) plutôt que l'original (MKV/WebM).
+    pub mp4: bool,
+}
+
+impl Sortie {
+    fn sous_titres(&self) -> Option<&str> {
+        self.sub_lang.as_deref().filter(|_| self.subtitles)
+    }
+
+    /// Ajouts faits par yt-dlp après le téléchargement (passe finale après le moteur).
+    fn ajouts(&self) -> bool {
+        self.sous_titres().is_some() || self.thumbnail || self.chapters
+    }
 }
 
 #[derive(Deserialize)]
@@ -126,6 +170,17 @@ struct Json {
     formats: Vec<Format>,
     #[serde(default)]
     is_live: Option<bool>,
+    #[serde(default)]
+    subtitles: Option<BTreeMap<String, Vec<Piste>>>,
+    #[serde(default)]
+    automatic_captions: Option<BTreeMap<String, Vec<Piste>>>,
+}
+
+/// Un format d'une langue de sous-titres (vtt, srv3…) : seul le nom sert.
+#[derive(Deserialize)]
+struct Piste {
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -136,8 +191,6 @@ struct Format {
     vcodec: Option<String>,
     #[serde(default)]
     acodec: Option<String>,
-    #[serde(default)]
-    ext: Option<String>,
     #[serde(default)]
     filesize: Option<f64>,
     #[serde(default)]
@@ -181,16 +234,7 @@ pub fn infos_depuis_json(d: &[u8]) -> Result<Infos, String> {
         .iter()
         .map(|&q| {
             if q.audio() {
-                let s = match q {
-                    Qualite::M4a => j
-                        .formats
-                        .iter()
-                        .filter(|f| f.son() && f.ext.as_deref() == Some("m4a"))
-                        .max_by_key(tbr)
-                        .or(son),
-                    _ => son,
-                };
-                return (q, a_du_son, s.and_then(Format::taille));
+                return (q, a_du_son, son.and_then(Format::taille));
             }
             let h = q.hauteur();
             let image = j
@@ -211,12 +255,31 @@ pub fn infos_depuis_json(d: &[u8]) -> Result<Infos, String> {
             (q, dispo, taille)
         })
         .collect();
+    let mut sous_titres = Vec::new();
+    for (pistes, auto) in [(j.subtitles, false), (j.automatic_captions, true)] {
+        for (code, p) in pistes.unwrap_or_default() {
+            // Code donné à `--sub-langs` (expression régulière) : lettres, chiffres, tirets
+            // seulement (écarte aussi « live_chat »).
+            if code.is_empty()
+                || code.len() > 20
+                || !code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            {
+                continue;
+            }
+            let nom = p
+                .iter()
+                .find_map(|p| p.name.as_deref().map(str::trim).filter(|n| !n.is_empty()))
+                .map_or_else(|| code.clone(), |n| n.chars().take(60).collect());
+            sous_titres.push(SousTitre { code, nom, auto });
+        }
+    }
     Ok(Infos {
         titre: j.title.unwrap_or_else(|| "video".into()),
         duree: j.duration,
         hauteur_max,
         choix,
         en_direct: j.is_live == Some(true),
+        sous_titres,
     })
 }
 
@@ -287,12 +350,48 @@ pub struct Tache {
     pub section: Option<(u32, u32)>,
     /// Live YouTube en cours : depuis son début (`--live-from-start`) plutôt que maintenant.
     pub debut: bool,
+    pub sortie: Sortie,
 }
 
 impl Tache {
-    /// Arguments propres à la tâche : format, passage, live, nom du fichier.
+    /// Arguments propres à la tâche : format, conteneur, sous-titres, miniature, chapitres,
+    /// passage, live, nom du fichier.
     fn args(&self) -> Vec<String> {
         let mut a: Vec<String> = self.qualite.args().into_iter().map(String::from).collect();
+        let s = &self.sortie;
+        let mut ajoute = |v: &[&str]| a.extend(v.iter().map(|x| x.to_string()));
+        if !self.qualite.audio() {
+            if s.mp4 {
+                ajoute(&[
+                    "-S",
+                    "vcodec:h264,acodec:m4a",
+                    "--merge-output-format",
+                    "mp4",
+                ]);
+            }
+            if let Some(l) = s.sous_titres() {
+                let ecrire = if s.sub_auto {
+                    "--write-auto-subs"
+                } else {
+                    "--write-subs"
+                };
+                if s.srt {
+                    ajoute(&[ecrire, "--sub-langs", l, "--convert-subs", "srt"]);
+                } else {
+                    // Sans `--write-subs`, yt-dlp efface le fichier une fois intégré.
+                    if s.sub_auto {
+                        ajoute(&[ecrire]);
+                    }
+                    ajoute(&["--embed-subs", "--sub-langs", l]);
+                }
+            }
+        }
+        if s.thumbnail {
+            ajoute(&["--embed-thumbnail"]);
+        }
+        if s.chapters {
+            ajoute(&["--embed-chapters"]);
+        }
         let mut nom = "%(title).150B [%(id)s]".to_string();
         if let Some((de, a_)) = self.section {
             a.extend([
@@ -450,19 +549,52 @@ pub fn telecharger(
 ) -> Result<Outcome, String> {
     let yt = o.ytdlp.as_ref().ok_or("yt-dlp missing")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    // Sans ffmpeg, yt-dlp ne sait ni intégrer ni convertir : ni sous-titres, ni miniature, ni
+    // chapitres (il échouerait).
+    let sans_ffmpeg;
+    let tache = if o.ffmpeg.is_none() {
+        sans_ffmpeg = Tache {
+            sortie: Sortie {
+                mp4: tache.sortie.mp4,
+                ..Default::default()
+            },
+            ..tache.clone()
+        };
+        &sans_ffmpeg
+    } else {
+        tache
+    };
+    // Fichier fini par le moteur : yt-dlp le retrouve (« already downloaded »), ne le
+    // retélécharge pas et n'y fait que les ajouts (sous-titres, miniature, chapitres).
+    let mut deja = None;
     // raccourci : son seul (extraction -x), passage et live restent à yt-dlp ; les passer au
     // moteur si les liens directs donnent satisfaction.
     if tache.section.is_none() && !tache.debut && !tache.qualite.audio() {
-        if let Some(d) = liens_directs(o, url, dir, tache, cookies, ctl) {
-            match par_le_moteur(&d, o.ffmpeg.as_deref(), connexions, ctl) {
-                Ok(r) => return Ok(r),
-                Err(e) => {
-                    // Plages refusées, lien expiré… : yt-dlp seul, sans échec visible.
-                    eprintln!("fluxdl: direct video links failed ({e}), yt-dlp alone");
-                    for f in temporaires(&d) {
-                        let _ = std::fs::remove_file(f);
+        if let Some(mut d) = liens_directs(o, url, dir, tache, cookies, ctl) {
+            let ajouts = tache.sortie.ajouts();
+            // Pas de miniature dans un webm : yt-dlp fusionne alors en mkv, la fusion maison
+            // aussi (même nom que celui que cherchera la passe finale).
+            if tache.sortie.thumbnail
+                && d.parties.len() == 2
+                && d.fichier.extension().is_some_and(|e| e == "webm")
+            {
+                d.fichier.set_extension("mkv");
+            }
+            // Déjà là avec des ajouts demandés : passe finale arrêtée avant la fin, la refaire.
+            if ajouts && d.fichier.is_file() {
+                deja = Some(d.fichier.clone());
+            } else {
+                match par_le_moteur(&d, o.ffmpeg.as_deref(), connexions, ctl) {
+                    Ok(Outcome::Done(f)) if ajouts && f == d.fichier => deja = Some(f),
+                    Ok(r) => return Ok(r),
+                    Err(e) => {
+                        // Plages refusées, lien expiré… : yt-dlp seul, sans échec visible.
+                        eprintln!("fluxdl: direct video links failed ({e}), yt-dlp alone");
+                        for f in temporaires(&d) {
+                            let _ = std::fs::remove_file(f);
+                        }
+                        *ctl.lock() = Live::default();
                     }
-                    *ctl.lock() = Live::default();
                 }
             }
         }
@@ -495,7 +627,7 @@ pub fn telecharger(
     std::thread::spawn(move || lignes(err, |l| tx.send((true, l)).is_ok()));
     {
         let mut l = ctl.lock();
-        l.size = taille;
+        l.size = taille.or(l.size);
         l.workers = vec![WorkerStat::default()];
     }
     // Plusieurs fichiers de suite (image puis son) : les octets des précédents s'ajoutent.
@@ -551,8 +683,18 @@ pub fn telecharger(
             }
             Ok(Outcome::Done(f))
         }
-        (true, None) => Ok(Outcome::Done(dir.to_path_buf())),
-        (false, _) => Err(derniere_erreur(&erreurs)),
+        (true, None) => Ok(Outcome::Done(deja.unwrap_or_else(|| dir.to_path_buf()))),
+        (false, _) => match deja {
+            // La vidéo est complète : un ajout raté (miniature…) ne la fait pas échouer.
+            Some(f) => {
+                eprintln!(
+                    "fluxdl: yt-dlp final pass failed ({}), video kept without extras",
+                    derniere_erreur(&erreurs)
+                );
+                Ok(Outcome::Done(f))
+            }
+            None => Err(derniere_erreur(&erreurs)),
+        },
     }
 }
 
@@ -1169,7 +1311,8 @@ mod tests {
         assert_eq!(c(Qualite::Best), Some(201_100_000));
         assert_eq!(c(Qualite::P1080), Some(31_100_000));
         assert_eq!(c(Qualite::P720), Some(16_100_000));
-        assert_eq!(c(Qualite::M4a), Some(1_000_000));
+        // Son original : le meilleur (Opus ici), sans conversion.
+        assert_eq!(c(Qualite::M4a), Some(1_100_000));
         assert_eq!(c(Qualite::Mp3), Some(1_100_000));
         // Vidéo en 480p : 1080p et 720p grisés.
         let petit = br#"{"title":"P","formats":[{"height":480,"vcodec":"avc1","acodec":"mp4a","filesize":5}]}"#;
@@ -1193,6 +1336,7 @@ mod tests {
             estimation: None,
             section: Some((60, 3723)),
             debut: false,
+            sortie: Sortie::default(),
         };
         let a = t.args();
         let apres = |o: &str| a.iter().position(|x| x == o).map(|i| a[i + 1].as_str());
@@ -1334,6 +1478,7 @@ mod tests {
             estimation: None,
             section: None,
             debut: false,
+            sortie: Sortie::default(),
         };
         let lance = |sortie: String| {
             std::fs::write(d.join("sortie.txt"), sortie).unwrap();
@@ -1517,6 +1662,7 @@ mod tests {
                     estimation: None,
                     section: None,
                     debut: false,
+                    sortie: Sortie::default(),
                 };
                 telecharger(
                     &o,
@@ -1618,5 +1764,294 @@ mod tests {
             derniere_erreur("WARNING: a\nERROR: [youtube] x: Video unavailable\n"),
             "[youtube] x: Video unavailable"
         );
+    }
+
+    /// 0.2.9 : arguments de yt-dlp pour chaque combinaison de sous-titres, miniature,
+    /// chapitres et conteneur, en vidéo et en son seul.
+    #[test]
+    fn arguments_de_sortie() {
+        let a = |qualite, sortie| {
+            Tache {
+                qualite,
+                estimation: None,
+                section: None,
+                debut: false,
+                sortie,
+            }
+            .args()
+            .join(" ")
+        };
+        // Sous-titres : (case, langue, auto, srt) → ce qui doit être passé (ou rien).
+        let st = [
+            (false, Some("fr"), false, false, None),
+            (true, None, false, false, None),
+            (
+                true,
+                Some("fr"),
+                false,
+                false,
+                Some("--embed-subs --sub-langs fr"),
+            ),
+            (
+                true,
+                Some("fr"),
+                false,
+                true,
+                Some("--write-subs --sub-langs fr --convert-subs srt"),
+            ),
+            (
+                true,
+                Some("en-US"),
+                true,
+                false,
+                Some("--write-auto-subs --embed-subs --sub-langs en-US"),
+            ),
+            (
+                true,
+                Some("en-US"),
+                true,
+                true,
+                Some("--write-auto-subs --sub-langs en-US --convert-subs srt"),
+            ),
+        ];
+        let mut n = 0;
+        for q in Qualite::TOUTES {
+            for &(subtitles, l, sub_auto, srt, attendu) in &st {
+                for (thumbnail, chapters, mp4) in (0..8).map(|b| (b & 1 > 0, b & 2 > 0, b & 4 > 0))
+                {
+                    let s = Sortie {
+                        subtitles,
+                        sub_lang: l.map(String::from),
+                        sub_auto,
+                        srt,
+                        thumbnail,
+                        chapters,
+                        mp4,
+                    };
+                    let x = a(q, s);
+                    let ctx = format!("{q:?} {x}");
+                    assert!(x.starts_with(&q.args().join(" ")), "{ctx}");
+                    assert!(x.ends_with("-o %(title).150B [%(id)s].%(ext)s"), "{ctx}");
+                    assert_eq!(x.contains("--embed-thumbnail"), thumbnail, "{ctx}");
+                    assert_eq!(x.contains("--embed-chapters"), chapters, "{ctx}");
+                    // Son seul : ni sous-titres ni conteneur vidéo.
+                    let image = !q.audio();
+                    assert_eq!(
+                        x.contains("-S vcodec:h264,acodec:m4a --merge-output-format mp4"),
+                        mp4 && image,
+                        "{ctx}"
+                    );
+                    assert_eq!(x.contains("--merge-output-format"), mp4 && image, "{ctx}");
+                    match attendu.filter(|_| image) {
+                        Some(v) => assert!(x.contains(v), "{ctx}"),
+                        None => assert!(!x.contains("subs"), "{ctx}"),
+                    }
+                    // Intégrés : jamais --write-subs (le fichier resterait à côté).
+                    if !srt {
+                        assert!(!x.contains("--write-subs"), "{ctx}");
+                    }
+                    n += 1;
+                }
+            }
+        }
+        assert_eq!(n, 5 * 6 * 8);
+        // Son : MP3 converti, original sans conversion.
+        assert_eq!(
+            a(Qualite::Mp3, Sortie::default()),
+            "-f ba/b -x --audio-format mp3 --audio-quality 0 -o %(title).150B [%(id)s].%(ext)s"
+        );
+        assert_eq!(
+            a(Qualite::M4a, Sortie::default()),
+            "-f ba/b -x -o %(title).150B [%(id)s].%(ext)s"
+        );
+        // Anciennes entrées de queue.json (sans `options`) : rien d'ajouté, conteneur original.
+        let k: crate::store::Kind =
+            serde_json::from_str(r#"{"Video":{"quality":"P1080","estimate":null}}"#).unwrap();
+        assert!(
+            matches!(k, crate::store::Kind::Video { options, .. } if options == Sortie::default())
+        );
+        let s = Sortie {
+            subtitles: true,
+            sub_lang: Some("fr".into()),
+            mp4: true,
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&s).unwrap();
+        assert_eq!(serde_json::from_str::<Sortie>(&j).unwrap(), s);
+    }
+
+    /// 0.2.9 : langues de sous-titres lues dans `-J` (site puis automatiques), langue de
+    /// l'interface par défaut.
+    #[test]
+    fn langues_de_sous_titres() {
+        let j = br#"{"title":"T","formats":[],
+            "subtitles":{"fr-CA":[{"ext":"vtt","name":"French (Canada)"}],"fr":[{"ext":"vtt","url":"u","name":"French"}],
+                "live_chat":[{"ext":"json"}],"x(.*)":[{"name":"pirate"}],"de":[{"ext":"srv3"}]},
+            "automatic_captions":{"en":[{"name":"English"}],"en-orig":[{"name":"English (Original)"}],"fr":[{"name":"French"}]}}"#;
+        let i = infos_depuis_json(j).unwrap();
+        let v: Vec<_> = i
+            .sous_titres
+            .iter()
+            .map(|s| (s.code.as_str(), s.nom.as_str(), s.auto))
+            .collect();
+        assert_eq!(
+            v,
+            [
+                ("de", "de", false),
+                ("fr", "French", false),
+                ("fr-CA", "French (Canada)", false),
+                ("en", "English", true),
+                ("en-orig", "English (Original)", true),
+                ("fr", "French", true),
+            ]
+        );
+        let d = |l| sous_titres_par_defaut(&i.sous_titres, l).map(|s| (s.code.as_str(), s.auto));
+        // Ceux du site avant les automatiques, code exact avant les variantes.
+        assert_eq!(d("fr"), Some(("fr", false)));
+        assert_eq!(d("en"), Some(("en", true)));
+        assert_eq!(d("es"), None);
+        let seul = infos_depuis_json(br#"{"automatic_captions":{"en-US":[{}]}}"#).unwrap();
+        assert_eq!(
+            sous_titres_par_defaut(&seul.sous_titres, "en").map(|s| s.code.as_str()),
+            Some("en-US")
+        );
+        // Vraie sortie (Commons) : 31 langues du site, sans nom (code affiché), fr choisi.
+        let c = infos_depuis_json(COMMONS).unwrap().sous_titres;
+        assert_eq!(c.len(), 31);
+        assert!(c.iter().all(|s| !s.auto && s.nom == s.code));
+        assert_eq!(
+            sous_titres_par_defaut(&c, "zh").map(|s| s.code.as_str()),
+            Some("zh-Hans-CN")
+        );
+        assert_eq!(
+            sous_titres_par_defaut(&c, "fr").map(|s| s.code.as_str()),
+            Some("fr")
+        );
+        assert!(infos_depuis_json(br#"{"formats":[]}"#)
+            .unwrap()
+            .sous_titres
+            .is_empty());
+    }
+
+    /// 0.2.9 : sous-titres, miniature, chapitres avec le passage par le moteur : fichier fini
+    /// par le moteur, puis yt-dlp seul le retrouve et y fait les ajouts (passe finale) ;
+    /// fichier déjà là = passe seule ; webm + miniature → mkv ; passe ratée = vidéo gardée ;
+    /// sans ffmpeg = pas d'ajouts.
+    #[cfg(unix)]
+    #[test]
+    fn video_ajouts_apres_le_moteur() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("fluxdl-test-video3-{}", std::process::id()));
+        let (dl, ff) = (d.join("dl"), d.join("ff"));
+        std::fs::create_dir_all(&dl).unwrap();
+        std::fs::create_dir_all(&ff).unwrap();
+        let script = |f: PathBuf, corps: String| {
+            std::fs::write(&f, format!("#!/bin/sh\n{corps}")).unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+            f
+        };
+        // Faux yt-dlp : `--print` = sortie.txt ; sinon passe finale (échoue si `rate`), qui
+        // donne le fichier retrouvé (final.txt) sans rien écrire.
+        let yt = script(
+            d.join("yt-dlp"),
+            format!(
+                "echo \"$@\" >> '{0}/args.txt'\ncase \"$*\" in\n*\"--print filename\"*) cat '{0}/sortie.txt' ;;\n*) [ -e '{0}/rate' ] && {{ echo 'ERROR: Postprocessing: boom' >&2; exit 1; }}; echo \"fluxdl-fichier $(cat '{0}/final.txt')\" ;;\nesac\n",
+                d.display()
+            ),
+        );
+        script(
+            ff.join("ffmpeg"),
+            "for a; do o=$a; done\nprintf fusion > \"$o\"\nexit 0\n".into(),
+        );
+        let o = Outils {
+            ytdlp: Some(yt),
+            ffmpeg: Some(ff),
+            ..Default::default()
+        };
+        let tache = Tache {
+            qualite: Qualite::Best,
+            estimation: None,
+            section: None,
+            debut: false,
+            sortie: Sortie {
+                subtitles: true,
+                sub_lang: Some("fr".into()),
+                thumbnail: true,
+                chapters: true,
+                mp4: true,
+                ..Default::default()
+            },
+        };
+        let lance = |o: &Outils, sortie: String, final_: &str| {
+            std::fs::write(d.join("sortie.txt"), sortie).unwrap();
+            std::fs::write(d.join("final.txt"), dl.join(final_).display().to_string()).unwrap();
+            let _ = std::fs::remove_file(d.join("args.txt"));
+            let ctl = Arc::new(Control::default());
+            let r = telecharger(
+                o,
+                "https://www.youtube.com/watch?v=x",
+                &dl,
+                &tache,
+                None,
+                4,
+                &ctl,
+            );
+            let args = std::fs::read_to_string(d.join("args.txt")).unwrap();
+            (r, args.lines().map(String::from).collect::<Vec<_>>())
+        };
+        let v: Vec<u8> = (0..2u32 << 20).map(|i| (i * 7 % 251) as u8).collect();
+        let base = serveur(
+            vec![("/v".into(), v.clone()), ("/a".into(), vec![1; 1000])],
+            true,
+        );
+        let un = format!(r#"{{"url":"{base}/v","protocol":"https"}}"#);
+        let sortie = |nom: &str, j: &str| format!("{}/{nom}\n{j}\n", dl.display());
+        // Lien direct : le moteur télécharge, puis la passe finale (mêmes arguments) ajoute.
+        let (r, args) = lance(&o, sortie("E [x].mp4", &un), "E [x].mp4");
+        assert_eq!(r, Ok(Outcome::Done(dl.join("E [x].mp4"))));
+        assert_eq!(std::fs::read(dl.join("E [x].mp4")).unwrap(), v);
+        assert_eq!(args.len(), 2, "{args:?}");
+        assert!(args[0].contains("--print filename"));
+        for a in &args {
+            for x in [
+                "-S vcodec:h264,acodec:m4a --merge-output-format mp4",
+                "--embed-subs --sub-langs fr",
+                "--embed-thumbnail",
+                "--embed-chapters",
+            ] {
+                assert!(a.contains(x), "{x} : {a}");
+            }
+        }
+        assert!(args[1].contains("--no-simulate") && !args[1].contains("--print filename"));
+        // Déjà là (passe arrêtée avant la fin) : pas de nouveau téléchargement, passe seule.
+        let (r, args) = lance(&o, sortie("E [x].mp4", &un), "E [x].mp4");
+        assert_eq!(r, Ok(Outcome::Done(dl.join("E [x].mp4"))));
+        assert_eq!(args.len(), 2);
+        assert!(!dl.join("E [x] (1).mp4").exists());
+        // Image + son en webm avec miniature : fusion en mkv, nom retrouvé par yt-dlp.
+        let deux = format!(
+            r#"{{"requested_formats":[{{"url":"{base}/v","protocol":"https"}},{{"url":"{base}/a","protocol":"https"}}]}}"#
+        );
+        let (r, _) = lance(&o, sortie("W [x].webm", &deux), "W [x].mkv");
+        assert_eq!(r, Ok(Outcome::Done(dl.join("W [x].mkv"))));
+        assert_eq!(std::fs::read(dl.join("W [x].mkv")).unwrap(), b"fusion");
+        assert!(!dl.join("W [x].webm").exists());
+        // Passe finale ratée (miniature impossible…) : la vidéo complète est gardée.
+        std::fs::write(d.join("rate"), "").unwrap();
+        let (r, _) = lance(&o, sortie("P [x].mp4", &un), "P [x].mp4");
+        assert_eq!(r, Ok(Outcome::Done(dl.join("P [x].mp4"))));
+        assert_eq!(std::fs::read(dl.join("P [x].mp4")).unwrap(), v);
+        std::fs::remove_file(d.join("rate")).unwrap();
+        // Sans ffmpeg : ni sous-titres, ni miniature, ni chapitres, pas de passe finale.
+        let sans = Outils {
+            ffmpeg: None,
+            ..o.clone()
+        };
+        let (r, args) = lance(&sans, sortie("N [x].mp4", &un), "N [x].mp4");
+        assert_eq!(r, Ok(Outcome::Done(dl.join("N [x].mp4"))));
+        assert_eq!(args.len(), 1);
+        assert!(args[0].contains("--merge-output-format mp4"));
+        assert!(!args[0].contains("--embed") && !args[0].contains("subs"));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

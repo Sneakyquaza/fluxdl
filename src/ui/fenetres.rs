@@ -10,12 +10,21 @@ const LARGEUR: f32 = 500.0;
 impl App {
     /// Résultats arrivés des fils (formats, aperçu, outils) et suites des fenêtres.
     pub(super) fn suivre_modale(&mut self) {
+        let langue = self.settings.lang.code();
         match &mut self.modale {
             Some(Modale::Video {
-                rx, infos, choix, ..
+                rx,
+                infos,
+                choix,
+                sortie,
+                ..
             }) => {
                 if let Some(r) = rx.as_ref().and_then(|r| r.try_recv().ok()) {
                     if let Ok(i) = &r {
+                        // Sous-titres dans la langue de l'interface si la vidéo en a, sinon aucun.
+                        let s = video::sous_titres_par_defaut(&i.sous_titres, langue);
+                        sortie.sub_lang = s.map(|s| s.code.clone());
+                        sortie.sub_auto = s.is_some_and(|s| s.auto);
                         // Qualité par défaut des réglages si disponible, sinon la première.
                         if !i.choix.iter().any(|c| c.0 == *choix && c.1) {
                             if let Some(c) = i.choix.iter().find(|c| c.1) {
@@ -283,6 +292,7 @@ impl App {
                 mut de,
                 mut a,
                 mut debut,
+                mut sortie,
             } => {
                 titre_modale(ui, Icone::Lecture, t(l, "Download a video"));
                 match &infos {
@@ -315,7 +325,13 @@ impl App {
                                 ),
                                 video::Qualite::P1080 => "1080p".into(),
                                 video::Qualite::P720 => "720p".into(),
-                                video::Qualite::M4a => format!("{} (M4A)", t(l, "Audio only")),
+                                video::Qualite::M4a => {
+                                    format!(
+                                        "{} ({})",
+                                        t(l, "Audio only"),
+                                        t(l, "original M4A/Opus")
+                                    )
+                                }
                                 video::Qualite::Mp3 => format!("{} (MP3)", t(l, "Audio only")),
                             };
                             let droite = taille.map_or("—".into(), |t| format!("~{}", octets(t)));
@@ -404,6 +420,92 @@ impl App {
                                 petit(ui, t(l, "Empty: the whole video. Long videos can be paused and resumed."));
                             }
                         }
+                        // Sous-titres, miniature, chapitres, conteneur : ffmpeg requis.
+                        let ff = self.outils.ffmpeg.is_some();
+                        let image = !choix.audio();
+                        ui.add_space(4.0);
+                        ui.add_enabled_ui(ff, |ui| {
+                            if image {
+                                ui.horizontal(|ui| {
+                                    ui.allocate_ui(vec2(132.0, 34.0), |ui| {
+                                        coche(ui, &mut sortie.subtitles, t(l, "Subtitles"), "")
+                                    });
+                                    ui.add_enabled_ui(sortie.subtitles, |ui| {
+                                        let nom = |s: &video::SousTitre| {
+                                            if s.auto {
+                                                format!("{} (auto)", s.nom)
+                                            } else {
+                                                s.nom.clone()
+                                            }
+                                        };
+                                        let actuel = i.sous_titres.iter().find(|s| {
+                                            sortie.sub_lang.as_ref() == Some(&s.code)
+                                                && s.auto == sortie.sub_auto
+                                        });
+                                        let vide = if i.sous_titres.is_empty() {
+                                            t(l, "None for this video")
+                                        } else {
+                                            t(l, "Language")
+                                        };
+                                        egui::ComboBox::from_id_salt("sous_titres")
+                                            .width(150.0)
+                                            .height(320.0)
+                                            .selected_text(actuel.map_or(vide.into(), nom))
+                                            .show_ui(ui, |ui| {
+                                                for s in &i.sous_titres {
+                                                    if ui
+                                                        .selectable_label(Some(s) == actuel, nom(s))
+                                                        .clicked()
+                                                    {
+                                                        sortie.sub_lang = Some(s.code.clone());
+                                                        sortie.sub_auto = s.auto;
+                                                    }
+                                                }
+                                            });
+                                        segmente(
+                                            ui,
+                                            &mut sortie.srt,
+                                            &[
+                                                (false, t(l, "Embedded")),
+                                                (true, t(l, ".srt file")),
+                                            ],
+                                        );
+                                    });
+                                });
+                            }
+                            ui.horizontal(|ui| {
+                                let w = (LARGEUR - 8.0) / 2.0;
+                                ui.allocate_ui(vec2(w, 26.0), |ui| {
+                                    coche(ui, &mut sortie.thumbnail, t(l, "Embed the thumbnail"), "")
+                                });
+                                ui.allocate_ui(vec2(w, 26.0), |ui| {
+                                    coche(ui, &mut sortie.chapters, t(l, "Embed the chapters"), "")
+                                });
+                            });
+                            if image {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(t(l, "Format"))
+                                            .font(moyen(13.0))
+                                            .color(TEXTE),
+                                    );
+                                    ui.add_space(8.0);
+                                    segmente(
+                                        ui,
+                                        &mut sortie.mp4,
+                                        &[(true, "MP4"), (false, t(l, "Original"))],
+                                    );
+                                });
+                                petit(ui, if sortie.mp4 {
+                                    t(l, "MP4: plays everywhere (H.264/AAC when available, up to 1080p on YouTube).")
+                                } else {
+                                    t(l, "Original: best quality, MKV or WebM.")
+                                });
+                            }
+                        });
+                        if !ff {
+                            petit(ui, t(l, "Subtitles, thumbnail and chapters need ffmpeg."));
+                        }
                         if self.jarres.contains_key(&url) {
                             petit(ui, t(l, "With your login cookies for this site (members, subscribers): kept in memory only, given to yt-dlp in a private temporary file deleted right after."));
                         }
@@ -422,6 +524,12 @@ impl App {
                                     .filter(|_| section.is_none() && !i.en_direct);
                                 let titre = i.titre.clone();
                                 let login = self.jarres.contains_key(&url);
+                                // Défaut des prochaines vidéos (langue : celle de l'interface).
+                                self.settings.video_options = video::Sortie {
+                                    sub_lang: None,
+                                    sub_auto: false,
+                                    ..sortie.clone()
+                                };
                                 let e = self.nouvelle(
                                     url.clone(),
                                     Kind::Video {
@@ -430,6 +538,7 @@ impl App {
                                         section,
                                         from_start: debut && i.en_direct,
                                         login,
+                                        options: sortie.clone(),
                                     },
                                 );
                                 e.name = Some(titre);
@@ -453,6 +562,7 @@ impl App {
                         de,
                         a,
                         debut,
+                        sortie,
                     });
                 }
             }
@@ -1176,6 +1286,40 @@ impl App {
                         (video::Qualite::P720, "720p"),
                     ],
                 );
+            });
+            // Derniers choix de la fenêtre des formats, modifiables ici.
+            let v = &mut self.settings.video_options;
+            separateur(ui);
+            let aide = t(l, "In the interface language, when the video has it.");
+            reglage(ui, t(l, "Subtitles"), aide, |ui| {
+                let mut m = (v.subtitles, v.srt && v.subtitles);
+                segmente(
+                    ui,
+                    &mut m,
+                    &[
+                        ((false, false), t(l, "None")),
+                        ((true, false), t(l, "Embedded")),
+                        ((true, true), t(l, ".srt file")),
+                    ],
+                );
+                (v.subtitles, v.srt) = (m.0, if m.0 { m.1 } else { v.srt });
+            });
+            separateur(ui);
+            let aide = t(l, "Inside the video file (needs ffmpeg).");
+            reglage(ui, t(l, "Embed the thumbnail"), aide, |ui| {
+                interrupteur(ui, &mut v.thumbnail);
+            });
+            separateur(ui);
+            reglage(ui, t(l, "Embed the chapters"), aide, |ui| {
+                interrupteur(ui, &mut v.chapters);
+            });
+            separateur(ui);
+            let aide = t(
+                l,
+                "MP4 plays everywhere (H.264/AAC when available); Original keeps the best quality (MKV/WebM).",
+            );
+            reglage(ui, t(l, "Video format"), aide, |ui| {
+                segmente(ui, &mut v.mp4, &[(true, "MP4"), (false, t(l, "Original"))]);
             });
         });
         ui.add_space(20.0);

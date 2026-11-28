@@ -511,6 +511,41 @@ const FR: &[(&str, &str)] = &[
         "Cochée d'avance ; utilisée sans question quand fluxdl est réduit.",
     ),
     ("Best", "Meilleure"),
+    ("original M4A/Opus", "original M4A/Opus"),
+    ("Subtitles", "Sous-titres"),
+    ("None for this video", "Aucun pour cette vidéo"),
+    ("Embedded", "Intégrés"),
+    (".srt file", "Fichier .srt"),
+    ("Embed the thumbnail", "Miniature intégrée"),
+    ("Embed the chapters", "Chapitres intégrés"),
+    ("Format", "Format"),
+    ("Original", "Original"),
+    (
+        "MP4: plays everywhere (H.264/AAC when available, up to 1080p on YouTube).",
+        "MP4 : compatible partout (H.264/AAC si possible, 1080p au plus sur YouTube).",
+    ),
+    (
+        "Original: best quality, MKV or WebM.",
+        "Original : meilleure qualité, MKV ou WebM.",
+    ),
+    (
+        "Subtitles, thumbnail and chapters need ffmpeg.",
+        "Sous-titres, miniature et chapitres demandent ffmpeg.",
+    ),
+    (
+        "In the interface language, when the video has it.",
+        "Dans la langue de l'interface, si la vidéo l'a.",
+    ),
+    ("None", "Aucun"),
+    (
+        "Inside the video file (needs ffmpeg).",
+        "Dans le fichier vidéo (ffmpeg requis).",
+    ),
+    ("Video format", "Format vidéo"),
+    (
+        "MP4 plays everywhere (H.264/AAC when available); Original keeps the best quality (MKV/WebM).",
+        "MP4 : compatible partout (H.264/AAC si possible) ; Original : meilleure qualité (MKV/WebM).",
+    ),
     (
         "Login cookies are gone (fluxdl was restarted): click the fluxdl button on the video page again to resume.",
         "Cookies de connexion perdus (fluxdl a redémarré) : clique à nouveau sur le bouton fluxdl de la page de la vidéo pour reprendre.",
