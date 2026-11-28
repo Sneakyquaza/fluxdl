@@ -74,8 +74,10 @@ running on `127.0.0.1`. Plain JavaScript, no build step, no remote code.
   absolutely, so the page's CSS can't alter it and the layout doesn't move. Buttons that start
   a download from a script (no link) don't get one: auto-capture handles those.
 - **Right-click menu**: "Download with fluxdl" on links, "Download this media with fluxdl" on
-  videos and audio, "Download all links on this page with fluxdl…" on pages (opens a picker
-  with checkboxes; file-like links are pre-selected).
+  videos and audio, "Get the links of this page with fluxdl" on pages and "…of the selection"
+  on selected text (also a popup button): picker with checkboxes, type/extension/text filters,
+  sent to the app in one request (`/add-many`; more than 20 links → one confirmation in the
+  app). Referer and cookies only for links of the page's own site.
 - **Cookies** (optional): sent only if enabled, and only for the listed sites (empty list = all
   sites).
 

@@ -68,6 +68,12 @@ async function init() {
     e.target.value = clean;
     save({ extensions: clean });
   });
+  // Liens de l'onglet actif → page de choix (ouverte par l'arrière-plan)
+  $("grabLinks").addEventListener("click", async () => {
+    const [tab] = await api.tabs.query({ active: true, currentWindow: true });
+    if (tab) await api.runtime.sendMessage({ type: "fluxdl-open-picker", tabId: tab.id });
+    window.close();
+  });
   $("openOptions").addEventListener("click", () => {
     api.runtime.openOptionsPage();
     window.close();

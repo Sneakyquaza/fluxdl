@@ -1,10 +1,35 @@
-/* Page « tout télécharger » */
+/* Page de choix des liens */
 body { padding: 24px 16px; }
 main { max-width: 760px; margin: 0 auto; }
 .header h1 { margin-bottom: 2px; }
 .header p { margin: 0; max-width: 640px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tools { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
 .tools input[type="text"] { flex: 1; min-width: 180px; margin: 0; }
+.tools input.exts { flex: 0 1 220px; min-width: 150px; }
+.types { display: flex; flex-wrap: wrap; gap: 0; margin-bottom: 10px; }
+.types .type {
+  padding: 4px 11px;
+  border-radius: 0;
+  margin-left: -1px;
+  color: var(--navy);
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.8);
+  border-color: #7a9cc0;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.9) 0%, rgba(255, 255, 255, 0.5) 49%, rgba(255, 255, 255, 0) 50%),
+    linear-gradient(180deg, #f2f7fb, #d6e5f2);
+}
+.types .type:first-child { border-radius: 5px 0 0 5px; margin-left: 0; }
+.types .type:last-child { border-radius: 0 5px 5px 0; }
+.types .type.on {
+  position: relative;
+  color: #fff;
+  text-shadow: 0 -1px 0 rgba(0, 0, 0, 0.35);
+  border-color: var(--blue-dark);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.55) 0%, rgba(255, 255, 255, 0.15) 49%, rgba(255, 255, 255, 0) 50%),
+    linear-gradient(180deg, #4aa3f0, var(--blue) 60%, #2a8ae8);
+}
+.types .n { font-weight: 400; opacity: 0.75; }
 .check { display: inline-flex; align-items: center; gap: 5px; font-weight: 600; cursor: pointer; }
 .count { margin-left: auto; color: var(--muted); font-weight: 600; }
 .list {
@@ -36,6 +61,11 @@ main { max-width: 760px; margin: 0 auto; }
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.5) 0 50%, transparent 51%), linear-gradient(180deg, #4aa3f0, #1e78d6);
 }
 .list .ext.none { background: linear-gradient(180deg, #c8d6e2, #9fb3c6); }
+.list .ext.videos { background: linear-gradient(180deg, rgba(255, 255, 255, 0.5) 0 50%, transparent 51%), linear-gradient(180deg, #e66aa8, #c2347c); }
+.list .ext.music { background: linear-gradient(180deg, rgba(255, 255, 255, 0.5) 0 50%, transparent 51%), linear-gradient(180deg, #a07ae6, #6f45c2); }
+.list .ext.images { background: linear-gradient(180deg, rgba(255, 255, 255, 0.5) 0 50%, transparent 51%), linear-gradient(180deg, #3cc3b4, #17907f); }
+.list .ext.archives { background: linear-gradient(180deg, rgba(255, 255, 255, 0.5) 0 50%, transparent 51%), linear-gradient(180deg, #f0b14a, #d07f14); }
+.list .ext.programs { background: linear-gradient(180deg, rgba(255, 255, 255, 0.5) 0 50%, transparent 51%), linear-gradient(180deg, #5fd06a, #2f9a3a); }
 .list .name { min-width: 0; }
 .list .name b, .list .name small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .list .name small { color: var(--muted); }

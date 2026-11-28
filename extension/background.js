@@ -10,6 +10,7 @@ if (typeof importScripts === "function") importScripts("common.js", "sites.js");
 const MENU_LINK = "fluxdl-download";
 const MENU_MEDIA = "fluxdl-media";
 const MENU_PAGE = "fluxdl-page";
+const MENU_SELECTION = "fluxdl-selection";
 const MENU_VIDEO = "fluxdl-video";
 const MAX_URL = 8192;
 const MAX_LINKS = 2000;
@@ -54,6 +55,12 @@ async function setupMenu() {
     id: MENU_PAGE,
     title: t("menuDownloadAll"),
     contexts: ["page"],
+    documentUrlPatterns: ["http://*/*", "https://*/*"],
+  });
+  api.contextMenus.create({
+    id: MENU_SELECTION,
+    title: t("menuDownloadSelection"),
+    contexts: ["selection"],
     documentUrlPatterns: ["http://*/*", "https://*/*"],
   });
   // Pages des sites vidéo (YouTube, Twitch…) : le lien de la page part comme vidéo
@@ -306,10 +313,11 @@ function probeLink(url) {
 
 const pickerMemory = new Map(); // repli si storage.session manque
 
-async function openPicker(tab) {
+// Liens de la page (ou de la sélection) du cadre `frameId` → page de choix dans un nouvel onglet
+async function openPicker(tab, selection, frameId) {
   let data;
   try {
-    data = await api.tabs.sendMessage(tab.id, { type: "fluxdl-collect" });
+    data = await api.tabs.sendMessage(tab.id, { type: "fluxdl-collect", selection }, { frameId: frameId ?? 0 });
   } catch {
     notify(t("notifReloadPage"));
     return;
@@ -323,12 +331,16 @@ async function openPicker(tab) {
   await api.tabs.create({ url: api.runtime.getURL("picker.html") + "#" + id, index: tab.index + 1 });
 }
 
+function isLink(url) {
+  return isHttp(url) || /^magnet:\?/i.test(url);
+}
+
 function cleanLinks(raw) {
   if (!Array.isArray(raw)) return [];
   const seen = new Set();
   const out = [];
   for (const l of raw) {
-    if (!l || typeof l.url !== "string" || l.url.length > MAX_URL || !isHttp(l.url) || seen.has(l.url)) continue;
+    if (!l || typeof l.url !== "string" || l.url.length > MAX_URL || !isLink(l.url) || seen.has(l.url)) continue;
     seen.add(l.url);
     out.push({ url: l.url, text: typeof l.text === "string" ? l.text.slice(0, 200) : "", media: l.media === true, dl: l.dl === true });
     if (out.length >= MAX_LINKS) break;
@@ -356,8 +368,8 @@ api.contextMenus.onClicked.addListener(async (info, tab) => {
     if ((await sendVideo(info.pageUrl, site, tab)).state === "ok") notify(t("notifVideoSent"));
     return;
   }
-  if (info.menuItemId === MENU_PAGE) {
-    if (tab?.id >= 0) openPicker(tab);
+  if (info.menuItemId === MENU_PAGE || info.menuItemId === MENU_SELECTION) {
+    if (tab?.id >= 0) openPicker(tab, info.menuItemId === MENU_SELECTION, info.frameId);
     return;
   }
   if (info.menuItemId !== MENU_LINK && info.menuItemId !== MENU_MEDIA) return;
@@ -368,6 +380,43 @@ api.contextMenus.onClicked.addListener(async (info, tab) => {
   }
   await sendManual(url, { referrer: info.pageUrl, title: tab?.title });
 });
+
+// Liens choisis dans la page de choix → appli en un envoi (/add-many, ~1,5 Mo au plus par envoi) ;
+// référent et cookies seulement pour les liens du même site que la page. Appli sans
+// /add-many (404) : state « old », la page envoie un par un.
+const MANY_BYTES = 1500000;
+async function sendMany(urls, referrer) {
+  if (!Array.isArray(urls)) return { error: "url" };
+  const settings = await getSettings();
+  const page = isHttp(referrer) ? referrer : "";
+  const items = [];
+  for (const url of urls.slice(0, MAX_LINKS)) {
+    if (typeof url !== "string" || url.length > MAX_URL || !isLink(url)) continue;
+    const item = { url };
+    if (page && isHttp(url) && sameSite(url, page)) {
+      item.referrer = page;
+      const cookies = await cookiesFor(url, settings);
+      if (cookies) item.cookies = cookies;
+    }
+    items.push(item);
+  }
+  if (!items.length) return { state: "bad", sent: 0 };
+  let sent = 0;
+  while (sent < items.length) {
+    const batch = [];
+    let size = 20;
+    while (sent + batch.length < items.length && batch.length < MAX_LINKS) {
+      const one = JSON.stringify(items[sent + batch.length]).length + 1;
+      if (batch.length && size + one > MANY_BYTES) break;
+      batch.push(items[sent + batch.length]);
+      size += one;
+    }
+    const res = await callApp("/add-many", { items: batch }, settings);
+    if (res.state !== "ok") return { state: res.status === 404 ? "old" : res.state, status: res.status, sent };
+    sent += batch.length;
+  }
+  return { state: "ok", sent };
+}
 
 // ---- Messages du script de contenu et de la page de liens ----
 
@@ -409,6 +458,21 @@ async function handleMessage(msg, sender) {
       if (!site || videoSiteOf(sender.url) !== site) return { error: "url" };
       const res = await sendVideo(msg.url, site, sender.tab);
       return { state: res.state, status: res.status, reason: res.reason };
+    }
+    case "fluxdl-add-many": {
+      if (!fromOwnPage(sender)) return { error: "sender" };
+      return sendMany(msg.urls, typeof msg.referrer === "string" ? msg.referrer : "");
+    }
+    case "fluxdl-open-picker": {
+      // Bouton du popup : onglet actif donné par le popup
+      if (!fromOwnPage(sender) || !Number.isInteger(msg.tabId)) return { error: "sender" };
+      const tab = await api.tabs.get(msg.tabId).catch(() => null);
+      if (!tab || !isHttp(tab.url ?? "")) {
+        notify(t("notifUnsupported"));
+        return { error: "tab" };
+      }
+      await openPicker(tab, false, 0);
+      return { ok: true };
     }
     case "fluxdl-pair": {
       if (!fromOwnPage(sender)) return { error: "sender" };

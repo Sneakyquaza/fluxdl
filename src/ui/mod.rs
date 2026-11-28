@@ -227,11 +227,15 @@ enum Modale {
         origine: String,
         navigateur: &'static str,
     },
+    /// Liens d'une page (plus de `LOT_CONFIRMER`) : « Ajouter N téléchargements ? ».
+    Lot(Vec<Demande>),
     /// Tout est fini : veille ou arrêt du PC dans 60 s (depuis `depuis`, horloge de l'appli),
     /// sauf « Annuler ».
     FinCompte { eteindre: bool, depuis: f64 },
 }
 
+/// Au-delà, les liens d'une page demandent une confirmation (une seule fenêtre).
+const LOT_CONFIRMER: usize = 20;
 /// Compte à rebours avant la veille ou l'arrêt du PC.
 const COMPTE_FIN_S: f64 = 60.0;
 /// Limites proposées dans le menu (Mo/s, 0 = illimitée).
@@ -292,6 +296,10 @@ pub struct App {
     modale: Option<Modale>,
     /// Liens envoyés par l'extension (serveur local) ou par une 2e instance.
     demandes: Option<Receiver<Demande>>,
+    /// Liens d'une page en attente de « Ajouter N téléchargements ? » (une autre fenêtre était
+    /// ouverte) ; liens d'un lot qui ont besoin de leur fenêtre (magnet, page vidéo), un à la fois.
+    lots: Vec<Demande>,
+    a_ouvrir: VecDeque<Demande>,
     jeton: Arc<Mutex<String>>,
     /// Demande d'appairage automatique (partagée avec le serveur).
     appairage: Arc<Mutex<serveur::Appairage>>,
@@ -385,6 +393,8 @@ impl App {
             relance: None,
             modale: None,
             demandes: None,
+            lots: Vec::new(),
+            a_ouvrir: VecDeque::new(),
             jeton: Arc::new(Mutex::new(String::new())),
             appairage: Arc::default(),
             serveur_err: None,
@@ -517,16 +527,12 @@ impl App {
         // Déjà dans la file : la montrer plutôt que télécharger deux fois le même fichier ;
         // en pause → reprise ; en échec → refus (le navigateur garde sa copie) ; fini → rien
         // tant que le fichier est là.
-        if let Some(e) = self.entries.iter_mut().rev().find(|e| {
-            e.url == url
-                && match &e.status {
-                    Status::Done => e
-                        .name
-                        .as_ref()
-                        .is_some_and(|n| Path::new(&e.dir).join(n).exists()),
-                    s => *s != Status::Canceled,
-                }
-        }) {
+        if let Some(e) = self
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|e| deja_en_file(e, &url))
+        {
             let st = match e.status {
                 Status::Done => Statut::DejaFini,
                 Status::Failed(_) => Statut::Refuse,
@@ -546,6 +552,44 @@ impl App {
         e.referrer = referrer;
         e.cookies = cookies;
         Statut::Ajoute
+    }
+
+    /// Liens d'une page (extension) : ceux déjà en file sont écartés ; plus de `LOT_CONFIRMER`
+    /// → une seule confirmation (fusionnée avec celle déjà ouverte ou en attente).
+    fn recevoir_lot(&mut self, lot: Vec<Demande>) {
+        let lot: Vec<Demande> = lot
+            .into_iter()
+            .filter(|d| !self.entries.iter().any(|e| deja_en_file(e, d.url.trim())))
+            .collect();
+        let ouverte = matches!(self.modale, Some(Modale::Lot(_)));
+        if !ouverte && self.lots.is_empty() && lot.len() <= LOT_CONFIRMER {
+            return self.ajouter_lot(lot);
+        }
+        let attente = match &mut self.modale {
+            Some(Modale::Lot(v)) => v,
+            _ => &mut self.lots,
+        };
+        for d in lot {
+            if !attente.iter().any(|x| x.url == d.url) {
+                attente.push(d);
+            }
+        }
+    }
+
+    /// Ajoute les liens d'un lot : fichiers dans la file (tri par type au nom donné par la
+    /// sonde) ; magnet et pages vidéo attendent leur fenêtre, un à la fois (`a_ouvrir`).
+    fn ajouter_lot(&mut self, lot: Vec<Demande>) {
+        // Le SHA-256 de la barre « coller » ne vaut pour aucun de ces liens.
+        let sha = std::mem::take(&mut self.sha);
+        for d in lot {
+            let u = d.url.trim();
+            if u.starts_with("magnet:") || video::site_video(u) {
+                self.a_ouvrir.push_back(d);
+            } else {
+                self.ajouter(d.url, d.referrer, d.cookies, false);
+            }
+        }
+        self.sha = sha;
     }
 
     /// Ajoute une entrée en attente, choisie dans la liste.
@@ -3801,6 +3845,10 @@ impl eframe::App for App {
             .unwrap_or_default();
         let reduite = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         for d in recus {
+            if !d.lot.is_empty() {
+                self.recevoir_lot(d.lot);
+                continue;
+            }
             // 2e instance lancée sans lien : montrer la fenêtre.
             if d.url.is_empty() {
                 montrer(ctx);
@@ -3827,6 +3875,16 @@ impl eframe::App for App {
             }
             // Un choix à faire (formats, fichiers d'un torrent) : la fenêtre passe devant.
             if !avant && self.modale.is_some() {
+                montrer(ctx);
+            }
+        }
+        // Lots : la confirmation, puis les liens qui ont leur fenêtre, quand aucune n'est ouverte.
+        if self.modale.is_none() && !self.lots.is_empty() {
+            self.modale = Some(Modale::Lot(std::mem::take(&mut self.lots)));
+            montrer(ctx);
+        } else if self.modale.is_none() {
+            if let Some(d) = self.a_ouvrir.pop_front() {
+                self.ajouter(d.url, d.referrer, d.cookies, false);
                 montrer(ctx);
             }
         }
@@ -4042,6 +4100,18 @@ fn montrer(ctx: &egui::Context) {
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+}
+
+/// Même lien déjà dans la file (fini : seulement si le fichier est encore là ; annulé : non).
+fn deja_en_file(e: &Entry, url: &str) -> bool {
+    e.url == url
+        && match &e.status {
+            Status::Done => e
+                .name
+                .as_ref()
+                .is_some_and(|n| Path::new(&e.dir).join(n).exists()),
+            s => *s != Status::Canceled,
+        }
 }
 
 /// Annulé (`annule`) : efface le `.part` et l'état d'un fichier HTTP, ou les fichiers
@@ -4486,6 +4556,69 @@ mod tests {
         app.schedule(1.0);
         let n = |s: Status| app.entries.iter().filter(|e| e.status == s).count();
         assert_eq!((n(Status::Running), n(Status::Queued)), (MAX_ACTIFS, 2));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 0.2.9 lot F : liens d'une page. Déjà en file écartés ; fichiers ajoutés tout de suite
+    /// (jusqu'à `LOT_CONFIRMER`) ; magnet et page vidéo attendent leur fenêtre ; au-delà, UNE
+    /// confirmation qui regroupe les lots suivants ; SHA-256 de la barre « coller » non repris.
+    #[test]
+    fn lot_de_liens() {
+        let d = std::env::temp_dir().join(format!("fluxdl-test-lot-{}", std::process::id()));
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, Some(d.join("cap")), None);
+        ctx.run_ui(Default::default(), |_| {})
+            .textures_delta
+            .clear();
+        app.capture = None;
+        app.entries.clear();
+        app.jobs.clear();
+        app.settings.folder = d.join("dl").to_string_lossy().into_owned();
+        app.sha = "abc".into();
+        app.nouvelle("https://a.b/0.zip".into(), Kind::Http);
+        let lien = |u: &str| Demande {
+            url: u.into(),
+            referrer: Some("https://a.b/page".into()),
+            ..Default::default()
+        };
+        app.recevoir_lot(
+            [
+                "https://a.b/0.zip",
+                "https://a.b/1.zip",
+                "https://a.b/2.pdf",
+                "magnet:?xt=urn:btih:abc",
+                "https://www.youtube.com/watch?v=x",
+            ]
+            .map(lien)
+            .into(),
+        );
+        assert!(app.modale.is_none() && app.lots.is_empty());
+        let urls: Vec<_> = app.entries.iter().map(|e| e.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://a.b/0.zip",
+                "https://a.b/1.zip",
+                "https://a.b/2.pdf"
+            ]
+        );
+        assert_eq!(app.entries[1].referrer.as_deref(), Some("https://a.b/page"));
+        assert!(app.entries[1].sha256.is_none() && app.sha == "abc");
+        assert_eq!(app.a_ouvrir.len(), 2);
+        // Plus de 20 : en attente de confirmation ; les suivants s'y ajoutent.
+        let n = |a: usize, b: usize| (a..b).map(|i| lien(&format!("https://a.b/f{i}.bin")));
+        app.recevoir_lot(n(0, 25).collect());
+        app.recevoir_lot(n(20, 28).collect());
+        assert_eq!((app.entries.len(), app.lots.len()), (3, 28));
+        app.modale = Some(Modale::Lot(std::mem::take(&mut app.lots)));
+        app.recevoir_lot(n(28, 30).chain([lien("https://a.b/1.zip")]).collect());
+        let Some(Modale::Lot(lot)) = app.modale.take() else {
+            panic!("confirmation attendue")
+        };
+        // f20…f24 reçus deux fois : comptés une fois.
+        assert_eq!(lot.len(), 30);
+        app.ajouter_lot(lot);
+        assert_eq!(app.entries.len(), 3 + 30);
         let _ = std::fs::remove_dir_all(&d);
     }
 

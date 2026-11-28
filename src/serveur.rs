@@ -10,6 +10,8 @@
 //! fichier : réponse donnée après la décision de l'appli : 200 `added` / `already_active` (le
 //! navigateur peut abandonner sa copie), 409 `already_done` / `refused`, 503 `timeout` (rien
 //! d'ajouté).
+//! `POST /add-many` {items: [{url, referrer?, cookies?}]} (liens d'une page, `LOT_MAX` au plus,
+//! mêmes contrôles par lien) → 200 `received` tout de suite (l'appli peut demander confirmation).
 //! `POST /focus` (2e instance seulement) : montre la fenêtre.
 //! `POST /pair` {nonce} (sans jeton, origine d'extension exigée) : appairage automatique. La 1re
 //! requête ouvre « Autoriser ? » dans l'appli (202) ; l'extension la répète avec le même nonce
@@ -37,6 +39,8 @@ pub const DELAI_DECISION: Duration = Duration::from_secs(5);
 const MAX_ENTETE: usize = 8 << 10;
 /// Vidéo avec cookies : 300 cookies (`cookies::MAX`) de 4 Kio au plus ≈ 1,3 Mo de JSON.
 const MAX_CORPS: usize = 2 << 20;
+/// Liens au plus dans un `/add-many` (comme `MAX_LINKS` de l'extension).
+pub const LOT_MAX: usize = 2000;
 /// Durée de vie d'une demande d'appairage (réponse comprise).
 pub const DELAI_APPAIRAGE: Duration = Duration::from_secs(60);
 /// Nouvelles demandes d'appairage au plus par minute.
@@ -68,6 +72,9 @@ pub struct Demande {
     /// Réponse attendue par le serveur (absente : rien à répondre).
     #[serde(skip)]
     pub decision: Option<Arc<Decision>>,
+    /// `/add-many` : liens d'une page, ajoutés ensemble (`url` vide).
+    #[serde(skip)]
+    pub lot: Vec<Demande>,
 }
 
 impl Demande {
@@ -84,14 +91,14 @@ impl PartialEq for Demande {
             &self.filename,
             &self.cookies,
             self.locale,
-            (&self.kind, &self.video_cookies),
+            (&self.kind, &self.video_cookies, &self.lot),
         ) == (
             &o.url,
             &o.referrer,
             &o.filename,
             &o.cookies,
             o.locale,
-            (&o.kind, &o.video_cookies),
+            (&o.kind, &o.video_cookies, &o.lot),
         )
     }
 }
@@ -439,16 +446,12 @@ pub fn traiter(
                 return avec(rep(400, r#"{"error":"bad body"}"#));
             };
             d.locale = origine == ORIGINE_LOCALE;
-            let u = d.url.trim();
-            let permis = u.starts_with("http://")
-                || u.starts_with("https://")
-                || u.starts_with("magnet:")
-                || (d.locale && u.to_ascii_lowercase().ends_with(".torrent"));
-            if !permis || u.len() > 16 << 10 {
+            if !lien_permis(&d) {
                 return avec(rep(400, r#"{"error":"bad url"}"#));
             }
             // Vidéo : page http(s) seulement ; cookies structurés seulement pour une vidéo.
             let video = d.video();
+            let u = d.url.trim();
             let page = u.starts_with("http://") || u.starts_with("https://");
             if d.kind.as_deref().is_some_and(|k| k != "video")
                 || (video && !page)
@@ -460,8 +463,53 @@ pub fn traiter(
             r.demande = Some(d);
             r
         }
+        ("POST", "/add-many") => {
+            #[derive(Deserialize)]
+            struct Corps {
+                items: Vec<Demande>,
+            }
+            let Ok(c) = serde_json::from_slice::<Corps>(corps) else {
+                return avec(rep(400, r#"{"error":"bad body"}"#));
+            };
+            if c.items.len() > LOT_MAX {
+                return avec(rep(413, r#"{"error":"too many"}"#));
+            }
+            // Fichiers et liens magnet seulement : ni vidéo, ni sonde, ni .torrent local.
+            let mut lot: Vec<Demande> = Vec::new();
+            for d in c.items {
+                if !lien_permis(&d) || d.kind.is_some() || d.video_cookies.is_some() || d.probe {
+                    return avec(rep(400, r#"{"error":"bad url"}"#));
+                }
+                if !lot.iter().any(|x| x.url == d.url) {
+                    lot.push(d);
+                }
+            }
+            if lot.is_empty() {
+                return avec(rep(400, r#"{"error":"empty"}"#));
+            }
+            let mut r = avec(rep(
+                200,
+                &serde_json::json!({ "ok": true, "status": "received", "count": lot.len() })
+                    .to_string(),
+            ));
+            r.demande = Some(Demande {
+                lot,
+                ..Default::default()
+            });
+            r
+        }
         _ => avec(rep(404, r#"{"error":"not found"}"#)),
     }
+}
+
+/// Lien accepté : http(s), magnet, ou chemin de .torrent venu de l'appli elle-même.
+fn lien_permis(d: &Demande) -> bool {
+    let u = d.url.trim();
+    let permis = u.starts_with("http://")
+        || u.starts_with("https://")
+        || u.starts_with("magnet:")
+        || (d.locale && u.to_ascii_lowercase().ends_with(".torrent"));
+    permis && u.len() <= 16 << 10
 }
 
 /// Lit une requête : en-têtes puis `Content-Length` octets (tailles bornées).
@@ -516,6 +564,7 @@ fn repondre(s: &mut TcpStream, r: &Reponse) {
         401 => "Unauthorized",
         403 => "Forbidden",
         409 => "Conflict",
+        413 => "Payload Too Large",
         503 => "Service Unavailable",
         410 => "Gone",
         429 => "Too Many Requests",
@@ -839,6 +888,53 @@ mod tests {
         assert_eq!(envoyer(&ext(J), "OPTIONS", "/add", "").code, 204);
     }
 
+    /// `/add-many` : liens d'une page en un envoi (doublons retirés), mêmes contrôles qu'un
+    /// `/add` (jeton, origine, lien par lien), nombre de liens borné.
+    #[test]
+    fn ajout_groupe() {
+        let corps = r#"{"items":[{"url":"https://a.b/1.zip","referrer":"https://a.b/","cookies":"s=1"},
+            {"url":"magnet:?xt=urn:btih:abc"},{"url":"https://a.b/1.zip"}]}"#;
+        let r = envoyer(&ext(J), "POST", "/add-many", corps);
+        assert_eq!((r.code, r.corps.contains(r#""count":2"#)), (200, true));
+        let d = r.demande.unwrap();
+        assert!(d.url.is_empty() && d.decision.is_none());
+        let urls: Vec<&str> = d.lot.iter().map(|x| x.url.as_str()).collect();
+        assert_eq!(urls, ["https://a.b/1.zip", "magnet:?xt=urn:btih:abc"]);
+        assert_eq!(d.lot[0].cookies.as_deref(), Some("s=1"));
+        assert_eq!(d.lot[0].referrer.as_deref(), Some("https://a.b/"));
+        // Sans jeton, jeton faux, page web : refusé.
+        let sans: Vec<_> = ext(J)
+            .into_iter()
+            .filter(|e| e.0 != "X-Fluxdl-Token")
+            .collect();
+        assert_eq!(envoyer(&sans, "POST", "/add-many", corps).code, 401);
+        assert_eq!(envoyer(&ext("faux"), "POST", "/add-many", corps).code, 401);
+        let mut web = ext(J);
+        web[1].1 = "https://pirate.example".into();
+        assert_eq!(envoyer(&web, "POST", "/add-many", corps).code, 403);
+        // Un seul lien interdit (fichier local, .torrent, vidéo, sonde) : tout est refusé.
+        for mauvais in [
+            r#"{"items":[{"url":"https://a.b/1.zip"},{"url":"file:///etc/passwd"}]}"#,
+            r#"{"items":[{"url":"C:\Users\a\b.torrent"}]}"#,
+            r#"{"items":[{"url":"https://www.youtube.com/watch?v=x","kind":"video"}]}"#,
+            r#"{"items":[{"url":"https://a.b/1.zip","probe":true}]}"#,
+            r#"{"items":[]}"#,
+            r#"{"url":"https://a.b/1.zip"}"#,
+        ] {
+            assert_eq!(
+                envoyer(&ext(J), "POST", "/add-many", mauvais).code,
+                400,
+                "{mauvais}"
+            );
+        }
+        // Trop de liens : 413.
+        let items: Vec<_> = (0..=LOT_MAX)
+            .map(|i| serde_json::json!({ "url": format!("https://a.b/{i}.zip") }))
+            .collect();
+        let trop = serde_json::json!({ "items": items }).to_string();
+        assert_eq!(envoyer(&ext(J), "POST", "/add-many", &trop).code, 413);
+    }
+
     #[test]
     fn debit_limite() {
         let mut lim = Limiteur::default();
@@ -1022,6 +1118,16 @@ mod tests {
         assert!(montrer(port, J));
         assert_eq!(ui.join().unwrap(), ["magnet:?xt=urn:btih:abc"; 2]);
         assert!(!confier(port, "faux", "magnet:?xt=urn:btih:abc"));
+        // Corps plus gros que `MAX_CORPS` : connexion fermée sans rien lire ni transmettre.
+        let gros = format!(
+            r#"{{"items":[{{"url":"https://a.b/{}"}}]}}"#,
+            "x".repeat(MAX_CORPS)
+        );
+        let r = ureq::post(&format!("http://127.0.0.1:{port}/add-many"))
+            .set("Origin", "chrome-extension://abcdefghijklmnop")
+            .set("X-Fluxdl-Token", J)
+            .send_string(&gros);
+        assert!(matches!(r, Err(ureq::Error::Transport(_))));
         // Serveur coupé pour l'extension : la 2e instance passe toujours (jeton local).
         *jeton.lock().unwrap() = String::new();
         let e = ext(J);

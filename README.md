@@ -139,7 +139,7 @@ A free, open-source multi-connection download manager (Windows + Linux, single e
 ### Extension features (0.2.1)
 - Auto-capture: clicking a site's download button hands the real file (final URL after redirects) to fluxdl; the browser download is cancelled only once fluxdl confirms. If fluxdl isn't running, the browser keeps the download and shows a badge.
 - Floating "⬇ fluxdl" button when hovering file links and videos (toggle in the popup).
-- Right-click: "Download with fluxdl" on links, videos and audio; "Download all links on this page…" opens a picker.
+- Right-click: "Download with fluxdl" on links, videos and audio; "Get the links of this page" (or of the selection, or from the popup) opens a picker with type and extension filters.
 - Options: capture everything, always/never-capture site lists, per-site cookie sending (off by default).
 
 ## Browser extension

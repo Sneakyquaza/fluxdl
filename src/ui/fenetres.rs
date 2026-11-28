@@ -207,6 +207,30 @@ impl App {
                 }
                 return fermer;
             }
+            Modale::Lot(lot) => {
+                let n = lot.len();
+                titre_modale(
+                    ui,
+                    Icone::Telecharger,
+                    &format!("{} {n} {}", t(l, "Add"), t(l, "downloads?")),
+                );
+                paragraphe(
+                    ui,
+                    t(
+                        l,
+                        "Links sent from a web page by the browser extension. Those already in the list are skipped.",
+                    ),
+                );
+                match boutons(ui, t(l, "Cancel"), &format!("{} ({n})", t(l, "Add")), true) {
+                    Some(true) => {
+                        self.ajouter_lot(lot);
+                        return true;
+                    }
+                    Some(false) => return true,
+                    None => self.modale = Some(Modale::Lot(lot)),
+                }
+                return false;
+            }
             Modale::Association => {
                 titre_modale(ui, Icone::Aimant, t(l, "Open torrents with fluxdl?"));
                 paragraphe(

@@ -1,7 +1,7 @@
 // Script de contenu : bouton flottant « ⬇ fluxdl » au survol des liens de fichiers (vérifiés par
 // l'arrière-plan : pas de bouton sur une page web) et des
 // vidéos/sons, bouton près du lecteur sur les pages de vidéo des sites de sites.js (chargé
-// avant ce script), et collecte des liens pour la page « tout télécharger ».
+// avant ce script), et collecte des liens pour la page de choix.
 // Ne lit jamais le stockage (le jeton y est) et ne parle qu'à l'arrière-plan.
 "use strict";
 
@@ -300,19 +300,38 @@
     if (target) offer(target);
   }
 
-  // Liens pour la page « tout télécharger »
-  function collect() {
+  // Liens pour la page de choix : a[href], img/video/audio/source[src], liens écrits en clair
+  // dans la sélection ; http(s) et magnet seulement, absolus, sans doublon ni ancre de la page.
+  // `selection` : seulement ce qui est sélectionné.
+  const TEXT_LINK = /\b(?:https?:\/\/|magnet:\?)[^\s<>"'`]+/gi;
+  function collect(selection) {
+    const sel = selection ? window.getSelection() : null;
+    const here = location.href.split("#")[0];
+    const seen = new Set();
     const links = [];
+    const add = (raw, text, extra) => {
+      let url;
+      try {
+        url = new URL(raw, location.href).href;
+      } catch {
+        return;
+      }
+      if (!isHttp(url) && !/^magnet:\?/i.test(url)) return; // javascript:, mailto:, data:, blob:…
+      if (url.includes("#") && url.split("#")[0] === here) return;
+      if (seen.has(url) || links.length >= 3000) return;
+      seen.add(url);
+      links.push({ url, text: (text || "").trim().replace(/\s+/g, " ").slice(0, 200), ...extra });
+    };
+    const inSel = (el) => !sel || (sel.rangeCount > 0 && sel.containsNode(el, true));
     for (const a of document.querySelectorAll("a[href]")) {
-      if (!isHttp(a.href)) continue;
-      const text = (a.textContent || a.title || "").trim().replace(/\s+/g, " ").slice(0, 200);
-      links.push({ url: a.href, text, dl: a.hasAttribute("download") });
-      if (links.length >= 3000) break;
+      if (inSel(a)) add(a.href, a.textContent || a.title, { dl: a.hasAttribute("download") });
     }
-    for (const el of document.querySelectorAll("video, audio")) {
-      const url = mediaSrc(el);
-      if (url) links.push({ url, text: el.title || "", media: true });
+    for (const el of document.querySelectorAll("img[src], video, audio, source[src]")) {
+      if (!inSel(el)) continue;
+      const url = el.tagName === "IMG" ? el.currentSrc || el.src : el.tagName === "SOURCE" ? el.src : mediaSrc(el);
+      if (url) add(url, el.alt || el.title, { media: true });
     }
+    if (sel) for (const m of sel.toString().matchAll(TEXT_LINK)) add(m[0].replace(/[).,;:!?\]]+$/, ""), "");
     return { links, page: location.href, title: document.title };
   }
 
@@ -437,7 +456,7 @@
 
   api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (sender.id !== api.runtime.id || msg?.type !== "fluxdl-collect") return;
-    sendResponse(collect());
+    sendResponse(collect(msg.selection === true));
   });
 
   document.addEventListener("mouseover", onPointer, { capture: true, passive: true });

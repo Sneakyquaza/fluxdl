@@ -17,14 +17,16 @@
     </div>
 
     <section class="card">
+      <div id="types" class="types" role="radiogroup" data-i18n-title="pickTypes"></div>
       <div class="tools">
-        <input type="text" id="filter" spellcheck="false" data-i18n-placeholder="pickFilter">
-        <label class="check"><input type="checkbox" id="showAll"> <span data-i18n="pickShowAll"></span></label>
+        <input type="text" id="filter" spellcheck="false" data-i18n-placeholder="pickFilter" data-i18n-title="pickFilter">
+        <input type="text" id="exts" class="exts" spellcheck="false" data-i18n-placeholder="pickExts" data-i18n-title="pickExtsHint">
       </div>
       <div class="tools">
         <button type="button" id="all" class="secondary" data-i18n="pickSelectAll"></button>
         <button type="button" id="none" class="secondary" data-i18n="pickSelectNone"></button>
-        <span id="count" class="count"></span>
+        <label class="check"><input type="checkbox" id="showAll"> <span data-i18n="pickShowAll"></span></label>
+        <span id="count" class="count" role="status"></span>
       </div>
       <ul id="list" class="list" aria-labelledby="count"></ul>
       <p id="empty" class="hint" data-i18n="pickEmpty" hidden></p>
@@ -32,7 +34,7 @@
 
     <div class="footer">
       <p id="msg" class="msg" role="status"></p>
-      <button type="button" id="send" class="go" data-i18n="pickSend"></button>
+      <button type="button" id="send" class="go"></button>
     </div>
   </main>
 

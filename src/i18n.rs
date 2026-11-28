@@ -740,6 +740,12 @@ const FR: &[(&str, &str)] = &[
         "Damaged archive: a file is larger than announced.",
         "Archive abîmée : un fichier est plus gros qu'annoncé.",
     ),
+    ("Add", "Ajouter"),
+    ("downloads?", "téléchargements ?"),
+    (
+        "Links sent from a web page by the browser extension. Those already in the list are skipped.",
+        "Liens envoyés depuis une page web par l'extension du navigateur. Ceux déjà dans la liste sont ignorés.",
+    ),
 ];
 
 pub fn t(lang: Lang, en: &'static str) -> &'static str {

@@ -28,7 +28,8 @@ const FILE_EXTS = (
 
 const APP_ORIGIN = "http://127.0.0.1/*";
 const TIMEOUT_MS = 1500;
-// /add : l'appli répond après avoir décidé (5 s au plus), et peut d'abord sonder le lien
+// /add : l'appli répond après avoir décidé (5 s au plus), et peut d'abord sonder le lien ;
+// /add-many : jusqu'à ~1,5 Mo de liens d'une page
 const ADD_TIMEOUT_MS = 12000;
 
 function t(key, subs) {
@@ -62,7 +63,7 @@ async function callApp(path, body, settings) {
   if (!s.token) return { state: "unpaired" };
   if (!(await hasAppAccess())) return { state: "noaccess" };
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), path === "/add" ? ADD_TIMEOUT_MS : TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), path.startsWith("/add") ? ADD_TIMEOUT_MS : TIMEOUT_MS);
   try {
     const opts = {
       method: body ? "POST" : "GET",
@@ -82,10 +83,11 @@ async function callApp(path, body, settings) {
     } catch {
       // corps vide ou non JSON
     }
-    const map = { 200: "ok", 400: "bad", 401: "unpaired", 403: "origin", 409: "kept", 429: "rate", 503: "kept" };
+    const map = { 200: "ok", 400: "bad", 401: "unpaired", 403: "origin", 409: "kept", 413: "bad", 429: "rate", 503: "kept" };
     let state = map[res.status] ?? "error";
-    // Appli 0.2.3+ : « ok » seulement si le lien est ajouté ou déjà en cours
-    if (state === "ok" && typeof data?.status === "string" && !["added", "already_active"].includes(data.status)) {
+    // Appli 0.2.3+ : « ok » seulement si le lien est ajouté ou déjà en cours (received : liens
+    // d'une page reçus, l'appli peut encore demander confirmation)
+    if (state === "ok" && typeof data?.status === "string" && !["added", "already_active", "received"].includes(data.status)) {
       state = "kept";
     }
     return { state, status: res.status, data };
@@ -184,6 +186,13 @@ function parseList(text) {
     .split(/[\s,;]+/)
     .map((x) => x.trim().replace(/^\./, "").toLowerCase())
     .filter(Boolean);
+}
+
+// Même site (≈ 2 derniers libellés de l'hôte, comme `cookies::site_de` de l'appli) ;
+// raccourci : sans liste des suffixes publics (a.co.uk ≈ b.co.uk), à revoir si ça gêne.
+function sameSite(a, b) {
+  const site = (u) => hostOf(u).split(".").slice(-2).join(".");
+  return !!site(a) && site(a) === site(b);
 }
 
 function hostOf(url) {
