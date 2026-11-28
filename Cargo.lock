@@ -1172,7 +1172,7 @@ dependencies = [
 
 [[package]]
 name = "fluxdl"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "arboard",
  "eframe",

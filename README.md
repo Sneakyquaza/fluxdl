@@ -56,6 +56,9 @@ A free, open-source multi-connection download manager (Windows + Linux, single e
   files (asked on the first torrent, toggle in Settings, current user only).
 - **Browser extension** (below).
 
+### New in 0.2.11
+- **Language choice in the guided tour:** FR | EN on every card, and in large on the welcome card. It applies to the whole app at once (same setting as Settings → Language).
+
 ### New in 0.2.10
 - **Guided tour** at first launch (and once after updating): ten short illustrated cards on what fluxdl does, with arrows, step dots and ← → / Esc. Setup cards have their own button (watch the clipboard, install the extension, video tools, scheduling, sorting and extraction, download folder, magnet links on Windows) and show "Done" once set. Replay it from Settings → Guided tour.
 

@@ -3918,7 +3918,7 @@ impl App {
         let f = *frame;
         let dir = dir.clone();
         // Assez d'images entre le changement de vue et la capture pour finir les animations.
-        let vues: [(Tab, Lang, &str); 52] = [
+        let vues: [(Tab, Lang, &str); 54] = [
             (Tab::Downloads, Lang::En, "downloads"),
             (Tab::Benchmark, Lang::En, "benchmark"),
             (Tab::Settings, Lang::En, "settings"),
@@ -3971,6 +3971,8 @@ impl App {
             (Tab::Downloads, Lang::Fr, "narrow_900x600_fr"),
             (Tab::Downloads, Lang::Fr, "tour_6_900x600_fr"),
             (Tab::Downloads, Lang::Fr, "tour_2_900x600_fr"),
+            (Tab::Downloads, Lang::Fr, "tour_0_900x600_fr"),
+            (Tab::Downloads, Lang::En, "tour_0_900x600_en"),
         ];
         for (i, (tab, lang, nom)) in vues.into_iter().enumerate() {
             let k = 30 * (i as u32 + 1);
@@ -5397,6 +5399,28 @@ mod tests {
         // Revoir depuis les réglages : depuis la première carte.
         app.revoir_visite();
         assert_eq!(app.visite.as_ref().unwrap().carte, 0);
+    }
+
+    /// Langue changée depuis la visite : réglage de l'appli changé, visite sur la même carte.
+    #[test]
+    fn visite_langue() {
+        let ctx = egui::Context::default();
+        let d =
+            std::env::temp_dir().join(format!("fluxdl-test-visite-langue-{}", std::process::id()));
+        let mut app = App::new(&ctx, Some(d), None);
+        ctx.run_ui(Default::default(), |_| {})
+            .textures_delta
+            .clear();
+        app.revoir_visite();
+        app.visite.as_mut().unwrap().aller(4);
+        app.settings.lang = Lang::En;
+        app.choisir_langue(Lang::Fr);
+        assert!(app.settings.lang == Lang::Fr);
+        assert_eq!(app.visite.as_ref().unwrap().carte, 4);
+        assert!(visite::visible(app.visite.as_ref(), app.modale.is_some()));
+        app.choisir_langue(Lang::En);
+        assert!(app.settings.lang == Lang::En);
+        assert_eq!(app.visite.as_ref().unwrap().carte, 4);
     }
 
     /// Faux yt-dlp qui rend une playlist → une entrée par vidéo cochée, dans le sous-dossier

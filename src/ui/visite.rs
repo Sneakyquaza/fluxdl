@@ -8,6 +8,8 @@ use super::*;
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) enum Action {
     Aucune,
+    /// Choix de la langue en grand sous le texte (carte de bienvenue).
+    Langue,
     /// Surveillance du presse-papiers.
     Presse,
     /// Guide d'installation de l'extension (la visite attend derrière).
@@ -53,7 +55,7 @@ static CARTES: [Carte; 10] = [
         deco: Deco::Logo,
         titre: "Welcome to fluxdl",
         texte: "Each file is cut into pieces downloaded side by side, up to 32 connections at once: much faster with most servers. A stopped download resumes where it left off.",
-        action: Action::Aucune,
+        action: Action::Langue,
     },
     Carte {
         icone: Icone::Coller,
@@ -226,6 +228,18 @@ impl App {
         }
     }
 
+    /// Langue choisie dans la visite : même réglage que Réglages → Interface → Langue, écrit
+    /// tout de suite ; la visite reste sur sa carte.
+    pub(super) fn choisir_langue(&mut self, lang: Lang) {
+        if self.settings.lang == lang {
+            return;
+        }
+        self.settings.lang = lang;
+        if self.capture.is_none() {
+            store::save(SETTINGS, &self.settings);
+        }
+    }
+
     /// Réglages → « Revoir la visite guidée » : reprend une visite en pause, sinon depuis le
     /// début.
     pub(super) fn revoir_visite(&mut self) {
@@ -261,7 +275,7 @@ impl App {
                 self.settings.handler_asked = true;
                 self.settings.torrent_handler = torrent::associer(true);
             }
-            Action::Aucune | Action::Apres => {}
+            Action::Aucune | Action::Langue | Action::Apres => {}
         }
     }
 
@@ -277,7 +291,7 @@ impl App {
                 .as_ref()
                 .is_some_and(|v| v.dossier != self.settings.folder),
             Action::Torrents => self.settings.torrent_handler,
-            Action::Aucune | Action::Apres => false,
+            Action::Aucune | Action::Langue | Action::Apres => false,
         }
     }
 
@@ -332,6 +346,7 @@ impl App {
         let mut action = None;
         let mut aller = None;
         let mut fin = false;
+        let mut lang = l;
         egui::Area::new(egui::Id::unique("visite"))
             .order(egui::Order::Foreground)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
@@ -356,12 +371,40 @@ impl App {
                     TEXTE3,
                 );
                 let txt = t(l, "Skip");
-                let w = p.layout_no_wrap(txt.into(), demi(13.5), TEXTE).size().x + 36.0;
+                // Largeur de la plus longue traduction : rien ne bouge quand la langue change.
+                let w = [Lang::Fr, Lang::En]
+                    .map(|k| {
+                        p.layout_no_wrap(t(k, "Skip").into(), demi(13.5), TEXTE)
+                            .size()
+                            .x
+                    })
+                    .into_iter()
+                    .fold(0.0, f32::max)
+                    + 36.0;
                 let bp =
                     Rect::from_min_size(pos2(r.right() - 16.0 - w, r.top() + 15.0), vec2(w, 30.0));
                 if a_la_place(ui, bp, |ui| bouton_secondaire(ui, txt, None, bp.size())).clicked() {
                     fin = true;
                 }
+                // Langue, sur toutes les cartes, à gauche de « Passer ».
+                let bl = Rect::from_min_size(
+                    pos2(bp.left() - 10.0 - 90.0, r.top() + 17.0),
+                    vec2(90.0, 26.0),
+                );
+                ui.scope_builder(
+                    UiBuilder::new().max_rect(bl).id_salt("visite-langue"),
+                    |ui| {
+                        segmente_taille(
+                            ui,
+                            &mut lang,
+                            &[(Lang::Fr, "FR"), (Lang::En, "EN")],
+                            42.0,
+                            26.0,
+                            12.0,
+                        )
+                        .on_hover_text("Langue / Language")
+                    },
+                );
                 // Cartes : celle d'avant et la suivante pendant le glissement.
                 let zone = Rect::from_min_max(
                     pos2(r.left() + 1.0, r.top() + 54.0),
@@ -437,6 +480,9 @@ impl App {
         if let Some(x) = action {
             self.agir_visite(x);
         }
+        if lang != l {
+            self.choisir_langue(lang);
+        }
         if fin {
             self.finir_visite();
         }
@@ -488,6 +534,7 @@ impl App {
         let ha = match c.action {
             _ if sans_bouton => 0.0,
             Action::Apres => 72.0,
+            Action::Langue => 78.0,
             _ if linux => 34.0,
             _ => 50.0,
         };
@@ -552,6 +599,36 @@ impl App {
             Action::Dossier => (t(l, "Change the folder"), Icone::Dossier),
             Action::Torrents if cfg!(windows) => {
                 (t(l, "Open magnet links with fluxdl"), Icone::Aimant)
+            }
+            Action::Langue => {
+                p.text(
+                    pos2(cx, y + 8.0),
+                    Align2::CENTER_CENTER,
+                    "Langue / Language",
+                    moyen(12.5),
+                    TEXTE3,
+                );
+                let b = Rect::from_center_size(pos2(cx, y + 44.0), vec2(266.0, 40.0));
+                let mut lang = l;
+                ui.scope_builder(
+                    UiBuilder::new()
+                        .max_rect(b)
+                        .id_salt(("visite-langue-carte", k)),
+                    |ui| {
+                        ui.set_clip_rect(zone);
+                        ui.multiply_opacity(o);
+                        segmente_taille(
+                            ui,
+                            &mut lang,
+                            &[(Lang::Fr, "Français"), (Lang::En, "English")],
+                            130.0,
+                            40.0,
+                            14.5,
+                        );
+                    },
+                );
+                self.choisir_langue(lang);
+                return None;
             }
             Action::Apres => {
                 let inters = [

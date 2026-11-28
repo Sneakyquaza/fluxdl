@@ -1390,19 +1390,33 @@ pub fn coche_ronde(p: &egui::Painter, c: Pos2, rayon: f32) {
 
 /// Contrôle segmenté : gel argenté, segment choisi en gel bleu qui glisse.
 pub fn segmente<T: PartialEq + Copy>(ui: &mut Ui, v: &mut T, options: &[(T, &str)]) -> Response {
-    let l = 96.0;
+    segmente_taille(ui, v, options, 96.0, 34.0, 13.0)
+}
+
+/// `segmente` à la taille donnée : largeur d'un segment `l`, hauteur `h`, taille du texte.
+pub fn segmente_taille<T: PartialEq + Copy>(
+    ui: &mut Ui,
+    v: &mut T,
+    options: &[(T, &str)],
+    l: f32,
+    h: f32,
+    taille: f32,
+) -> Response {
     let (r, mut rep) =
-        ui.allocate_exact_size(vec2(l * options.len() as f32 + 6.0, 34.0), Sense::hover());
+        ui.allocate_exact_size(vec2(l * options.len() as f32 + 6.0, h), Sense::hover());
     let p = ui.painter().clone();
-    gel(&p, r, 17.0, GEL_ARGENT, true, false);
+    gel(&p, r, h / 2.0, GEL_ARGENT, true, false);
     let i = options.iter().position(|o| o.0 == *v).unwrap_or(0);
     let x = anim::valeur(ui.ctx(), rep.id.with("glisse"), i as f32, 0.22);
-    let sel = Rect::from_min_size(pos2(r.left() + 3.0 + x * l, r.top() + 3.0), vec2(l, 28.0));
-    gel(&p, sel, 14.0, GEL_BLEU, false, false);
+    let sel = Rect::from_min_size(
+        pos2(r.left() + 3.0 + x * l, r.top() + 3.0),
+        vec2(l, h - 6.0),
+    );
+    gel(&p, sel, h / 2.0 - 3.0, GEL_BLEU, false, false);
     for (k, (val, nom)) in options.iter().enumerate() {
         let cr = Rect::from_min_size(
             pos2(r.left() + 3.0 + k as f32 * l, r.top() + 3.0),
-            vec2(l, 28.0),
+            vec2(l, h - 6.0),
         );
         let c = ui.interact(cr, rep.id.with(k), Sense::click());
         if c.clicked() && *v != *val {
@@ -1410,13 +1424,13 @@ pub fn segmente<T: PartialEq + Copy>(ui: &mut Ui, v: &mut T, options: &[(T, &str
             rep.mark_changed();
         }
         if k == i {
-            let g = p.layout_no_wrap(nom.to_string(), demi(13.0), Color32::WHITE);
+            let g = p.layout_no_wrap(nom.to_string(), demi(taille), Color32::WHITE);
             let pos = cr.center() - g.size() / 2.0;
             p.galley_with_override_text_color(pos + vec2(0.0, 1.0), g.clone(), nuit(110));
             p.galley(pos, g, Color32::WHITE);
         } else {
             let col = if c.hovered() { TITRE } else { TEXTE2 };
-            p.text(cr.center(), Align2::CENTER_CENTER, *nom, moyen(13.0), col);
+            p.text(cr.center(), Align2::CENTER_CENTER, *nom, moyen(taille), col);
         }
     }
     rep
