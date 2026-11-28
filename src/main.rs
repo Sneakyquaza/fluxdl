@@ -6,6 +6,7 @@ mod apres;
 mod cookies;
 mod extension;
 mod github;
+mod historique;
 mod i18n;
 mod icone;
 mod instance;

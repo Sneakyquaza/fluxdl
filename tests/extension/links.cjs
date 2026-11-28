@@ -37,6 +37,27 @@ function typeTableTests() {
   for (const [rsName, jsName] of Object.entries(names)) check(`types : ${jsName} = apres.rs`, ctx.TYPES[jsName] === app[rsName], `${ctx.TYPES[jsName]} / ${app[rsName]}`);
 }
 
+// ---- Règle « même site » de common.js (référent et cookies d'un lien) ----
+function sameSiteTests() {
+  const ctx = { globalThis: {}, chrome: {}, URL };
+  vm.createContext(ctx);
+  vm.runInContext(fs.readFileSync(path.join(SRC, "common.js"), "utf8") + "\nthis.sameSite = sameSite;", ctx);
+  const cases = [
+    ["https://exemple.fr/a.zip", "https://exemple.fr/page", true],
+    ["https://cdn.exemple.fr/a.zip", "https://exemple.fr/page", true],
+    ["https://exemple.fr/a.zip", "https://cdn.exemple.fr/page", false],
+    ["https://cdn.exemple.fr/a.zip", "https://www.exemple.fr/page", false],
+    ["https://b.co.uk/a.zip", "https://a.co.uk/page", false],
+    ["https://y.github.io/a.zip", "https://x.github.io/page", false],
+    ["https://github.io/a.zip", "https://x.github.io/page", false],
+    ["https://evilexemple.fr/a.zip", "https://exemple.fr/page", false],
+    ["https://exemple.fr.evil.com/a.zip", "https://exemple.fr/page", false],
+    ["magnet:?xt=urn:btih:abc", "https://exemple.fr/page", false],
+    ["https://exemple.fr/a.zip", "", false],
+  ];
+  for (const [url, page, want] of cases) check(`même site : ${url} depuis ${page || "(rien)"} → ${want}`, ctx.sameSite(url, page) === want);
+}
+
 function testBuild() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fluxdl-ext-"));
   fs.cpSync(SRC, dir, { recursive: true, filter: (p) => !p.includes(`${path.sep}dist`) });
@@ -115,6 +136,7 @@ function fakeSite() {
 
 (async () => {
   typeTableTests();
+  sameSiteTests();
   const ext = testBuild();
   const app = fakeApp();
   const site = fakeSite();

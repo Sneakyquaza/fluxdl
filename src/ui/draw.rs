@@ -641,6 +641,7 @@ pub enum Icone {
     Aimant,
     Actualiser,
     Copier,
+    Horloge,
 }
 
 fn trait_(p: &egui::Painter, pts: &[Pos2], s: Stroke) {
@@ -766,6 +767,10 @@ pub fn icone(p: &egui::Painter, r: Rect, i: Icone, c: Color32) {
                 c,
                 Stroke::NONE,
             ));
+        }
+        Icone::Horloge => {
+            p.circle_stroke(q(8.0, 8.0), 6.2 * k, s);
+            trait_(p, &[q(8.0, 4.5), q(8.0, 8.0), q(10.8, 9.8)], s);
         }
     }
 }

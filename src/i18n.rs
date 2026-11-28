@@ -746,6 +746,33 @@ const FR: &[(&str, &str)] = &[
         "Links sent from a web page by the browser extension. Those already in the list are skipped.",
         "Liens envoyés depuis une page web par l'extension du navigateur. Ceux déjà dans la liste sont ignorés.",
     ),
+    ("History", "Historique"),
+    ("Clear history", "Vider l'historique"),
+    ("Clear history?", "Vider l'historique ?"),
+    (
+        "All entries leave the history. Downloaded files are kept.",
+        "Toutes les entrées quittent l'historique. Les fichiers téléchargés sont gardés.",
+    ),
+    ("Search by name, link or site", "Rechercher par nom, lien ou site"),
+    ("All", "Tous"),
+    ("Successful", "Terminés"),
+    ("Errors", "Échoués"),
+    ("All types", "Tous les types"),
+    ("Newest", "Récents"),
+    ("Oldest", "Anciens"),
+    ("No history yet", "Historique vide"),
+    (
+        "Finished, failed and canceled downloads appear here, even after they leave the list.",
+        "Les téléchargements terminés, échoués et annulés s'affichent ici, même retirés de la liste.",
+    ),
+    ("Nothing matches", "Aucun résultat"),
+    ("Change the search or the filters.", "Change la recherche ou les filtres."),
+    ("Retry", "Réessayer"),
+    ("Download again", "Retélécharger"),
+    ("Open file", "Ouvrir le fichier"),
+    ("File not found", "Fichier introuvable"),
+    ("Copy link", "Copier le lien"),
+    ("Remove from history", "Retirer de l'historique"),
 ];
 
 pub fn t(lang: Lang, en: &'static str) -> &'static str {

@@ -188,11 +188,13 @@ function parseList(text) {
     .filter(Boolean);
 }
 
-// Même site (≈ 2 derniers libellés de l'hôte, comme `cookies::site_de` de l'appli) ;
-// raccourci : sans liste des suffixes publics (a.co.uk ≈ b.co.uk), à revoir si ça gêne.
-function sameSite(a, b) {
-  const site = (u) => hostOf(u).split(".").slice(-2).join(".");
-  return !!site(a) && site(a) === site(b);
+// Même site que la page : hôte exact de la page ou un de ses sous-domaines (jamais deux voisins
+// sous un même suffixe : a.co.uk ≠ b.co.uk, x.github.io ≠ y.github.io) ;
+// raccourci : cdn.exemple.fr depuis www.exemple.fr n'a pas le référent, à revoir si ça gêne.
+function sameSite(url, page) {
+  const h = hostOf(url);
+  const p = hostOf(page);
+  return !!p && (h === p || h.endsWith("." + p));
 }
 
 function hostOf(url) {

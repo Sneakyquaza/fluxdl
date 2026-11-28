@@ -216,7 +216,7 @@ pub fn save<T: Serialize>(name: &str, v: &T) {
     save_in(&data_dir(), name, v);
 }
 
-fn save_in<T: Serialize>(d: &std::path::Path, name: &str, v: &T) {
+pub fn save_in<T: Serialize>(d: &std::path::Path, name: &str, v: &T) {
     let _ = std::fs::create_dir_all(d);
     // Jeton et cookies dedans : dossier et fichiers lisibles par l'utilisateur seul.
     #[cfg(unix)]

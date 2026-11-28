@@ -316,6 +316,34 @@ impl App {
                 }
                 return false;
             }
+            Modale::ViderHistorique => {
+                titre_modale(ui, Icone::Horloge, t(l, "Clear history?"));
+                paragraphe(
+                    ui,
+                    t(
+                        l,
+                        "All entries leave the history. Downloaded files are kept.",
+                    ),
+                );
+                match boutons_avec(
+                    ui,
+                    t(l, "Cancel"),
+                    t(l, "Clear history"),
+                    true,
+                    Icone::Fermer,
+                    gel_de(DANGER),
+                ) {
+                    Some(true) => {
+                        self.historique.clear();
+                        self.hist_sale = true;
+                        self.last_save = f64::NEG_INFINITY;
+                        return true;
+                    }
+                    Some(false) => return true,
+                    None => self.modale = Some(Modale::ViderHistorique),
+                }
+                return false;
+            }
             Modale::FinCompte { eteindre, depuis } => {
                 let reste = (COMPTE_FIN_S - (self.now - depuis)).max(0.0);
                 let (titre, quoi) = if eteindre {

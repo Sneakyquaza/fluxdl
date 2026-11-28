@@ -6,6 +6,7 @@ mod fenetres;
 mod guide;
 
 use crate::apres::{self, Categorie};
+use crate::historique::{self, Filtre, Trace};
 use crate::i18n::t;
 use crate::maj::{self, Maj};
 use crate::serveur::{self, Demande, Statut};
@@ -81,6 +82,7 @@ const FONDU_S: f64 = 0.6;
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Downloads,
+    History,
     Benchmark,
     Settings,
 }
@@ -94,6 +96,8 @@ struct Job {
     speeds: Vec<f64>,
     history: VecDeque<f32>,
     last: (f64, u64, Vec<u64>),
+    /// Lancement : instant et octets déjà là (durée et vitesse moyenne de l'historique).
+    depart: (f64, u64),
 }
 
 impl Job {
@@ -105,6 +109,7 @@ impl Job {
             speeds: Vec::new(),
             history: VecDeque::new(),
             last: (0.0, 0, Vec::new()),
+            depart: (0.0, 0),
         }
     }
 
@@ -229,6 +234,8 @@ enum Modale {
     },
     /// Liens d'une page (plus de `LOT_CONFIRMER`) : « Ajouter N téléchargements ? ».
     Lot(Vec<Demande>),
+    /// « Vider l'historique ? » (les fichiers restent).
+    ViderHistorique,
     /// Tout est fini : veille ou arrêt du PC dans 60 s (depuis `depuis`, horloge de l'appli),
     /// sauf « Annuler ».
     FinCompte { eteindre: bool, depuis: f64 },
@@ -345,6 +352,14 @@ pub struct App {
     sha_colle: std::cell::RefCell<String>,
     /// Le sélecteur de dossier ouvert choisit le dossier de cette catégorie (tri par type).
     picker_cat: Option<Categorie>,
+    /// Historique (history.json, écrit par `persist` quand `hist_sale`) ; page Historique :
+    /// recherche, filtre d'état, type, plus récents d'abord.
+    historique: Vec<Trace>,
+    hist_sale: bool,
+    hist_texte: String,
+    hist_filtre: Filtre,
+    hist_cat: Option<Categorie>,
+    hist_recentes: bool,
 }
 
 impl App {
@@ -420,6 +435,12 @@ impl App {
             outil_demande: Default::default(),
             sha_colle: Default::default(),
             picker_cat: None,
+            historique: Vec::new(),
+            hist_sale: false,
+            hist_texte: String::new(),
+            hist_filtre: Filtre::Tous,
+            hist_cat: None,
+            hist_recentes: true,
         };
         if let Some(d) = capture {
             // Captures : jamais de vraie veille ni d'arrêt du PC.
@@ -444,7 +465,16 @@ impl App {
         for e in &mut app.entries {
             store::au_lancement(e);
         }
-        app.next_id = app.entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+        app.historique = historique::charger(&store::data_dir());
+        // Ids jamais repris : une trace de l'historique garde le sien.
+        app.next_id = app
+            .entries
+            .iter()
+            .map(|e| e.id)
+            .chain(app.historique.iter().map(|t| t.entree.id))
+            .max()
+            .unwrap_or(0)
+            + 1;
         maj::nettoyer();
         // Cookies laissés par un plantage (instance unique déjà prise).
         crate::cookies::purger(&crate::cookies::dossier());
@@ -976,7 +1006,9 @@ impl App {
                 })
             }
         };
-        self.jobs.insert(e.id, Job::new(ctl, Some(h)));
+        let mut job = Job::new(ctl, Some(h));
+        job.depart = (self.now, e.done);
+        self.jobs.insert(e.id, job);
     }
 
     /// Fin des téléchargements terminés, démarrage des suivants, noms et tailles à jour.
@@ -1021,6 +1053,7 @@ impl App {
                 .map(|h| h.join().unwrap_or_else(|_| Err("panic".into())));
             j.speed = 0.0;
             fini = true;
+            let mut chemin = None;
             e.status = match r {
                 Some(Ok(Outcome::Done(p))) => {
                     // Nom final (« nom (1).ext » si un fichier du même nom est apparu entre-temps).
@@ -1033,6 +1066,7 @@ impl App {
                     // (yt-dlp sans chemin final renvoie le dossier de téléchargement).
                     if p.is_file() || matches!(e.kind, Kind::Torrent { .. }) {
                         crate::motw::marquer(&p, &e.url, e.referrer.as_deref());
+                        chemin = Some(p.to_string_lossy().into_owned());
                     }
                     // Cookies inutiles une fois fini : ils ne restent pas dans queue.json.
                     e.cookies = None;
@@ -1067,6 +1101,18 @@ impl App {
                 }
                 None => e.status.clone(),
             };
+            // Fini ou échoué : dans l'historique (la pause n'y va pas).
+            if matches!(e.status, Status::Done | Status::Failed(_)) {
+                historique::noter(
+                    &mut self.historique,
+                    e,
+                    secondes(),
+                    (now - j.depart.0).max(0.0) as u64,
+                    e.done.saturating_sub(j.depart.1),
+                    chemin,
+                );
+                self.hist_sale = true;
+            }
         }
         // Annulés : effacer les partiels une fois leur fil fini (il sauve encore l'état en partant).
         self.orphelins.retain(|(j, e, effacer)| {
@@ -1273,6 +1319,9 @@ impl App {
         if self.capture.is_none() && now - self.last_save > 2.0 {
             store::save_queue(&store::data_dir(), QUEUE, &self.entries, &self.inconnues);
             store::save(SETTINGS, &self.settings);
+            if std::mem::take(&mut self.hist_sale) {
+                historique::sauver(&store::data_dir(), &self.historique);
+            }
             self.last_save = now;
         }
     }
@@ -1414,6 +1463,12 @@ impl App {
         ui.add_space(30.0);
         let items = [
             (Tab::Downloads, Icone::Telecharger, "Downloads", GEL_VERT),
+            (
+                Tab::History,
+                Icone::Horloge,
+                "History",
+                gel_de(rgb(0x4f, 0xa8, 0xb8)),
+            ),
             (Tab::Benchmark, Icone::Comparatif, "Benchmark", GEL_BLEU),
             (
                 Tab::Settings,
@@ -1605,7 +1660,9 @@ impl App {
         ui.add_space(20.0);
         self.bandeau_plan(ui);
         let mut action = None;
+        // Défilement propre à la liste (sinon partagé avec les réglages).
         egui::ScrollArea::vertical()
+            .id_salt("file")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 10.0;
@@ -1621,6 +1678,306 @@ impl App {
             });
         if let Some((i, a)) = action {
             self.act(i, a);
+        }
+    }
+
+    /// Historique : recherche (nom, lien, site), filtres (état, type), tri par date ; par ligne
+    /// Réessayer / Retélécharger, ouvrir le fichier ou le dossier (grisés s'ils ont disparu),
+    /// copier le lien, retirer ; « Vider l'historique » après confirmation.
+    fn page_historique(&mut self, ui: &mut Ui) {
+        let l = self.settings.lang;
+        let r = self.page_title(ui, t(l, "History"), None);
+        if !self.historique.is_empty() {
+            let txt = t(l, "Clear history");
+            let w = ui
+                .painter()
+                .layout_no_wrap(txt.into(), demi(13.5), TEXTE)
+                .size()
+                .x
+                + 52.0;
+            let b = Rect::from_min_size(pos2(r.right() - w, r.center().y - 17.0), vec2(w, 34.0));
+            let rep = a_la_place(ui, b, |ui| {
+                bouton_secondaire(ui, txt, Some(Icone::Fermer), vec2(w, 34.0))
+            });
+            if rep.clicked() && self.modale.is_none() {
+                self.modale = Some(Modale::ViderHistorique);
+            }
+        }
+        ui.add_space(18.0);
+        carte(ui, Margin::symmetric(16, 14), |ui| {
+            ui.set_width(ui.available_width());
+            let (rc, _) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
+            champ(
+                ui,
+                rc,
+                &mut self.hist_texte,
+                t(l, "Search by name, link or site"),
+                None,
+                regulier(13.5),
+            );
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                segmente(
+                    ui,
+                    &mut self.hist_filtre,
+                    &[
+                        (Filtre::Tous, t(l, "All")),
+                        (Filtre::Termines, t(l, "Successful")),
+                        (Filtre::Echecs, t(l, "Errors")),
+                    ],
+                );
+                ui.add_space(8.0);
+                let nom = |c: Option<Categorie>| c.map_or(t(l, "All types"), |c| t(l, c.nom()));
+                egui::ComboBox::from_id_salt("hist_type")
+                    .width(150.0)
+                    .selected_text(nom(self.hist_cat))
+                    .show_ui(ui, |ui| {
+                        for c in std::iter::once(None).chain(apres::CATEGORIES.map(Some)) {
+                            ui.selectable_value(&mut self.hist_cat, c, nom(c));
+                        }
+                    });
+                ui.add_space(8.0);
+                segmente(
+                    ui,
+                    &mut self.hist_recentes,
+                    &[(true, t(l, "Newest")), (false, t(l, "Oldest"))],
+                );
+            });
+        });
+        ui.add_space(16.0);
+        let vus = historique::chercher(
+            &self.historique,
+            &self.hist_texte,
+            self.hist_filtre,
+            self.hist_cat,
+            self.hist_recentes,
+        );
+        if vus.is_empty() {
+            carte(ui, Margin::symmetric(24, 22), |ui| {
+                ui.set_width(ui.available_width());
+                ui.vertical_centered(|ui| {
+                    let (titre, sous) = if self.historique.is_empty() {
+                        (
+                            "No history yet",
+                            "Finished, failed and canceled downloads appear here, even after they leave the list.",
+                        )
+                    } else {
+                        ("Nothing matches", "Change the search or the filters.")
+                    };
+                    ui.label(
+                        egui::RichText::new(t(l, titre))
+                            .font(demi(17.0))
+                            .color(TITRE),
+                    );
+                    ui.label(
+                        egui::RichText::new(t(l, sous))
+                            .font(moyen(13.5))
+                            .color(TEXTE),
+                    );
+                });
+            });
+            return;
+        }
+        // Heure locale = UTC + décalage d'aujourd'hui ; raccourci : une date d'avant un
+        // changement d'heure est décalée d'une heure, à revoir si ça gêne.
+        let maintenant = secondes();
+        let decalage =
+            (i64::from(crate::systeme::minute_locale()) - (maintenant / 60 % 1440) as i64 + 720)
+                .rem_euclid(1440)
+                - 720;
+        let mut action = None;
+        // Défilement propre à la page (sinon partagé avec la liste et les réglages).
+        egui::ScrollArea::vertical()
+            .id_salt("historique")
+            .auto_shrink([false, false])
+            .show_rows(ui, 72.0, vus.len(), |ui, rangs| {
+                ui.spacing_mut().item_spacing.y = 10.0;
+                for &i in &vus[rangs] {
+                    if let Some(a) = self.ligne_historique(ui, &self.historique[i], decalage) {
+                        action = Some((i, a));
+                    }
+                }
+            });
+        if let Some((i, a)) = action {
+            self.agir_historique(ui.ctx(), i, a);
+        }
+    }
+
+    /// Une ligne de l'historique ; action cliquée.
+    fn ligne_historique(&self, ui: &mut Ui, h: &Trace, decalage: i64) -> Option<HAct> {
+        let l = self.settings.lang;
+        let e = &h.entree;
+        let (etat, ce) = self.status_label(e);
+        let w = ui.available_width();
+        let (r, rep) = ui.allocate_exact_size(vec2(w, 72.0), Sense::hover());
+        let p = ui.painter().clone();
+        p.add(verre(ui.ctx(), r, 12, 0.66));
+        let nom = h.nom().to_string();
+        let tuile = Rect::from_min_size(pos2(r.left() + 16.0, r.top() + 16.0), Vec2::splat(40.0));
+        tuile_fichier(&p, tuile, type_de(e, &nom));
+        let (x0, x1) = (tuile.right() + 14.0, r.right() - 16.0);
+        let fichier = h.fichier().filter(|f| f.exists());
+        let dossier = Path::new(&e.dir).is_dir();
+        let fini = e.status == Status::Done;
+        let introuvable = t(l, "File not found");
+        let actes = [
+            (
+                Icone::Actualiser,
+                if fini { "Download again" } else { "Retry" },
+                HAct::Relancer,
+                self.peut_relancer(h),
+                "",
+            ),
+            (
+                Icone::Lecture,
+                "Open file",
+                HAct::Fichier,
+                fichier.is_some(),
+                introuvable,
+            ),
+            (
+                Icone::Dossier,
+                "Open folder",
+                HAct::Dossier,
+                dossier,
+                introuvable,
+            ),
+            (Icone::Copier, "Copy link", HAct::Copier, true, ""),
+            (
+                Icone::Fermer,
+                "Remove from history",
+                HAct::Retirer,
+                true,
+                "",
+            ),
+        ];
+        let mut action = None;
+        let mut bx = x1 + 6.0;
+        for (k, (ic, aide, act, permis, sinon)) in actes.into_iter().enumerate().rev() {
+            bx -= 30.0;
+            let b = Rect::from_min_size(pos2(bx, r.center().y - 15.0), Vec2::splat(30.0));
+            let mut c = ui.new_child(UiBuilder::new().max_rect(b));
+            if !permis {
+                c.disable();
+            }
+            let rb = bouton_icone_ici(&c, b, rep.id.with(k), ic, t(l, aide));
+            let rb = if sinon.is_empty() {
+                rb
+            } else {
+                rb.on_disabled_hover_text(sinon)
+            };
+            if rb.clicked() {
+                action = Some(act);
+            }
+            bx -= 2.0;
+        }
+        let g = ligne(ui, nom, demi(14.5), TEXTE, bx - 10.0 - x0);
+        p.galley(pos2(x0, r.top() + 24.0 - g.size().y / 2.0), g, TEXTE);
+        let ym = r.top() + 50.0;
+        let pr = pastille(ui, pos2(x0, ym), etat, ce);
+        // Date, taille, durée, vitesse moyenne, site ; raison d'un échec ; fichier disparu.
+        let mut infos = vec![historique::date(h.fin, decalage, l == Lang::Fr)];
+        if let Some(s) = e.size.filter(|_| fini) {
+            infos.push(octets(s));
+        }
+        if h.duree > 0 {
+            infos.push(duree(h.duree as f64));
+        }
+        if let Some(v) = h.vitesse() {
+            infos.push(format!("{}/s", octets(v)));
+        }
+        if let Some(site) = e
+            .url
+            .split_once("://")
+            .and_then(|(_, r)| r.split(['/', '?', '#']).next())
+            .filter(|s| !s.is_empty())
+        {
+            infos.push(site.to_string());
+        }
+        if let Status::Failed(m) = &e.status {
+            infos.push(crate::i18n::tr(l, m).to_string());
+        }
+        let manque = fini && fichier.is_none();
+        if manque {
+            infos.push(introuvable.to_string());
+        }
+        let cg = if manque || matches!(e.status, Status::Failed(_)) {
+            mix(DANGER, TEXTE2, 0.35)
+        } else {
+            TEXTE2
+        };
+        let g = ligne(
+            ui,
+            infos.join("  ·  "),
+            regulier(12.5),
+            cg,
+            bx - 10.0 - pr.right() - 10.0,
+        );
+        p.galley(pos2(pr.right() + 10.0, ym - g.size().y / 2.0), g, cg);
+        action
+    }
+
+    /// Réessayer / Retélécharger possible : lien web, ou torrent dont le lien magnet ou le
+    /// `.torrent` gardé est encore là.
+    fn peut_relancer(&self, h: &Trace) -> bool {
+        match &h.entree.kind {
+            Kind::Torrent { hash, .. } => {
+                h.entree.url.starts_with("magnet:") || torrent::garde(hash).exists()
+            }
+            _ => h.entree.url.starts_with("http://") || h.entree.url.starts_with("https://"),
+        }
+    }
+
+    fn agir_historique(&mut self, ctx: &egui::Context, i: usize, a: HAct) {
+        let h = &self.historique[i];
+        match a {
+            HAct::Relancer => {
+                if !self.peut_relancer(h) {
+                    return;
+                }
+                let h = h.clone();
+                // Encore dans la file : reprise de cette entrée, ou la montrer si elle tourne.
+                if let Some(k) = self.entries.iter().position(|e| {
+                    e.url == h.entree.url
+                        && matches!(
+                            e.status,
+                            Status::Queued | Status::Running | Status::Paused | Status::Failed(_)
+                        )
+                }) {
+                    if matches!(self.entries[k].status, Status::Paused | Status::Failed(_)) {
+                        self.act(k, Act::Resume);
+                    }
+                    self.selected = Some(self.entries[k].id);
+                    self.tab = Tab::Downloads;
+                    return;
+                }
+                // Torrent sans son .torrent gardé : la fenêtre des fichiers, depuis le magnet.
+                if let Kind::Torrent { hash, .. } = &h.entree.kind {
+                    if !torrent::garde(hash).exists() {
+                        return self.ouvrir_torrent(h.entree.url.clone(), None);
+                    }
+                }
+                let e = historique::relancer(&h, self.next_id);
+                self.next_id += 1;
+                self.selected = Some(e.id);
+                self.born.insert(e.id, self.now);
+                self.entries.push(e);
+                self.tab = Tab::Downloads;
+                self.last_save = f64::NEG_INFINITY;
+            }
+            HAct::Fichier => {
+                if let Some(f) = h.fichier().filter(|f| f.exists()) {
+                    // L'appli associée au fichier (explorer / xdg-open).
+                    open_folder(&f);
+                }
+            }
+            HAct::Dossier => open_folder(Path::new(&h.entree.dir)),
+            HAct::Copier => ctx.copy_text(h.entree.url.clone()),
+            HAct::Retirer => {
+                self.historique.remove(i);
+                self.hist_sale = true;
+                self.last_save = f64::NEG_INFINITY;
+            }
         }
     }
 
@@ -1924,7 +2281,13 @@ impl App {
                     (Icone::Lecture, "Try as video", Act::Video),
                     (Icone::Fermer, "Remove from list", Act::Remove),
                 ],
-                Status::Paused | Status::Failed(_) => &[
+                // Échec : « Réessayer » (reprend le `.part` s'il est là, comme Reprendre).
+                Status::Failed(_) => &[
+                    (Icone::Actualiser, "Retry", Act::Resume),
+                    (Icone::Dossier, "Open folder", Act::Folder),
+                    (Icone::Fermer, "Cancel", Act::Cancel),
+                ],
+                Status::Paused => &[
                     (Icone::Lecture, "Resume", Act::Resume),
                     (Icone::Dossier, "Open folder", Act::Folder),
                     (Icone::Fermer, "Cancel", Act::Cancel),
@@ -2104,6 +2467,16 @@ impl App {
                 self.ouvrir_video(url);
             }
             Act::Remove => {
+                // Fini avant l'historique (file d'une version précédente) : noté en partant.
+                let e = &self.entries[i];
+                if matches!(
+                    e.status,
+                    Status::Done | Status::Failed(_) | Status::Canceled
+                ) && !self.historique.iter().any(|t| t.entree.id == id)
+                {
+                    historique::noter(&mut self.historique, e, secondes(), 0, 0, None);
+                    self.hist_sale = true;
+                }
                 delete_parts(&self.entries[i], false);
                 self.entries.remove(i);
                 self.born.remove(&id);
@@ -2126,6 +2499,18 @@ impl App {
         if self.selected == Some(id) {
             self.selected = None;
         }
+        let mut trace = e.clone();
+        trace.status = Status::Canceled;
+        let depart = self.jobs.get(&id).map_or((self.now, e.done), |j| j.depart);
+        historique::noter(
+            &mut self.historique,
+            &trace,
+            secondes(),
+            (self.now - depart.0).max(0.0) as u64,
+            e.done.saturating_sub(depart.1),
+            None,
+        );
+        self.hist_sale = true;
         match self.jobs.remove(&id).filter(|j| j.handle.is_some()) {
             Some(j) => {
                 j.ctl.request_stop();
@@ -3238,7 +3623,7 @@ impl App {
         let f = *frame;
         let dir = dir.clone();
         // Assez d'images entre le changement de vue et la capture pour finir les animations.
-        let vues: [(Tab, Lang, &str); 32] = [
+        let vues: [(Tab, Lang, &str); 37] = [
             (Tab::Downloads, Lang::En, "downloads"),
             (Tab::Benchmark, Lang::En, "benchmark"),
             (Tab::Settings, Lang::En, "settings"),
@@ -3270,6 +3655,11 @@ impl App {
             (Tab::Settings, Lang::En, "lotE_settings_en"),
             (Tab::Downloads, Lang::Fr, "lotE_detail_fr"),
             (Tab::Downloads, Lang::En, "lotE_progress_en"),
+            (Tab::History, Lang::Fr, "lotG_history_fr"),
+            (Tab::History, Lang::En, "lotG_failed_en"),
+            (Tab::History, Lang::Fr, "lotG_search_fr"),
+            (Tab::History, Lang::Fr, "lotG_clear_fr"),
+            (Tab::Downloads, Lang::Fr, "lotG_retry_card_fr"),
             (Tab::Downloads, Lang::Fr, "narrow_900x600_fr"),
         ];
         for (i, (tab, lang, nom)) in vues.into_iter().enumerate() {
@@ -3497,6 +3887,32 @@ impl App {
                     .sort_folders
                     .insert(Categorie::Images, images.to_string_lossy().into_owned());
                 self.defile = Some(if nom.ends_with("en") { 760.0 } else { 330.0 });
+            }
+            // Carte en échec en haut de la liste : bouton « Réessayer ».
+            "lotG_retry_card_fr" => {
+                if let Some(k) = self.entries.iter().position(|e| e.id == 4) {
+                    let mut e = self.entries.remove(k);
+                    e.status = Status::Failed("HTTP 404".into());
+                    self.entries.insert(0, e);
+                }
+                self.selected = Some(4);
+            }
+            n if n.starts_with("lotG_") => {
+                self.hist_texte = if n == "lotG_search_fr" { "exemple".into() } else { String::new() };
+                self.hist_filtre = if n == "lotG_failed_en" { Filtre::Echecs } else { Filtre::Tous };
+                if n == "lotG_clear_fr" {
+                    self.modale = Some(Modale::ViderHistorique);
+                }
+                // Un fichier fini encore là (boutons actifs), les autres introuvables (grisés).
+                if let Some((d, _)) = &self.capture {
+                    let f = d.join("demo").join("blender-4.2.3-windows-x64.zip");
+                    let _ = std::fs::create_dir_all(d.join("demo"));
+                    let _ = std::fs::write(&f, b"demo");
+                    if let Some(t) = self.historique.iter_mut().find(|t| t.entree.id == 2) {
+                        t.entree.dir = d.join("demo").to_string_lossy().into_owned();
+                        t.chemin = Some(f.to_string_lossy().into_owned());
+                    }
+                }
             }
             "lotE_detail_fr" | "lotE_progress_en" => {
                 // Archive finie présente sur le disque (boutons montrés seulement si elle existe).
@@ -3753,7 +4169,84 @@ impl App {
         self.bench.shown = -10.0;
         self.settings.speed_limit_mb = 50.0;
         self.settings.token = "3fa2c9d8e1b04f5a8c7d6e5f4a3b2c1d".into();
-        self.next_id = 7;
+        // Historique : fins des deux derniers jours (vidéo, échecs, annulé, torrent).
+        let base = 1_795_800_000; // 27/11/2026 vers 15 h UTC
+        let mut hist = vec![
+            (
+                2,
+                Status::Done,
+                381 * mo,
+                42,
+                "blender-4.2.3-windows-x64.zip",
+                "https://download.blender.org/release/Blender4.2/blender-4.2.3-windows-x64.zip",
+            ),
+            (
+                4,
+                Status::Failed("HTTP 404".into()),
+                0,
+                3,
+                "archive.tar.zst",
+                "https://example.org/archive.tar.zst",
+            ),
+            (
+                6,
+                Status::Done,
+                402 * mo,
+                61,
+                "Big Buck Bunny 60fps 4K",
+                "https://www.youtube.com/watch?v=aqz-KE-bpKQ",
+            ),
+            (
+                101,
+                Status::Canceled,
+                1_200 * mo,
+                95,
+                "Fedora-Workstation-Live-41.iso",
+                "https://download.fedoraproject.org/pub/fedora/41/Fedora-Workstation-Live-41.iso",
+            ),
+            (
+                102,
+                Status::Done,
+                18 * mo,
+                2,
+                "rapport-annuel-2025.pdf",
+                "https://www.exemple.fr/docs/rapport-annuel-2025.pdf",
+            ),
+            (
+                103,
+                Status::Failed("This link has expired.".into()),
+                640 * mo,
+                30,
+                "dataset-images.7z",
+                "https://cdn.exemple.fr/d/dataset-images.7z",
+            ),
+            (
+                104,
+                Status::Done,
+                9 * mo,
+                4,
+                "chanson.mp3",
+                "https://musique.exemple.org/chanson.mp3",
+            ),
+        ];
+        for (k, (id, st, recu, duree, nom, url)) in hist.drain(..).enumerate() {
+            let mut e = self
+                .entries
+                .iter()
+                .find(|e| e.id == id)
+                .cloned()
+                .unwrap_or_else(|| entree(id, url, Some(nom), st.clone(), Some(recu), recu));
+            e.status = st;
+            historique::noter(
+                &mut self.historique,
+                &e,
+                base + k as u64 * 9_377,
+                duree,
+                recu,
+                None,
+            );
+        }
+        self.next_id = 105;
     }
 }
 
@@ -3761,6 +4254,16 @@ impl App {
 fn job_speed_curve(x: f32) -> f32 {
     let monte = 1.0 - (-x / 12.0).exp();
     96.0 * monte + 6.0 * (x * 0.37).sin() + 5.0 * (x * 0.11).cos()
+}
+
+/// Actions d'une ligne de l'historique.
+#[derive(Clone, Copy)]
+enum HAct {
+    Relancer,
+    Fichier,
+    Dossier,
+    Copier,
+    Retirer,
 }
 
 #[derive(Clone, Copy)]
@@ -4043,6 +4546,7 @@ impl eframe::App for App {
             }))
             .show(ui, |ui| match self.tab {
                 Tab::Downloads => self.downloads(ui),
+                Tab::History => self.page_historique(ui),
                 Tab::Benchmark => self.benchmark(ui),
                 Tab::Settings => self.settings_tab(ui),
             });
@@ -4089,6 +4593,9 @@ impl eframe::App for App {
         }
         store::save_queue(&store::data_dir(), QUEUE, &self.entries, &self.inconnues);
         store::save(SETTINGS, &self.settings);
+        if self.hist_sale {
+            historique::sauver(&store::data_dir(), &self.historique);
+        }
         if let Some(exe) = &self.relance {
             maj::relancer(exe);
         }
@@ -4562,6 +5069,119 @@ mod tests {
     /// 0.2.9 lot F : liens d'une page. Déjà en file écartés ; fichiers ajoutés tout de suite
     /// (jusqu'à `LOT_CONFIRMER`) ; magnet et page vidéo attendent leur fenêtre ; au-delà, UNE
     /// confirmation qui regroupe les lots suivants ; SHA-256 de la barre « coller » non repris.
+    /// Historique : fin, échec et annulation notés (sans cookies) ; Réessayer depuis l'historique
+    /// remet une vidéo retirée de la liste en file avec ses options ; Retirer, Vider.
+    #[test]
+    fn historique_fin_echec_annulation_reessayer() {
+        let d = std::env::temp_dir().join(format!("fluxdl-test-hist-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, Some(d.join("cap")), None);
+        ctx.run_ui(Default::default(), |_| {})
+            .textures_delta
+            .clear();
+        app.capture = None;
+        app.entries.clear();
+        app.jobs.clear();
+        app.historique.clear();
+        app.settings.folder = d.display().to_string();
+        let fichier = d.join("a.zip");
+        std::fs::write(&fichier, b"x").unwrap();
+        let sortie = video::Sortie {
+            subtitles: true,
+            sub_lang: Some("fr".into()),
+            thumbnail: true,
+            ..Default::default()
+        };
+        let kind_video = Kind::Video {
+            quality: video::Qualite::P720,
+            estimate: None,
+            section: None,
+            from_start: false,
+            login: false,
+            options: sortie,
+        };
+        let a = app.nouvelle("https://a.b/a.zip".into(), Kind::Http).id;
+        let b = app.nouvelle("https://a.b/b.zip".into(), Kind::Http).id;
+        let v = app
+            .nouvelle(
+                "https://www.youtube.com/watch?v=x".into(),
+                kind_video.clone(),
+            )
+            .id;
+        let c = app.nouvelle("https://a.b/c.zip".into(), Kind::Http).id;
+        app.entries[0].cookies = Some("SID=secret".into());
+        app.entries[0].referrer = Some("https://a.b/page?t=secret".into());
+        let r: [Result<Outcome, String>; 3] = [
+            Ok(Outcome::Done(fichier.clone())),
+            Err("HTTP 500".into()),
+            Err("x".into()),
+        ];
+        for (id, r) in [a, b, v].into_iter().zip(r) {
+            let h = std::thread::spawn(move || r);
+            while !h.is_finished() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            app.jobs
+                .insert(id, Job::new(Arc::new(Control::default()), Some(h)));
+            app.entries.iter_mut().find(|e| e.id == id).unwrap().status = Status::Running;
+        }
+        app.annuler(c, true);
+        app.now = 10.0;
+        app.schedule(10.0);
+        let etat = |h: &[Trace], id| {
+            h.iter()
+                .find(|t| t.entree.id == id)
+                .map(|t| t.entree.status.clone())
+        };
+        assert_eq!(etat(&app.historique, a), Some(Status::Done));
+        assert_eq!(
+            etat(&app.historique, b),
+            Some(Status::Failed("HTTP 500".into()))
+        );
+        assert_eq!(etat(&app.historique, v), Some(Status::Failed("x".into())));
+        assert_eq!(etat(&app.historique, c), Some(Status::Canceled));
+        let ta = app.historique.iter().find(|t| t.entree.id == a).unwrap();
+        assert_eq!(ta.fichier().as_deref(), Some(fichier.as_path()));
+        assert!(ta.entree.cookies.is_none() && ta.entree.referrer.is_none());
+        assert!(app.hist_sale);
+        // Retirée de la liste : reste dans l'historique ; Réessayer = en file, mêmes options.
+        let iv = app.entries.iter().position(|e| e.id == v).unwrap();
+        app.act(iv, Act::Remove);
+        assert!(app.entries.iter().all(|e| e.id != v));
+        let k = app
+            .historique
+            .iter()
+            .position(|t| t.entree.id == v)
+            .unwrap();
+        app.agir_historique(&ctx, k, HAct::Relancer);
+        let e = app.entries.last().unwrap();
+        assert_eq!((e.status.clone(), &e.kind), (Status::Queued, &kind_video));
+        assert!(e.id > c);
+        // Encore dans la liste en échec : la même entrée reprend (pas de doublon).
+        let n = app.entries.len();
+        let k = app
+            .historique
+            .iter()
+            .position(|t| t.entree.id == b)
+            .unwrap();
+        app.agir_historique(&ctx, k, HAct::Relancer);
+        assert_eq!(app.entries.len(), n);
+        assert_eq!(
+            app.entries.iter().find(|e| e.id == b).unwrap().status,
+            Status::Queued
+        );
+        // Retirer de l'historique.
+        let k = app
+            .historique
+            .iter()
+            .position(|t| t.entree.id == c)
+            .unwrap();
+        app.agir_historique(&ctx, k, HAct::Retirer);
+        assert_eq!(etat(&app.historique, c), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn lot_de_liens() {
         let d = std::env::temp_dir().join(format!("fluxdl-test-lot-{}", std::process::id()));
