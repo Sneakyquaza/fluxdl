@@ -836,6 +836,27 @@ fn requetes_bornees_et_plages_exigees() {
     }
 }
 
+#[test]
+fn tri_par_type_avant_d_ecrire() {
+    // 0.2.9 : le dossier est choisi d'après le nom donné par la sonde, avant le `.part` ;
+    // une reprise (nom déjà choisi) reste dans le dossier donné.
+    let (_c, url, data) = serveur(256 << 10, |_| {});
+    let d = dossier("tri");
+    let mut o = opts(2);
+    let base = d.clone();
+    o.tri = Some(engine::Tri(Arc::new(move |nom: &str| {
+        base.join(format!("tri-{nom}"))
+    })));
+    let (p, ctl) = telecharge(&url, &d, &o);
+    assert_eq!(p, d.join("tri-file.bin").join("file.bin"));
+    assert_eq!(ctl.snapshot().dir, Some(d.join("tri-file.bin")));
+    verifie(&p, &data);
+    let ctl = Arc::new(Control::default());
+    let r = engine::run(&url, &d, Some("repris.bin"), &o, &ctl).unwrap();
+    assert!(matches!(r, Outcome::Done(p) if p == d.join("repris.bin")));
+    assert_eq!(ctl.snapshot().dir, None);
+}
+
 /// Débit moyen (octets/s) d'un téléchargement lancé sur `ctl`, sonde comprise.
 fn debit_sur(url: &str, d: &Path, n: usize, ctl: &Arc<Control>) -> (PathBuf, f64) {
     let t = Instant::now();

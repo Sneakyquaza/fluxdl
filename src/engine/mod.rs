@@ -57,6 +57,19 @@ pub struct Options {
     /// Plages exigées : un serveur qui les refuse donne `ERR_PLAGES` au lieu du repli sur une
     /// connexion (les vidéos repassent alors par yt-dlp).
     pub require_ranges: bool,
+    /// Tri par type : dossier choisi d'après le nom donné par la sonde, seulement quand aucun
+    /// nom n'est encore choisi (jamais à une reprise) ; le dossier retenu est dans `Live.dir`.
+    pub tri: Option<Tri>,
+}
+
+/// Dossier d'un fichier d'après son nom (voir `Options::tri`).
+#[derive(Clone)]
+pub struct Tri(pub Arc<dyn Fn(&str) -> PathBuf + Send + Sync>);
+
+impl std::fmt::Debug for Tri {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Tri")
+    }
 }
 
 impl Default for Options {
@@ -69,6 +82,7 @@ impl Default for Options {
             headers: Vec::new(),
             max_request: 0,
             require_ranges: false,
+            tri: None,
         }
     }
 }
@@ -122,6 +136,8 @@ pub struct WorkerStat {
 #[derive(Clone, Debug, Default)]
 pub struct Live {
     pub file_name: Option<String>,
+    /// Dossier choisi par le tri par type (`Options::tri`), sinon `None` (celui donné).
+    pub dir: Option<PathBuf>,
     pub size: Option<u64>,
     /// Téléchargement découpé (plages acceptées et taille connue).
     pub ranges: bool,
@@ -387,13 +403,22 @@ pub fn run(
     if opts.require_ranges && !(p.ranges && p.size.is_some()) {
         return Err(ERR_PLAGES.into());
     }
+    let trie = match (&opts.tri, name) {
+        (Some(t), None) => Some((t.0)(&p.file_name)),
+        _ => None,
+    };
+    let dir = trie.as_deref().unwrap_or(dir);
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let name = match name {
         Some(n) => n.to_string(),
         None => reserve_name(dir, &p.file_name)?,
     };
     let target = dir.join(&name);
-    ctl.lock().file_name = Some(name);
+    {
+        let mut l = ctl.lock();
+        l.file_name = Some(name);
+        l.dir = trie.clone();
+    }
     match attempt(&agent, url, &p, &target, opts, ctl, false)? {
         Step::Fallback if opts.require_ranges => Err(ERR_PLAGES.into()),
         // Un serveur a répondu 200 à une plage : tout reprendre sur une seule connexion.
@@ -1279,7 +1304,7 @@ fn reserve_name(dir: &Path, name: &str) -> Result<String, String> {
 }
 
 /// « nom.ext », sinon « nom (1).ext »… libre (ni fichier fini ni `.part`).
-fn unique_name(dir: &Path, name: &str) -> String {
+pub fn unique_name(dir: &Path, name: &str) -> String {
     let libre = |n: &str| !dir.join(n).exists() && !part_path(&dir.join(n)).exists();
     if libre(name) {
         return name.to_string();

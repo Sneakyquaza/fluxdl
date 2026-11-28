@@ -24,6 +24,9 @@ ring = "0.17"
 # Torrents et liens magnet (Apache-2.0) ; tokio seulement pour sa session.
 librqbit = { version = "9.1", default-features = false, features = ["rust-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+# Extraction des archives finies : zip (deflate par flate2, déjà tiré par librqbit), 7z (LZMA/LZMA2).
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+sevenz-rust2 = { version = "0.25", default-features = false }
 
 # Sélecteur de dossier natif (Windows : IFileOpenDialog, sans dépendance lourde). Linux :
 # zenity/kdialog s'ils sont installés, sinon champ texte seulement.
@@ -33,6 +36,10 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 rfd = { version = "0.15", default-features = false }
+
+[dev-dependencies]
+# Tests : archives 7z créées à la volée.
+sevenz-rust2 = { version = "0.25", default-features = false, features = ["compress"] }
 
 [build-dependencies]
 # Icône .ico de l'exe Windows (entrées PNG), dessinée par src/icone.rs.

@@ -694,6 +694,52 @@ const FR: &[(&str, &str)] = &[
         "The selected videos are already in the list.",
         "Les vidéos cochées sont déjà dans la liste.",
     ),
+    // Lot E : tri par type, extraction, empreinte.
+    ("Music", "Musique"),
+    ("Pictures", "Images"),
+    ("Programs", "Programmes"),
+    ("Other", "Autres"),
+    ("After download", "Après le téléchargement"),
+    ("Sort by file type", "Trier par type de fichier"),
+    (
+        "New files and videos go to the folder of their type. Torrents are not sorted.",
+        "Les nouveaux fichiers et vidéos vont dans le dossier de leur type. Les torrents ne sont pas triés.",
+    ),
+    ("Extract archives automatically", "Extraire les archives automatiquement"),
+    (
+        "zip and 7z, into a folder named after the archive, next to it. RAR is not supported.",
+        "zip et 7z, dans un dossier au nom de l'archive, à côté. RAR non pris en charge.",
+    ),
+    ("Delete the archive after extraction", "Supprimer l'archive après extraction"),
+    (
+        "Only once the extraction succeeded. Off: the archive is kept.",
+        "Seulement si l'extraction a réussi. Désactivé : l'archive est gardée.",
+    ),
+    ("File", "Fichier"),
+    ("Extract", "Extraire"),
+    ("Compute SHA-256", "Calculer SHA-256"),
+    ("Stop extracting", "Arrêter l'extraction"),
+    ("Stop SHA-256", "Arrêter le SHA-256"),
+    ("Extracting…", "Extraction…"),
+    ("Extracted to:", "Extrait dans :"),
+    ("Computing SHA-256…", "Calcul du SHA-256…"),
+    ("Paste the expected SHA-256", "Colle le SHA-256 attendu"),
+    ("Match", "Identique"),
+    ("Mismatch", "Différent"),
+    ("RAR archives are not supported.", "Archives RAR non prises en charge."),
+    (
+        "Only zip and 7z archives can be extracted.",
+        "Seules les archives zip et 7z peuvent être extraites.",
+    ),
+    (
+        "Archive refused: a file path would leave the folder (absolute or ..).",
+        "Archive refusée : un chemin de fichier sortirait du dossier (absolu ou ..).",
+    ),
+    ("Encrypted archive: not supported.", "Archive chiffrée : non prise en charge."),
+    (
+        "Damaged archive: a file is larger than announced.",
+        "Archive abîmée : un fichier est plus gros qu'annoncé.",
+    ),
 ];
 
 pub fn t(lang: Lang, en: &'static str) -> &'static str {

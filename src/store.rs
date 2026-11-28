@@ -56,6 +56,14 @@ pub struct Settings {
     /// Quand tout est fini. Veille et arrêt du PC ne sont pas gardés d'une session à l'autre
     /// (remis à `Rien` au lancement).
     pub end_action: Fin,
+    /// Tri par type : un nouveau fichier ou une vidéo va dans le dossier de sa catégorie
+    /// (vide ou absent = `<dossier par défaut>/<catégorie traduite>`). Torrents non triés.
+    pub sort_by_type: bool,
+    pub sort_folders: std::collections::BTreeMap<crate::apres::Categorie, String>,
+    /// Archive zip / 7z finie : extraite toute seule ; archive effacée après une extraction
+    /// réussie (bouton « Extraire » compris).
+    pub auto_extract: bool,
+    pub extract_delete: bool,
 }
 
 /// Action quand tous les téléchargements sont finis.
@@ -96,6 +104,10 @@ impl Default for Settings {
             plan_start: None,
             plan_stop: None,
             end_action: Fin::Rien,
+            sort_by_type: false,
+            sort_folders: Default::default(),
+            auto_extract: false,
+            extract_delete: false,
         }
     }
 }

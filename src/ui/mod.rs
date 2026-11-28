@@ -5,6 +5,7 @@ mod draw;
 mod fenetres;
 mod guide;
 
+use crate::apres::{self, Categorie};
 use crate::i18n::t;
 use crate::maj::{self, Maj};
 use crate::serveur::{self, Demande, Statut};
@@ -133,6 +134,20 @@ impl Job {
         }
         self.last = (now, l.received, par);
     }
+}
+
+/// Outil d'un fichier fini, lancé depuis le panneau de détail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Outil {
+    Extraire,
+    Sha,
+}
+
+/// Extraction ou empreinte en cours dans un fil : avancement, arrêt, résultat (dossier extrait
+/// ou empreinte hex).
+struct TacheFichier {
+    suivi: Arc<apres::Suivi>,
+    rx: Receiver<Result<String, String>>,
 }
 
 /// Résultat attendu d'un fil (infos vidéo, aperçu de torrent…).
@@ -313,6 +328,15 @@ pub struct App {
     fini_session: bool,
     /// Veille (`false`) ou arrêt du PC (`true`) : `systeme::veille_ou_arret`, faux en test.
     executer: fn(bool),
+    /// Extractions et empreintes en cours, puis leur résultat, par (téléchargement, outil).
+    taches: HashMap<(u64, Outil), TacheFichier>,
+    resultats: HashMap<(u64, Outil), Result<String, String>>,
+    /// Outil lancé ou arrêté dans le panneau de détail (dessiné sans `&mut`).
+    outil_demande: std::cell::Cell<Option<(u64, Outil)>>,
+    /// Empreinte collée pour la comparer à celle calculée.
+    sha_colle: std::cell::RefCell<String>,
+    /// Le sélecteur de dossier ouvert choisit le dossier de cette catégorie (tri par type).
+    picker_cat: Option<Categorie>,
 }
 
 impl App {
@@ -381,6 +405,11 @@ impl App {
             plan_suspendus: Vec::new(),
             fini_session: false,
             executer: crate::systeme::veille_ou_arret,
+            taches: HashMap::new(),
+            resultats: HashMap::new(),
+            outil_demande: Default::default(),
+            sha_colle: Default::default(),
+            picker_cat: None,
         };
         if let Some(d) = capture {
             // Captures : jamais de vraie veille ni d'arrêt du PC.
@@ -521,10 +550,16 @@ impl App {
 
     /// Ajoute une entrée en attente, choisie dans la liste.
     fn nouvelle(&mut self, url: String, kind: Kind) -> &mut Entry {
+        // Tri par type : vidéo → Vidéos (son seul → Musique) ; fichier HTTP : au nom donné par
+        // la sonde (`start`) ; torrent : jamais.
+        let dir = match &kind {
+            Kind::Video { quality, .. } => self.dossier_tri(video_ou_son(*quality)),
+            _ => self.settings.folder.clone(),
+        };
         self.entries.push(Entry {
             id: self.next_id,
             url,
-            dir: self.settings.folder.clone(),
+            dir,
             name: None,
             sha256: None,
             connections: self.settings.connections,
@@ -541,6 +576,26 @@ impl App {
         self.next_id += 1;
         self.tab = Tab::Downloads;
         self.entries.last_mut().expect("entrée ajoutée")
+    }
+
+    /// Dossier d'un nouveau téléchargement de cette catégorie : celui de la catégorie si le tri
+    /// par type est actif, sinon le dossier par défaut.
+    fn dossier_tri(&self, c: Categorie) -> String {
+        if !self.settings.sort_by_type {
+            return self.settings.folder.clone();
+        }
+        self.dossier_categorie(c)
+    }
+
+    /// Dossier choisi pour la catégorie, sinon `<dossier par défaut>/<catégorie traduite>`.
+    fn dossier_categorie(&self, c: Categorie) -> String {
+        match self.settings.sort_folders.get(&c).map(|d| d.trim()) {
+            Some(d) if !d.is_empty() => d.to_string(),
+            _ => Path::new(&self.settings.folder)
+                .join(t(self.settings.lang, c.nom()))
+                .to_string_lossy()
+                .into_owned(),
+        }
     }
 
     /// Vidéo : formats lus par yt-dlp ; outils manquants → accord (Windows) ou message.
@@ -656,7 +711,7 @@ impl App {
         sortie: &video::Sortie,
         dossier: bool,
     ) -> usize {
-        let mut dir = PathBuf::from(&self.settings.folder);
+        let mut dir = PathBuf::from(self.dossier_tri(video_ou_son(qualite)));
         if dossier {
             dir.push(video::nom_dossier(&p.titre));
         }
@@ -785,6 +840,10 @@ impl App {
     }
 
     fn start(&mut self, i: usize) {
+        let dossiers: Vec<String> = apres::CATEGORIES
+            .iter()
+            .map(|&c| self.dossier_categorie(c))
+            .collect();
         let e = &mut self.entries[i];
         e.status = Status::Running;
         // Limites : globale (partagée) puis celle du téléchargement (index 1, voir `schedule`).
@@ -807,10 +866,21 @@ impl App {
                 if let Some(k) = &e.cookies {
                     headers.push(("Cookie".to_string(), k.clone()));
                 }
+                // Tri par type : nom pas encore choisi, dossier par défaut (pas un dossier choisi
+                // pour cette entrée) ; le moteur choisit d'après le nom donné par la sonde.
+                let tri = (self.settings.sort_by_type
+                    && e.name.is_none()
+                    && e.dir == self.settings.folder)
+                    .then(|| {
+                        engine::Tri(Arc::new(move |nom: &str| {
+                            PathBuf::from(&dossiers[apres::categorie(nom) as usize])
+                        }))
+                    });
                 let opts = Options {
                     connections: e.connections,
                     expected_sha256: e.sha256.clone(),
                     headers,
+                    tri,
                     ..Default::default()
                 };
                 std::thread::spawn(move || engine::run(&url, &dir, name.as_deref(), &opts, &c))
@@ -869,6 +939,7 @@ impl App {
     fn schedule(&mut self, now: f64) {
         let mut page = None;
         let mut fini = false;
+        let mut a_extraire = Vec::new();
         if let Some((id, v)) = self.limite_choisie.take() {
             if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
                 e.speed_limit_mb = v;
@@ -887,6 +958,9 @@ impl App {
             j.sample(now, &l);
             if l.file_name.is_some() {
                 e.name = l.file_name.clone();
+            }
+            if let Some(d) = &l.dir {
+                e.dir = d.to_string_lossy().into_owned();
             }
             e.size = l.size.or(e.size);
             e.done = l.done();
@@ -918,6 +992,16 @@ impl App {
                     }
                     // Cookies inutiles une fois fini : ils ne restent pas dans queue.json.
                     e.cookies = None;
+                    // Décompression automatique (zip / 7z, fichier HTTP seulement).
+                    if self.settings.auto_extract
+                        && e.kind == Kind::Http
+                        && e.name
+                            .as_deref()
+                            .and_then(apres::format)
+                            .is_some_and(|f| f != apres::Format::Rar)
+                    {
+                        a_extraire.push(e.id);
+                    }
                     self.fini_session = true;
                     Status::Done
                 }
@@ -967,6 +1051,9 @@ impl App {
                         && !matches!(e.status, Status::Done | Status::Canceled)
                 })
         });
+        for id in a_extraire {
+            self.lancer_outil(id, Outil::Extraire);
+        }
         // Fin, pause ou échec : la file est écrite tout de suite.
         if fini {
             self.last_save = f64::NEG_INFINITY;
@@ -989,6 +1076,68 @@ impl App {
             if e.status == Status::Queued && !self.plan_arme && (actifs < MAX_ACTIFS || petit) {
                 self.start(i);
                 actifs += usize::from(!petit);
+            }
+        }
+    }
+
+    /// Extraction ou empreinte d'un fichier fini dans un fil (une seule à la fois par outil).
+    fn lancer_outil(&mut self, id: u64, o: Outil) {
+        let Some(f) = self
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| Some(Path::new(&e.dir).join(e.name.as_ref()?)))
+        else {
+            return;
+        };
+        if self.taches.contains_key(&(id, o)) {
+            return;
+        }
+        let suivi = Arc::new(apres::Suivi::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let s = suivi.clone();
+        let effacer = self.settings.extract_delete;
+        std::thread::spawn(move || {
+            let r = match o {
+                Outil::Extraire => apres::extraire(&f, &s).map(|d| {
+                    // Archive gardée par défaut ; effacée seulement après une extraction réussie.
+                    if effacer {
+                        if let Err(e) = std::fs::remove_file(&f) {
+                            eprintln!("{}: {e}", f.display());
+                        }
+                    }
+                    d.to_string_lossy().into_owned()
+                }),
+                Outil::Sha => apres::sha256(&f, &s),
+            };
+            let _ = tx.send(r);
+        });
+        self.resultats.remove(&(id, o));
+        self.taches.insert((id, o), TacheFichier { suivi, rx });
+    }
+
+    /// Outils des fichiers finis : résultats des fils, clic du panneau de détail.
+    fn suivre_outils(&mut self) {
+        let finies: Vec<_> = self
+            .taches
+            .iter()
+            .filter_map(|(k, t)| match t.rx.try_recv() {
+                Ok(r) => Some((*k, r)),
+                Err(TryRecvError::Disconnected) => Some((*k, Err("panic".into()))),
+                Err(TryRecvError::Empty) => None,
+            })
+            .collect();
+        for (k, r) in finies {
+            self.taches.remove(&k);
+            // Arrêté : rien à montrer (l'extraction partielle est effacée).
+            if r.as_ref().err().map(String::as_str) != Some(apres::ARRETE) {
+                self.resultats.insert(k, r);
+            }
+        }
+        if let Some((id, o)) = self.outil_demande.take() {
+            match self.taches.get(&(id, o)) {
+                Some(t) => t.suivi.stop.store(true, Ordering::Relaxed),
+                None => self.lancer_outil(id, o),
             }
         }
     }
@@ -1053,8 +1202,10 @@ impl App {
             return;
         }
         let action = self.settings.end_action;
+        // Une extraction ou une empreinte en cours n'est pas coupée par la veille ou l'arrêt.
         if action == Fin::Rien
             || self.modale.is_some()
+            || !self.taches.is_empty()
             || !plan::fin_atteinte(self.entries.iter().map(|e| &e.status), self.fini_session)
         {
             return;
@@ -2030,6 +2181,9 @@ impl App {
             g,
             TEXTE3,
         );
+        if e.status == Status::Done && !matches!(e.kind, Kind::Torrent { .. }) {
+            self.detail_outils(ui, e);
+        }
         // Limite propre au téléchargement (en plus de la globale) ; torrents : globale seulement.
         ui.add_space(14.0);
         if matches!(e.kind, Kind::Torrent { .. }) {
@@ -2256,6 +2410,170 @@ impl App {
             });
         ui.add_space(20.0);
         self.detail_courbe(ui, e, j);
+    }
+
+    /// Fichier fini : extraire une archive zip / 7z, calculer son SHA-256 (copie, comparaison
+    /// avec une empreinte collée).
+    fn detail_outils(&self, ui: &mut Ui, e: &Entry) {
+        let l = self.settings.lang;
+        let Some(n) = e.name.as_deref() else {
+            return;
+        };
+        let existe = Path::new(&e.dir).join(n).is_file();
+        let vu =
+            |o| self.taches.contains_key(&(e.id, o)) || self.resultats.contains_key(&(e.id, o));
+        if !existe && !vu(Outil::Extraire) && !vu(Outil::Sha) {
+            return;
+        }
+        let w = ui.available_width();
+        ui.add_space(16.0);
+        self.section(ui, t(l, "File"), "");
+        ui.add_space(6.0);
+        let demande = |o| self.outil_demande.set(Some((e.id, o)));
+        // Panneau étroit : le 2e bouton passe à la ligne.
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            match apres::format(n) {
+                Some(apres::Format::Rar) => {
+                    ui.label(
+                        egui::RichText::new(t(l, "RAR archives are not supported."))
+                            .font(regulier(12.5))
+                            .color(TEXTE3),
+                    );
+                }
+                Some(_) if existe => {
+                    let r = if self.taches.contains_key(&(e.id, Outil::Extraire)) {
+                        bouton_secondaire(
+                            ui,
+                            t(l, "Stop extracting"),
+                            Some(Icone::Fermer),
+                            vec2(184.0, 32.0),
+                        )
+                    } else {
+                        bouton_principal(
+                            ui,
+                            t(l, "Extract"),
+                            Some(Icone::Dossier),
+                            vec2(112.0, 32.0),
+                        )
+                    };
+                    if r.clicked() {
+                        demande(Outil::Extraire);
+                    }
+                }
+                _ => {}
+            }
+            if existe {
+                let (m, i) = if self.taches.contains_key(&(e.id, Outil::Sha)) {
+                    (t(l, "Stop SHA-256"), Icone::Fermer)
+                } else {
+                    (t(l, "Compute SHA-256"), Icone::Comparatif)
+                };
+                if bouton_secondaire(ui, m, Some(i), vec2(176.0, 32.0)).clicked() {
+                    demande(Outil::Sha);
+                }
+            }
+        });
+        // Avancement d'un fil : jauge et pourcentage.
+        let avancement = |ui: &mut Ui, titre: &str, tf: &TacheFichier| {
+            let fait = tf.suivi.fait.load(Ordering::Relaxed);
+            let total = tf.suivi.total.load(Ordering::Relaxed).max(1);
+            let frac = (fait as f64 / total as f64).min(1.0) as f32;
+            ui.add_space(8.0);
+            let (r, _) = ui.allocate_exact_size(vec2(w, 16.0), Sense::hover());
+            texte(
+                ui,
+                r.left_center(),
+                Align2::LEFT_CENTER,
+                titre,
+                regulier(12.5),
+                TEXTE2,
+            );
+            texte(
+                ui,
+                r.right_center(),
+                Align2::RIGHT_CENTER,
+                &format!("{:.0}%", frac * 100.0),
+                regulier(12.5),
+                TEXTE2,
+            );
+            let (r, _) = ui.allocate_exact_size(vec2(w, 10.0), Sense::hover());
+            jauge(ui.painter(), r, frac, ACCENT, true);
+        };
+        let message = |ui: &mut Ui, m: &str, c: Color32| {
+            ui.add_space(8.0);
+            ui.add(egui::Label::new(egui::RichText::new(m).font(regulier(12.5)).color(c)).wrap());
+        };
+        if let Some(tf) = self.taches.get(&(e.id, Outil::Extraire)) {
+            avancement(ui, t(l, "Extracting…"), tf);
+        }
+        match self.resultats.get(&(e.id, Outil::Extraire)) {
+            Some(Ok(d)) => {
+                message(ui, &format!("{} {d}", t(l, "Extracted to:")), SUCCES);
+                ui.add_space(4.0);
+                if bouton_secondaire(
+                    ui,
+                    t(l, "Open folder"),
+                    Some(Icone::Dossier),
+                    vec2(150.0, 30.0),
+                )
+                .clicked()
+                {
+                    open_folder(Path::new(d));
+                }
+            }
+            Some(Err(m)) => message(ui, crate::i18n::tr(l, m), DANGER),
+            None => {}
+        }
+        if let Some(tf) = self.taches.get(&(e.id, Outil::Sha)) {
+            avancement(ui, t(l, "Computing SHA-256…"), tf);
+        }
+        match self.resultats.get(&(e.id, Outil::Sha)) {
+            Some(Ok(h)) => {
+                ui.add_space(8.0);
+                // Empreinte entière, sur deux lignes au besoin.
+                let g = ui
+                    .painter()
+                    .layout(h.clone(), regulier(12.0), TEXTE, w - 38.0);
+                let (r, _) = ui.allocate_exact_size(vec2(w, g.size().y.max(30.0)), Sense::hover());
+                let bc = Rect::from_min_size(pos2(r.right() - 30.0, r.top()), vec2(30.0, 30.0));
+                ui.painter()
+                    .galley(pos2(r.left(), r.center().y - g.size().y / 2.0), g, TEXTE);
+                if bouton_icone_ici(
+                    ui,
+                    bc,
+                    egui::Id::unique("copier-sha"),
+                    Icone::Copier,
+                    t(l, "Copy"),
+                )
+                .clicked()
+                {
+                    ui.ctx().copy_text(h.clone());
+                }
+                ui.add_space(6.0);
+                let (r, _) = ui.allocate_exact_size(vec2(w, 30.0), Sense::hover());
+                let pr = Rect::from_min_size(r.min, vec2((w - 120.0).max(120.0), 30.0));
+                let mut colle = self.sha_colle.borrow_mut();
+                champ(
+                    ui,
+                    pr,
+                    &mut colle,
+                    t(l, "Paste the expected SHA-256"),
+                    None,
+                    regulier(12.0),
+                );
+                if !colle.trim().is_empty() {
+                    let (m, c) = if apres::meme_empreinte(&colle, h) {
+                        (t(l, "Match"), SUCCES)
+                    } else {
+                        (t(l, "Mismatch"), DANGER)
+                    };
+                    pastille(ui, pos2(pr.right() + 10.0, r.center().y), m, c);
+                }
+            }
+            Some(Err(m)) => message(ui, crate::i18n::tr(l, m), DANGER),
+            None => {}
+        }
     }
 
     /// Courbe du débit, en bas du panneau de détail.
@@ -2648,6 +2966,8 @@ impl App {
                     );
                 });
                 ui.add_space(20.0);
+                self.reglages_apres(ui);
+                ui.add_space(20.0);
                 self.reglages_plan(ui);
                 ui.add_space(20.0);
                 self.reglages_v2(ui);
@@ -2709,6 +3029,75 @@ impl App {
                 });
                 ui.add_space(24.0);
             });
+    }
+
+    /// Carte « Après le téléchargement » : tri par type (un dossier par catégorie), extraction
+    /// automatique des archives.
+    fn reglages_apres(&mut self, ui: &mut Ui) {
+        let l = self.settings.lang;
+        carte(ui, Margin::symmetric(20, 6), |ui| {
+            ui.set_width(ui.available_width());
+            titre_section(ui, t(l, "After download"));
+            reglage(
+                ui,
+                t(l, "Sort by file type"),
+                t(
+                    l,
+                    "New files and videos go to the folder of their type. Torrents are not sorted.",
+                ),
+                |ui| {
+                    interrupteur(ui, &mut self.settings.sort_by_type);
+                },
+            );
+            if self.settings.sort_by_type {
+                for c in apres::CATEGORIES {
+                    let defaut = Path::new(&self.settings.folder)
+                        .join(t(l, c.nom()))
+                        .to_string_lossy()
+                        .into_owned();
+                    let actuel = self.dossier_categorie(c);
+                    separateur(ui);
+                    reglage(ui, t(l, c.nom()), &actuel, |ui| {
+                        if bouton_secondaire(
+                            ui,
+                            t(l, "Browse"),
+                            Some(Icone::Dossier),
+                            vec2(112.0, 36.0),
+                        )
+                        .clicked()
+                            && self.picker.is_none()
+                        {
+                            self.picker = Some(choose_folder(&actuel));
+                            self.picker_cat = Some(c);
+                        }
+                        let (r, _) = ui.allocate_exact_size(vec2(250.0, 36.0), Sense::hover());
+                        let d = self.settings.sort_folders.entry(c).or_default();
+                        champ(ui, r, d, &defaut, None, regulier(13.0));
+                    });
+                }
+            }
+            separateur(ui);
+            reglage(
+                ui,
+                t(l, "Extract archives automatically"),
+                t(l, "zip and 7z, into a folder named after the archive, next to it. RAR is not supported."),
+                |ui| {
+                    interrupteur(ui, &mut self.settings.auto_extract);
+                },
+            );
+            separateur(ui);
+            reglage(
+                ui,
+                t(l, "Delete the archive after extraction"),
+                t(
+                    l,
+                    "Only once the extraction succeeded. Off: the archive is kept.",
+                ),
+                |ui| {
+                    interrupteur(ui, &mut self.settings.extract_delete);
+                },
+            );
+        });
     }
 
     /// Carte « Planification » : heure de démarrage de la file, heure de pause, action de fin.
@@ -2805,7 +3194,7 @@ impl App {
         let f = *frame;
         let dir = dir.clone();
         // Assez d'images entre le changement de vue et la capture pour finir les animations.
-        let vues: [(Tab, Lang, &str); 28] = [
+        let vues: [(Tab, Lang, &str); 32] = [
             (Tab::Downloads, Lang::En, "downloads"),
             (Tab::Benchmark, Lang::En, "benchmark"),
             (Tab::Settings, Lang::En, "settings"),
@@ -2833,6 +3222,10 @@ impl App {
             (Tab::Settings, Lang::Fr, "lotD_settings_plan_fr"),
             (Tab::Settings, Lang::En, "lotD_settings_plan_en"),
             (Tab::Downloads, Lang::Fr, "lotD_countdown_fr"),
+            (Tab::Settings, Lang::Fr, "lotE_settings_fr"),
+            (Tab::Settings, Lang::En, "lotE_settings_en"),
+            (Tab::Downloads, Lang::Fr, "lotE_detail_fr"),
+            (Tab::Downloads, Lang::En, "lotE_progress_en"),
             (Tab::Downloads, Lang::Fr, "narrow_900x600_fr"),
         ];
         for (i, (tab, lang, nom)) in vues.into_iter().enumerate() {
@@ -3051,6 +3444,46 @@ impl App {
                     eteindre: true,
                     depuis: self.now - 18.0,
                 })
+            }
+            "lotE_settings_fr" | "lotE_settings_en" => {
+                self.settings.sort_by_type = true;
+                self.settings.auto_extract = true;
+                let images = Path::new(&self.settings.folder).join("Photos");
+                self.settings
+                    .sort_folders
+                    .insert(Categorie::Images, images.to_string_lossy().into_owned());
+                self.defile = Some(if nom.ends_with("en") { 760.0 } else { 330.0 });
+            }
+            "lotE_detail_fr" | "lotE_progress_en" => {
+                // Archive finie présente sur le disque (boutons montrés seulement si elle existe).
+                let d = std::env::temp_dir().join("fluxdl-capture-lotE");
+                let _ = std::fs::create_dir_all(&d);
+                let _ = std::fs::write(d.join("blender-4.2.3-windows-x64.zip"), b"PK");
+                if let Some(e) = self.entries.iter_mut().find(|e| e.id == 2) {
+                    e.dir = d.to_string_lossy().into_owned();
+                    e.name = Some("blender-4.2.3-windows-x64.zip".into());
+                }
+                self.selected = Some(2);
+                self.taches.clear();
+                self.resultats.clear();
+                let h = "3f1c2a9e0b7d4e8f6a5c1b2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f";
+                if nom == "lotE_detail_fr" {
+                    let x = d.join("blender-4.2.3-windows-x64");
+                    self.resultats
+                        .insert((2, Outil::Extraire), Ok(x.to_string_lossy().into_owned()));
+                    self.resultats.insert((2, Outil::Sha), Ok(h.into()));
+                    *self.sha_colle.borrow_mut() = h.to_uppercase();
+                } else {
+                    for (o, fait) in [(Outil::Extraire, 0.62), (Outil::Sha, 0.35)] {
+                        let suivi = Arc::new(apres::Suivi::default());
+                        suivi.total.store(381_000_000, Ordering::Relaxed);
+                        suivi.fait.store((381e6 * fait) as u64, Ordering::Relaxed);
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        // Capture : le fil n'existe pas, la tâche reste « en cours ».
+                        std::mem::forget(tx);
+                        self.taches.insert((2, o), TacheFichier { suivi, rx });
+                    }
+                }
             }
             "torrent_pieces_fr" => self.selected = Some(5),
             "cancel_fr" => {
@@ -3331,13 +3764,22 @@ impl eframe::App for App {
             self.bench.result = h.map(|r| r.unwrap_or_else(|_| Err("panic".into())));
             self.bench.shown = now;
         }
+        self.suivre_outils();
         if let Some(rx) = &self.picker {
             match rx.try_recv() {
                 Ok(d) => {
-                    self.settings.folder = d;
+                    match self.picker_cat.take() {
+                        Some(c) => {
+                            self.settings.sort_folders.insert(c, d);
+                        }
+                        None => self.settings.folder = d,
+                    }
                     self.picker = None;
                 }
-                Err(TryRecvError::Disconnected) => self.picker = None,
+                Err(TryRecvError::Disconnected) => {
+                    self.picker = None;
+                    self.picker_cat = None;
+                }
                 Err(TryRecvError::Empty) => {}
             }
         }
@@ -3445,6 +3887,7 @@ impl eframe::App for App {
                 || self.bench.handle.is_some()
                 || self.picker.is_some()
                 || self.picker_torrent.is_some()
+                || !self.taches.is_empty()
                 || matches!(
                     self.maj.etat(),
                     maj::Etat::Recherche | maj::Etat::Telechargement(..)
@@ -3624,6 +4067,15 @@ fn delete_parts(e: &Entry, annule: bool) {
 }
 
 /// Tuile d'une entrée : vidéo et torrent d'après leur sorte, sinon d'après l'extension.
+/// Catégorie du tri par type d'une vidéo : son seul → Musique.
+fn video_ou_son(q: video::Qualite) -> Categorie {
+    if q.audio() {
+        Categorie::Musique
+    } else {
+        Categorie::Videos
+    }
+}
+
 fn type_de(e: &Entry, nom: &str) -> TypeFichier {
     match e.kind {
         Kind::Video { .. } => TypeFichier::Video,
@@ -4034,6 +4486,104 @@ mod tests {
         app.schedule(1.0);
         let n = |s: Status| app.entries.iter().filter(|e| e.status == s).count();
         assert_eq!((n(Status::Running), n(Status::Queued)), (MAX_ACTIFS, 2));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 0.2.9 : tri par type désactivé → dossier par défaut ; activé → dossier choisi pour la
+    /// catégorie, sinon `<dossier>/<catégorie traduite>` ; vidéo → Vidéos, son seul → Musique,
+    /// playlist en sous-dossier ; fichier HTTP : dossier par défaut (trié au nom de la sonde).
+    #[test]
+    fn dossier_selon_le_tri() {
+        let d = std::env::temp_dir().join(format!("fluxdl-test-tri-{}", std::process::id()));
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, Some(d.join("cap")), None);
+        ctx.run_ui(Default::default(), |_| {})
+            .textures_delta
+            .clear();
+        app.capture = None;
+        app.entries.clear();
+        app.jobs.clear();
+        app.settings.folder = d.join("dl").to_string_lossy().into_owned();
+        app.settings.lang = Lang::Fr;
+        let video = |q| Kind::Video {
+            quality: q,
+            estimate: None,
+            section: None,
+            from_start: false,
+            login: false,
+            options: Default::default(),
+        };
+        let dl = |n: &str| d.join("dl").join(n).to_string_lossy().into_owned();
+        let dir = app
+            .nouvelle("https://v/1".into(), video(video::Qualite::P720))
+            .dir
+            .clone();
+        assert_eq!(dir, app.settings.folder);
+        app.settings.sort_by_type = true;
+        let dir = app
+            .nouvelle("https://v/2".into(), video(video::Qualite::P720))
+            .dir
+            .clone();
+        assert_eq!(dir, dl("Vidéos"));
+        let dir = app
+            .nouvelle("https://v/3".into(), video(video::Qualite::Mp3))
+            .dir
+            .clone();
+        assert_eq!(dir, dl("Musique"));
+        let dir = app
+            .nouvelle(
+                "https://t/4".into(),
+                Kind::Torrent {
+                    hash: "h".into(),
+                    files: None,
+                    started: false,
+                },
+            )
+            .dir
+            .clone();
+        assert_eq!(dir, app.settings.folder);
+        assert_eq!(app.dossier_tri(Categorie::Autres), dl("Autres"));
+        app.settings.lang = Lang::En;
+        assert_eq!(app.dossier_tri(Categorie::Programmes), dl("Programs"));
+        app.settings
+            .sort_folders
+            .insert(Categorie::Images, "/photos".into());
+        app.settings
+            .sort_folders
+            .insert(Categorie::Documents, "  ".into());
+        assert_eq!(app.dossier_tri(Categorie::Images), "/photos");
+        assert_eq!(app.dossier_tri(Categorie::Documents), dl("Documents"));
+        let p = video::Playlist {
+            titre: "Ma liste".into(),
+            videos: vec![video::VideoListe {
+                url: "https://www.youtube.com/watch?v=a".into(),
+                titre: "A".into(),
+                duree: None,
+                numero: 1,
+            }],
+            suite: false,
+            lues: 1,
+        };
+        let o = video::Sortie::default();
+        app.ajouter_liste(
+            "https://www.youtube.com/playlist?list=x",
+            &p,
+            &[true],
+            video::Qualite::Best,
+            &o,
+            true,
+        );
+        let e = app.entries.last().unwrap();
+        assert_eq!(
+            e.dir,
+            d.join("dl")
+                .join("Videos")
+                .join("Ma liste")
+                .to_string_lossy()
+        );
+        // Fichier HTTP : dossier par défaut à l'ajout, le moteur trie au nom de la sonde.
+        app.ajouter("https://h/a.zip".into(), None, None, false);
+        assert_eq!(app.entries.last().unwrap().dir, app.settings.folder);
         let _ = std::fs::remove_dir_all(&d);
     }
 
