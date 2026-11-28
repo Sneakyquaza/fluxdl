@@ -10,11 +10,18 @@ pub fn probe(
 ) -> Result<Probe, String> {
     let (resp, url_finale) = match super::requete(agent, url, url, headers, Some("bytes=0-0")) {
         // Page de connexion ou anti-robot (Cloudflare…) : c'est une page web, pas le fichier.
+        // Sauf une page qui dit « expiré » : lien signé périmé.
         Err(ureq::Error::Status(c, r))
             if matches!(c, 401 | 403 | 429 | 503) && super::est_html(r.header("Content-Type")) =>
         {
-            return Err(super::ERR_PAGE.into())
+            return Err(if matches!(c, 401 | 403) && dit_expire(r) {
+                super::ERR_EXPIRE.into()
+            } else {
+                super::ERR_PAGE.into()
+            });
         }
+        // Accès refusé ou retiré (comme pendant le téléchargement) : « mettre à jour le lien ».
+        Err(ureq::Error::Status(401 | 403 | 410, _)) => return Err(super::ERR_EXPIRE.into()),
         // Fichier vide : « 416, Content-Range: bytes */0 ».
         Err(ureq::Error::Status(416, r))
             if r.header("Content-Range").map(str::trim) == Some("bytes */0") =>
@@ -65,6 +72,15 @@ pub fn probe(
         content_type: entete("Content-Type"),
         url: url_finale,
     })
+}
+
+/// Page d'erreur qui parle d'expiration (16 Kio lus au plus).
+fn dit_expire(r: ureq::Response) -> bool {
+    use std::io::Read;
+    let mut b = Vec::new();
+    let _ = r.into_reader().take(16 << 10).read_to_end(&mut b);
+    let t = String::from_utf8_lossy(&b).to_lowercase();
+    ["expire", "expiré"].iter().any(|k| t.contains(k))
 }
 
 /// Nom du fichier : Content-Disposition, sinon fin de l'URL, nettoyé ; « download » à défaut.

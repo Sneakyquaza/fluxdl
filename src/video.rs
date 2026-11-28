@@ -25,6 +25,10 @@ pub const ABSENT: &str = "yt-dlp not found: install yt-dlp and ffmpeg.";
 /// ils ne sont jamais écrits sur le disque).
 pub const ERR_COOKIES: &str = "Login cookies are gone (fluxdl was restarted): click the fluxdl button on the video page again to resume.";
 
+/// VOD Twitch réservée aux abonnés (yt-dlp : « … subscriber-only content ») : ni nouvelle
+/// tentative ni contournement, seulement ce message.
+pub const ERR_ABONNES: &str = "This video is for subscribers of the channel only.";
+
 /// Sites vidéo connus : leurs liens vont droit au choix du format.
 const HOTES_VIDEO: [&str; 14] = [
     "youtube.com",
@@ -108,6 +112,10 @@ pub struct Infos {
     pub en_direct: bool,
     /// Sous-titres proposés : ceux du site puis les automatiques, par code.
     pub sous_titres: Vec<SousTitre>,
+    /// Un format en H.264 (sinon « MP4 » ne peut pas être tenu : format d'origine).
+    pub h264: bool,
+    /// Le site donne une miniature.
+    pub miniature: bool,
 }
 
 /// Une langue de sous-titres (`subtitles` / `automatic_captions` de `yt-dlp -J`).
@@ -174,6 +182,10 @@ struct Json {
     subtitles: Option<BTreeMap<String, Vec<Piste>>>,
     #[serde(default)]
     automatic_captions: Option<BTreeMap<String, Vec<Piste>>>,
+    #[serde(default)]
+    thumbnail: Option<String>,
+    #[serde(default)]
+    thumbnails: Option<Vec<serde_json::Value>>,
 }
 
 /// Un format d'une langue de sous-titres (vtt, srv3…) : seul le nom sert.
@@ -255,6 +267,13 @@ pub fn infos_depuis_json(d: &[u8]) -> Result<Infos, String> {
             (q, dispo, taille)
         })
         .collect();
+    let h264 = j.formats.iter().any(|f| {
+        f.image()
+            && f.vcodec
+                .as_deref()
+                .is_some_and(|v| v.starts_with("avc") || v.starts_with("h264"))
+    });
+    let miniature = j.thumbnail.is_some() || j.thumbnails.as_ref().is_some_and(|t| !t.is_empty());
     let mut sous_titres = Vec::new();
     for (pistes, auto) in [(j.subtitles, false), (j.automatic_captions, true)] {
         for (code, p) in pistes.unwrap_or_default() {
@@ -280,6 +299,8 @@ pub fn infos_depuis_json(d: &[u8]) -> Result<Infos, String> {
         choix,
         en_direct: j.is_live == Some(true),
         sous_titres,
+        h264,
+        miniature,
     })
 }
 
@@ -493,17 +514,6 @@ pub fn lire_liste(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("yt-dlp: {e}"))?;
-    let lire = |r: Option<Box<dyn Read + Send>>| {
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let mut s = Vec::new();
-            if let Some(mut r) = r {
-                let _ = r.read_to_end(&mut s);
-            }
-            let _ = tx.send(s);
-        });
-        rx
-    };
     let sortie = lire(fils.stdout.take().map(|r| Box::new(r) as _));
     let err = lire(fils.stderr.take().map(|r| Box::new(r) as _));
     let s = loop {
@@ -557,12 +567,22 @@ pub fn nom_dossier(titre: &str) -> String {
     }
 }
 
-/// Ligne de progression (`--progress-template`) : « fluxdl <reçus> <total> <estimé> ».
+/// Ligne de progression (`--progress-template`) : « fluxdl <reçus> <total> <estimé> <ext> ».
+/// Sous-titres et miniature ne comptent pas (sinon « 100 % de 2 ko » avant la vidéo).
 pub fn progression(l: &str) -> Option<(u64, Option<u64>)> {
     let mut m = l.strip_prefix("fluxdl ")?.split_whitespace();
     let n = |s: Option<&str>| s.and_then(|s| s.parse::<f64>().ok()).map(|v| v as u64);
     let recus = n(m.next())?;
     let (total, estime) = (n(m.next()), n(m.next()));
+    if m.next().is_some_and(|e| {
+        [
+            "vtt", "srt", "ass", "ttml", "srv1", "srv2", "srv3", "json3", "lrc", "jpg", "png",
+            "webp",
+        ]
+        .contains(&e)
+    }) {
+        return None;
+    }
     Some((recus, total.or(estime)))
 }
 
@@ -638,6 +658,11 @@ impl Tache {
         }
         if s.thumbnail {
             ajoute(&["--embed-thumbnail"]);
+            // Un webm ne prend pas de miniature : yt-dlp le remet en mkv (un seul format, ou
+            // fichier déjà fini par le moteur ; fusion de deux parties : déjà en mkv).
+            if !self.qualite.audio() {
+                ajoute(&["--remux-video", "webm>mkv"]);
+            }
         }
         if s.chapters {
             ajoute(&["--embed-chapters"]);
@@ -668,7 +693,7 @@ pub fn debut_possible(url: &str) -> bool {
     crate::cookies::site_de(url) == "youtube.com"
 }
 
-const MODELE: &str = "download:fluxdl %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s";
+const MODELE: &str = "download:fluxdl %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s %(info.ext)s";
 
 /// Emplacements de yt-dlp, ffmpeg (dossier de ffmpeg, pour `--ffmpeg-location`) et deno.
 #[derive(Clone, Debug, Default)]
@@ -767,8 +792,25 @@ pub fn lire_infos(o: &Outils, url: &str, cookies: Option<&Path>) -> Result<Infos
     infos_depuis_json(&sortie.stdout)
 }
 
-/// Dernière ligne « ERROR: … » de yt-dlp (sinon la dernière ligne).
+/// Tout le flux `r` lu dans un fil (sortie ou erreurs d'un processus), reçu à sa fin.
+fn lire(r: Option<Box<dyn Read + Send>>) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = Vec::new();
+        if let Some(mut r) = r {
+            let _ = r.read_to_end(&mut s);
+        }
+        let _ = tx.send(s);
+    });
+    rx
+}
+
+/// Dernière ligne « ERROR: … » de yt-dlp (sinon la dernière ligne) ; contenu réservé aux
+/// abonnés → `ERR_ABONNES`.
 fn derniere_erreur(err: &str) -> String {
+    if err.contains("subscriber-only") {
+        return ERR_ABONNES.into();
+    }
     let l = err.lines().rev();
     let e = l
         .clone()
@@ -820,7 +862,7 @@ pub fn telecharger(
     // raccourci : son seul (extraction -x), passage et live restent à yt-dlp ; les passer au
     // moteur si les liens directs donnent satisfaction.
     if tache.section.is_none() && !tache.debut && !tache.qualite.audio() {
-        if let Some(mut d) = liens_directs(o, url, dir, tache, cookies, ctl) {
+        if let Some(mut d) = liens_directs(o, url, dir, tache, cookies, ctl)? {
             let ajouts = tache.sortie.ajouts();
             // Pas de miniature dans un webm : yt-dlp fusionne alors en mkv, la fusion maison
             // aussi (même nom que celui que cherchera la passe finale).
@@ -884,6 +926,8 @@ pub fn telecharger(
     // Plusieurs fichiers de suite (image puis son) : les octets des précédents s'ajoutent.
     let (mut base, mut dernier, mut dernier_total) = (0u64, 0u64, 0u64);
     let (mut fichier, mut erreurs) = (None, String::new());
+    // Sous-titres écrits par yt-dlp : effacés si la vidéo échoue (sinon orphelins).
+    let mut sous_titres = Vec::new();
     loop {
         if ctl.stop.load(Ordering::Relaxed) {
             tuer(&mut fils);
@@ -897,6 +941,8 @@ pub fn telecharger(
             Ok((false, l)) => {
                 if let Some(f) = l.strip_prefix("fluxdl-fichier ") {
                     fichier = Some(PathBuf::from(f.trim()));
+                } else if let Some(f) = l.strip_prefix("[info] Writing video subtitles to: ") {
+                    sous_titres.push(dir.join(f.trim()));
                 } else if let Some((recus, total)) = progression(&l) {
                     if recus + (1 << 20) < dernier {
                         base += dernier_total.max(dernier);
@@ -938,13 +984,17 @@ pub fn telecharger(
         (false, _) => match deja {
             // La vidéo est complète : un ajout raté (miniature…) ne la fait pas échouer.
             Some(f) => {
-                eprintln!(
-                    "fluxdl: yt-dlp final pass failed ({}), video kept without extras",
-                    derniere_erreur(&erreurs)
-                );
+                let e = derniere_erreur(&erreurs);
+                eprintln!("fluxdl: yt-dlp final pass failed ({e}), video kept without extras");
+                ctl.lock().avis = Some(e);
                 Ok(Outcome::Done(f))
             }
-            None => Err(derniere_erreur(&erreurs)),
+            None => {
+                for f in &sous_titres {
+                    let _ = std::fs::remove_file(f);
+                }
+                Err(derniere_erreur(&erreurs))
+            }
         },
     }
 }
@@ -1023,7 +1073,8 @@ fn directs(sortie: &str, dir: &Path) -> Option<Directs> {
 }
 
 /// yt-dlp choisit le format (mêmes arguments que le téléchargement) sans rien télécharger.
-/// Arrêt demandé : yt-dlp est tué, `None`.
+/// Arrêt demandé : yt-dlp est tué, `None`. Vidéo réservée aux abonnés : `ERR_ABONNES` tout de
+/// suite (pas de nouvel essai par yt-dlp seul).
 fn liens_directs(
     o: &Outils,
     url: &str,
@@ -1031,46 +1082,49 @@ fn liens_directs(
     tache: &Tache,
     cookies: Option<&Path>,
     ctl: &Control,
-) -> Option<Directs> {
-    let mut c = commande(o.ytdlp.as_ref()?);
+) -> Result<Option<Directs>, String> {
+    let Some(yt) = o.ytdlp.as_ref() else {
+        return Ok(None);
+    };
+    let mut c = commande(yt);
     c.args(tache.args());
     args_communs(&mut c, o, cookies);
-    let mut fils = c
+    let Ok(mut fils) = c
         .args(["--print", "filename", "--print", "%()j", "-P"])
         .arg(dir)
         .arg("--")
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .ok()?;
-    let (tx, rx) = mpsc::channel();
-    let mut sortie = fils.stdout.take();
-    std::thread::spawn(move || {
-        let mut s = Vec::new();
-        if let Some(r) = &mut sortie {
-            let _ = r.read_to_end(&mut s);
-        }
-        let _ = tx.send(s);
-    });
+    else {
+        return Ok(None);
+    };
+    let rx = lire(fils.stdout.take().map(|r| Box::new(r) as _));
+    let err = lire(fils.stderr.take().map(|r| Box::new(r) as _));
     let s = loop {
         if ctl.stop.load(Ordering::Relaxed) {
             tuer(&mut fils);
-            return None;
+            return Ok(None);
         }
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(s) => break s,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 tuer(&mut fils);
-                return None;
+                return Ok(None);
             }
         }
     };
-    fils.wait()
-        .is_ok_and(|e| e.success())
-        .then(|| directs(&String::from_utf8_lossy(&s), dir))?
+    if fils.wait().is_ok_and(|e| e.success()) {
+        return Ok(directs(&String::from_utf8_lossy(&s), dir));
+    }
+    let e = derniere_erreur(&String::from_utf8_lossy(&err.recv().unwrap_or_default()));
+    if e == ERR_ABONNES {
+        return Err(e);
+    }
+    Ok(None)
 }
 
 /// Noms des fichiers de la partie `i` sur `n` (`n` = 1 : directement le fichier final).
@@ -1558,6 +1612,8 @@ mod tests {
         assert_eq!(c(Qualite::P720), (Qualite::P720, true, Some(96_610_694)));
         // Pas de son seul : extraction possible (son dans les vidéos), taille inconnue.
         assert_eq!(c(Qualite::Mp3), (Qualite::Mp3, true, None));
+        // Audit H1 B5 : ni H.264 (MP4 impossible) ni miniature chez Wikimedia.
+        assert!(!i.h264 && !i.miniature);
     }
 
     #[test]
@@ -1583,6 +1639,9 @@ mod tests {
         // Son original : le meilleur (Opus ici), sans conversion.
         assert_eq!(c(Qualite::M4a), Some(1_100_000));
         assert_eq!(c(Qualite::Mp3), Some(1_100_000));
+        assert!(i.h264 && !i.miniature);
+        let m = infos_depuis_json(br#"{"thumbnail":"https://i/x.jpg","formats":[]}"#).unwrap();
+        assert!(m.miniature && !m.h264);
         // Vidéo en 480p : 1080p et 720p grisés.
         let petit = br#"{"title":"P","formats":[{"height":480,"vcodec":"avc1","acodec":"mp4a","filesize":5}]}"#;
         let i = infos_depuis_json(petit).unwrap();
@@ -2028,6 +2087,8 @@ mod tests {
             Some((1024, Some(4096)))
         );
         assert_eq!(progression("fluxdl 10 NA NA"), Some((10, None)));
+        assert_eq!(progression("fluxdl 10 20 NA webm"), Some((10, Some(20))));
+        assert_eq!(progression("fluxdl 2086 2086 NA vtt"), None);
         assert_eq!(progression("[download] 5%"), None);
         assert!(site_video("https://www.youtube.com/watch?v=x"));
         assert!(site_video("https://youtu.be/x"));
@@ -2038,6 +2099,102 @@ mod tests {
             derniere_erreur("WARNING: a\nERROR: [youtube] x: Video unavailable\n"),
             "[youtube] x: Video unavailable"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vod_reservee_aux_abonnes() {
+        // Audit H1 B10 : message clair, et yt-dlp lancé une seule fois (pas de repli « yt-dlp
+        // seul » après l'échec des liens directs).
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("fluxdl-test-abonnes-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let yt = d.join("yt-dlp");
+        std::fs::write(
+            &yt,
+            format!(
+                "#!/bin/sh\necho x >> '{}/appels'\necho 'ERROR: [twitch:vod] v1: You must be logged into an account that has access to this subscriber-only content. Use --cookies' >&2\nexit 1\n",
+                d.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let o = Outils {
+            ytdlp: Some(yt),
+            ..trouver()
+        };
+        let tache = Tache {
+            qualite: Qualite::Best,
+            estimation: None,
+            section: None,
+            debut: false,
+            sortie: Sortie::default(),
+        };
+        let ctl = Arc::new(Control::default());
+        let r = telecharger(
+            &o,
+            "https://www.twitch.tv/videos/1",
+            &d,
+            &tache,
+            None,
+            4,
+            &ctl,
+        );
+        assert_eq!(r, Err(ERR_ABONNES.into()));
+        assert_eq!(
+            std::fs::read_to_string(d.join("appels"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sous_titres_effaces_apres_echec() {
+        // Audit H1 B8 : le .vtt écrit avant l'échec de la vidéo ne reste pas dans le dossier.
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("fluxdl-test-vtt-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let yt = d.join("yt-dlp");
+        std::fs::write(
+            &yt,
+            format!(
+                "#!/bin/sh\nprintf v > '{0}/V.fr.vtt'\necho '[info] Writing video subtitles to: {0}/V.fr.vtt'\necho 'fluxdl 2 2 NA vtt'\necho 'ERROR: ffmpeg exited with code -11' >&2\nexit 1\n",
+                d.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let o = Outils {
+            ytdlp: Some(yt),
+            ..trouver()
+        };
+        // Passage : yt-dlp seul (pas de liens directs).
+        let tache = Tache {
+            qualite: Qualite::Best,
+            estimation: None,
+            section: Some((0, 20)),
+            debut: false,
+            sortie: Sortie::default(),
+        };
+        let ctl = Arc::new(Control::default());
+        let r = telecharger(
+            &o,
+            "https://commons.wikimedia.org/v",
+            &d,
+            &tache,
+            None,
+            4,
+            &ctl,
+        );
+        assert_eq!(r, Err("ffmpeg exited with code -11".into()));
+        assert!(!d.join("V.fr.vtt").exists());
+        // La ligne de progression du .vtt n'a pas fait « 100 % ».
+        assert_eq!(ctl.snapshot().received, 0);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// 0.2.9 : arguments de yt-dlp pour chaque combinaison de sous-titres, miniature,
@@ -2107,6 +2264,11 @@ mod tests {
                     assert!(x.starts_with(&q.args().join(" ")), "{ctx}");
                     assert!(x.ends_with("-o %(title).150B [%(id)s].%(ext)s"), "{ctx}");
                     assert_eq!(x.contains("--embed-thumbnail"), thumbnail, "{ctx}");
+                    assert_eq!(
+                        x.contains("--remux-video webm>mkv"),
+                        thumbnail && !q.audio(),
+                        "{ctx}"
+                    );
                     assert_eq!(x.contains("--embed-chapters"), chapters, "{ctx}");
                     // Son seul : ni sous-titres ni conteneur vidéo.
                     let image = !q.audio();
@@ -2256,6 +2418,8 @@ mod tests {
                 ..Default::default()
             },
         };
+        // Avertissement de la dernière passe (`Live.avis`).
+        let avis = std::cell::RefCell::new(None);
         let lance = |o: &Outils, sortie: String, final_: &str| {
             std::fs::write(d.join("sortie.txt"), sortie).unwrap();
             std::fs::write(d.join("final.txt"), dl.join(final_).display().to_string()).unwrap();
@@ -2270,6 +2434,7 @@ mod tests {
                 4,
                 &ctl,
             );
+            *avis.borrow_mut() = ctl.snapshot().avis;
             let args = std::fs::read_to_string(d.join("args.txt")).unwrap();
             (r, args.lines().map(String::from).collect::<Vec<_>>())
         };
@@ -2308,6 +2473,7 @@ mod tests {
         );
         let (r, _) = lance(&o, sortie("W [x].webm", &deux), "W [x].mkv");
         assert_eq!(r, Ok(Outcome::Done(dl.join("W [x].mkv"))));
+        assert_eq!(*avis.borrow(), None);
         assert_eq!(std::fs::read(dl.join("W [x].mkv")).unwrap(), b"fusion");
         assert!(!dl.join("W [x].webm").exists());
         // Passe finale ratée (miniature impossible…) : la vidéo complète est gardée.
@@ -2315,6 +2481,8 @@ mod tests {
         let (r, _) = lance(&o, sortie("P [x].mp4", &un), "P [x].mp4");
         assert_eq!(r, Ok(Outcome::Done(dl.join("P [x].mp4"))));
         assert_eq!(std::fs::read(dl.join("P [x].mp4")).unwrap(), v);
+        // … mais pas en silence : l'erreur de yt-dlp est remontée en avertissement.
+        assert_eq!(*avis.borrow(), Some("Postprocessing: boom".into()));
         std::fs::remove_file(d.join("rate")).unwrap();
         // Sans ffmpeg : ni sous-titres, ni miniature, ni chapitres, pas de passe finale.
         let sans = Outils {

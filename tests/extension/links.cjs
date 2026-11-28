@@ -54,6 +54,9 @@ function sameSiteTests() {
     ["https://exemple.fr.evil.com/a.zip", "https://exemple.fr/page", false],
     ["magnet:?xt=urn:btih:abc", "https://exemple.fr/page", false],
     ["https://exemple.fr/a.zip", "", false],
+    ["http://127.0.0.1:18990/a.zip", "http://127.0.0.1:18995/page", false],
+    ["http://127.0.0.1:18990/a.zip", "http://127.0.0.1:18990/page", true],
+    ["https://exemple.fr:443/a.zip", "https://exemple.fr/page", true],
   ];
   for (const [url, page, want] of cases) check(`même site : ${url} depuis ${page || "(rien)"} → ${want}`, ctx.sameSite(url, page) === want);
 }

@@ -73,8 +73,13 @@ pub fn site_de(url: &str) -> String {
     site(&hote(url))
 }
 
-/// Cookie utilisable : du même site que la page, sans tabulation ni retour à la ligne (le
-/// format Netscape n'a pas d'échappement : un tel cookie est écarté, pas réparé).
+/// Cookie utilisable : son domaine est l'hôte de la page, un domaine parent qui le couvre
+/// (`.youtube.com` pour `www.youtube.com`) ou un sous-domaine de l'hôte (même règle stricte que
+/// `sameSite` de l'extension : `b.co.uk` ou `y.github.io` jamais pour `a.co.uk` / `x.github.io`) ;
+/// sans tabulation ni retour à la ligne (le format Netscape n'a pas d'échappement : un tel cookie
+/// est écarté, pas réparé). Parent : au moins deux libellés (`.com`, `.uk` refusés) ;
+/// raccourci : sans liste des suffixes publics, un cookie `.co.uk` passerait (le navigateur n'en
+/// crée jamais), à revoir si l'appli reçoit des cookies d'ailleurs que du navigateur.
 fn valide(c: &Cookie, page: &str) -> bool {
     let propre = |s: &str| !s.chars().any(|c| c.is_control());
     let d = c.domain.trim_start_matches('.');
@@ -86,14 +91,23 @@ fn valide(c: &Cookie, page: &str) -> bool {
             .all(|s| propre(s))
         && c.path.starts_with('/')
         && c.expiry.is_finite()
-        && site(d) == page
+        && (d == page
+            || (d.contains('.') && page.ends_with(&format!(".{d}")))
+            || d.ends_with(&format!(".{page}")))
 }
 
 /// Cookies gardés pour la page `url` (autres sites et cookies illisibles écartés, `MAX` au plus).
 pub fn pour_la_page(url: &str, v: Vec<Cookie>) -> Vec<Cookie> {
-    let page = site_de(url);
+    let h = hote(url);
+    let h = h.trim_end_matches('.');
+    // youtu.be (liens courts) : les cookies sont ceux de youtube.com.
+    let page = if h == "youtu.be" || h.ends_with(".youtu.be") {
+        "youtube.com"
+    } else {
+        h
+    };
     v.into_iter()
-        .filter(|c| valide(c, &page))
+        .filter(|c| valide(c, page))
         .take(MAX)
         .collect()
 }
@@ -226,6 +240,26 @@ mod tests {
             1
         );
         assert_eq!(pour_la_page("https://u:p@www.twitch.tv:443/x", t).len(), 1);
+        // Hôte exact ou sous-domaine seulement : jamais un voisin sous un suffixe public.
+        let v = vec![
+            c("a", "1", "a.co.uk"),
+            c("b", "2", "b.co.uk"),
+            c("x", "3", "x.github.io"),
+            c("y", "4", ".y.github.io"),
+            c("w", "5", "www.a.co.uk"),
+            c("t", "6", ".uk"),
+            c("i", "7", "io"),
+        ];
+        let noms = |u: &str| {
+            pour_la_page(u, v.clone())
+                .into_iter()
+                .map(|c| c.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(noms("https://a.co.uk/v"), ["a", "w"]);
+        assert_eq!(noms("https://x.github.io/v"), ["x"]);
+        assert_eq!(noms("https://cdn.y.github.io/v"), ["y"]);
+        assert!(noms("https://z.github.io/v").is_empty());
         let trop = vec![c("a", "b", ".twitch.tv"); MAX + 5];
         assert_eq!(pour_la_page("https://twitch.tv/", trop).len(), MAX);
         // La valeur n'apparaît jamais dans un {:?}.

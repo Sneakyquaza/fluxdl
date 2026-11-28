@@ -68,7 +68,7 @@ const ASTUCES: [(Icone, &str, &str); 8] = [
     (
         Icone::Reglages,
         "Leave some bandwidth",
-        "Settings → Speed limit: each download leaves bandwidth for everyone else.",
+        "Click the speed pill at the top: one limit for all downloads (or per download in its detail).",
     ),
     (
         Icone::Telecharger,
@@ -274,6 +274,10 @@ pub struct App {
     tab: Tab,
     url: String,
     sha: String,
+    /// Fenêtre étroite (< 1100 px) : le détail de la ligne choisie prend la place de la liste.
+    detail_ouvert: bool,
+    /// Retour de la barre « coller » sous le champ : message, couleur, lien à retélécharger.
+    avis_coller: Option<(&'static str, Color32, Option<String>)>,
     selected: Option<u64>,
     bench: Bench,
     next_id: u64,
@@ -330,6 +334,9 @@ pub struct App {
     /// Cookies de connexion par page vidéo (extension, option par site) : en mémoire seulement,
     /// oubliés quand plus aucune vidéo de la page n'attend (fin, retrait, fenêtre fermée).
     jarres: HashMap<String, Arc<Vec<crate::cookies::Cookie>>>,
+    /// Vidéos finies sans leurs ajouts (passe finale de yt-dlp ratée) : message brut, par id.
+    /// raccourci : en mémoire seulement (perdu au redémarrage), à garder dans `Entry` si besoin.
+    avis_fin: HashMap<u64, String>,
     /// Limite globale, partagée par les connexions de tous les téléchargements HTTP et vidéo.
     globale: Arc<Seau>,
     /// Limite d'un téléchargement choisie dans le panneau de détail (dessiné sans `&mut`).
@@ -382,6 +389,8 @@ impl App {
             tab: Tab::Downloads,
             url: String::new(),
             sha: String::new(),
+            avis_coller: None,
+            detail_ouvert: false,
             selected: None,
             bench: Bench {
                 connections: 16,
@@ -423,6 +432,7 @@ impl App {
             inconnues: Vec::new(),
             cjk: false,
             jarres: HashMap::new(),
+            avis_fin: HashMap::new(),
             globale: Arc::new(Seau::new(0)),
             limite_choisie: Default::default(),
             plan_arme: false,
@@ -908,9 +918,29 @@ impl App {
         });
     }
 
+    /// Barre « coller » : chaque refus se voit sous le champ (texte gardé pour le corriger) ;
+    /// lien en échec → Réessayer ; déjà téléchargé → « Retélécharger » proposé.
     fn add(&mut self) {
-        let url = std::mem::take(&mut self.url);
-        self.ajouter(url, None, None, true);
+        let url = self.url.trim().to_string();
+        let echec = self
+            .entries
+            .iter()
+            .rposition(|e| deja_en_file(e, &url) && matches!(e.status, Status::Failed(_)));
+        let st = self.ajouter(url.clone(), None, None, true);
+        self.avis_coller = match (st, echec) {
+            (Statut::Ajoute, _) => None,
+            (Statut::DejaActif, _) => Some(("Already in the list.", TEXTE2, None)),
+            (Statut::DejaFini, _) => Some(("Already downloaded.", ATTENTION, Some(url))),
+            (Statut::Refuse, Some(k)) => {
+                self.act(k, Act::Resume);
+                Some(("Retrying the failed download.", TEXTE2, None))
+            }
+            (Statut::Refuse, None) => Some(("Paste an http(s) or magnet link.", DANGER, None)),
+        };
+        // Texte gardé s'il est refusé ou déjà téléchargé (à corriger ou à retélécharger).
+        if !matches!((st, echec), (Statut::DejaFini, _) | (Statut::Refuse, None)) {
+            self.url.clear();
+        }
     }
 
     fn start(&mut self, i: usize) {
@@ -1070,6 +1100,9 @@ impl App {
                     }
                     // Cookies inutiles une fois fini : ils ne restent pas dans queue.json.
                     e.cookies = None;
+                    if let Some(a) = j.ctl.snapshot().avis {
+                        self.avis_fin.insert(e.id, a);
+                    }
                     // Décompression automatique (zip / 7z, fichier HTTP seulement).
                     if self.settings.auto_extract
                         && e.kind == Kind::Http
@@ -1148,8 +1181,14 @@ impl App {
         if fini {
             self.last_save = f64::NEG_INFINITY;
         }
-        // Page web au lieu d'un fichier : explication et bouton vers le navigateur.
-        if let Some(url) = page.filter(|_| self.modale.is_none()) {
+        // Page web au lieu d'un fichier : explication et bouton vers le navigateur ; pas si un
+        // autre lien a été ajouté depuis ou est en train d'être collé (la fenêtre volait la
+        // saisie) : la carte garde ses boutons « Ouvrir dans le navigateur » / « vidéo ».
+        if let Some(url) = page.filter(|u| {
+            self.modale.is_none()
+                && self.url.trim().is_empty()
+                && self.entries.last().is_some_and(|e| &e.url == u)
+        }) {
             self.modale = Some(Modale::Page(url));
         }
         // Un torrent qui partage après la fin ne prend pas de place dans la file.
@@ -1606,9 +1645,14 @@ impl App {
             pos2(r.right() - larg, r.center().y - 17.0),
             vec2(larg, 34.0),
         );
+        // « N actives » effacé de la pastille : gardé dans l'infobulle.
+        let mut aide = t(l, "Speed limit for all downloads").to_string();
+        if n > 0 {
+            aide += &format!("\n{n} {}", compte(l, n, "active"));
+        }
         let rep = ui
             .interact(b, egui::Id::unique("limite_globale"), Sense::click())
-            .on_hover_text(t(l, "Speed limit for all downloads"));
+            .on_hover_text(aide);
         let h = survol(ui, &rep);
         if h > 0.0 {
             p.add(lueur(
@@ -1659,6 +1703,7 @@ impl App {
         self.paste_card(ui);
         ui.add_space(20.0);
         self.bandeau_plan(ui);
+        self.bandeau_fin(ui);
         let mut action = None;
         // Défilement propre à la liste (sinon partagé avec les réglages).
         egui::ScrollArea::vertical()
@@ -1895,7 +1940,7 @@ impl App {
             infos.push(site.to_string());
         }
         if let Status::Failed(m) = &e.status {
-            infos.push(crate::i18n::tr(l, m).to_string());
+            infos.push(crate::i18n::erreur(l, m).0);
         }
         let manque = fini && fichier.is_none();
         if manque {
@@ -1914,6 +1959,11 @@ impl App {
             bx - 10.0 - pr.right() - 10.0,
         );
         p.galley(pos2(pr.right() + 10.0, ym - g.size().y / 2.0), g, cg);
+        if let Status::Failed(m) = &e.status {
+            if let (_, Some(d)) = crate::i18n::erreur(l, m) {
+                rep.on_hover_text(d);
+            }
+        }
         action
     }
 
@@ -1981,6 +2031,57 @@ impl App {
         }
     }
 
+    /// Action de fin désarmée (Annuler, Échap, bouton du bandeau) : plus de veille ni d'arrêt
+    /// à la fin, réglage écrit tout de suite.
+    pub(super) fn desarmer_fin(&mut self) {
+        self.settings.end_action = Fin::Rien;
+        self.last_save = f64::NEG_INFINITY;
+    }
+
+    /// Veille ou arrêt du PC armé pour la fin : rappel permanent et « Désactiver ».
+    fn bandeau_fin(&mut self, ui: &mut Ui) {
+        let l = self.settings.lang;
+        let titre = match self.settings.end_action {
+            Fin::Eteindre => t(l, "The PC will shut down when everything is finished"),
+            Fin::Veille => t(l, "The PC will go to sleep when everything is finished"),
+            _ => return,
+        };
+        let desactiver = carte(ui, Margin::symmetric(14, 10), |ui| {
+            let w = ui.available_width();
+            ui.set_width(w);
+            let (r, _) = ui.allocate_exact_size(vec2(w, 36.0), Sense::hover());
+            let p = ui.painter();
+            orbe(p, pos2(r.left() + 16.0, r.center().y), 14.0, GEL_BLEU);
+            icone_relief(
+                p,
+                Rect::from_center_size(pos2(r.left() + 16.0, r.center().y), Vec2::splat(14.0)),
+                Icone::Horloge,
+            );
+            let txt = t(l, "Disable");
+            let bw = ui
+                .painter()
+                .layout_no_wrap(txt.into(), demi(13.5), TEXTE)
+                .size()
+                .x
+                + 64.0;
+            let b = Rect::from_min_size(pos2(r.right() - bw, r.center().y - 18.0), vec2(bw, 36.0));
+            let g = ligne(ui, titre, demi(15.0), TITRE, b.left() - r.left() - 50.0);
+            p.galley(
+                pos2(r.left() + 40.0, r.center().y - g.size().y / 2.0),
+                g,
+                TITRE,
+            );
+            a_la_place(ui, b, |ui| {
+                bouton_gel(ui, txt, Some(Icone::Fermer), b.size(), GEL_BLEU)
+            })
+            .clicked()
+        });
+        if desactiver {
+            self.desarmer_fin();
+        }
+        ui.add_space(14.0);
+    }
+
     /// File en attente de l'heure de démarrage : « Démarre à 02:00 » et « Démarrer maintenant ».
     fn bandeau_plan(&mut self, ui: &mut Ui) {
         let l = self.settings.lang;
@@ -1998,7 +2099,13 @@ impl App {
                 Rect::from_center_size(pos2(r.left() + 16.0, r.center().y), Vec2::splat(14.0)),
                 Icone::Pause,
             );
-            let titre = format!("{} {}", t(l, "Starts at"), plan::hhmm(debut));
+            // Heure déjà passée aujourd'hui : c'est demain.
+            let quand = if crate::systeme::minute_locale() > debut {
+                t(l, "Starts tomorrow at")
+            } else {
+                t(l, "Starts at")
+            };
+            let titre = format!("{quand} {}", plan::hhmm(debut));
             let aide = match self.settings.plan_stop {
                 Some(f) => format!(
                     "{} {}.",
@@ -2059,6 +2166,9 @@ impl App {
                 Some(Icone::Lien),
                 regulier(14.5),
             );
+            if rep.changed() {
+                self.avis_coller = None;
+            }
             let entree = rep.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let coller = a_la_place(ui, bc, |ui| {
                 let n = if etroit { "" } else { t(l, "Paste") };
@@ -2074,6 +2184,9 @@ impl App {
                     .filter(|s| !s.is_empty())
                 {
                     self.url = s;
+                    self.avis_coller = None;
+                } else {
+                    self.avis_coller = Some(("The clipboard has no link.", DANGER, None));
                 }
             }
             let vide = self.url.trim().is_empty();
@@ -2091,6 +2204,31 @@ impl App {
             });
             if (go.clicked() || entree) && !vide {
                 self.add();
+            }
+            if let Some((m, c, encore)) = self.avis_coller.clone() {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(t(l, m)).font(moyen(13.0)).color(c));
+                    let Some(u) = encore else {
+                        return;
+                    };
+                    let txt = t(l, "Download again");
+                    let bw = ui
+                        .painter()
+                        .layout_no_wrap(txt.into(), demi(13.0), TEXTE)
+                        .size()
+                        .x
+                        + 56.0;
+                    if bouton_secondaire(ui, txt, Some(Icone::Actualiser), vec2(bw, 28.0)).clicked()
+                    {
+                        // Nouvelle entrée malgré le doublon : nom rendu unique (« nom (1) »).
+                        let sha = std::mem::take(&mut self.sha).trim().to_string();
+                        let e = self.nouvelle(u, Kind::Http);
+                        e.sha256 = (!sha.is_empty()).then_some(sha);
+                        self.url.clear();
+                        self.avis_coller = None;
+                    }
+                });
             }
             ui.add_space(10.0);
             let (r, _) = ui.allocate_exact_size(vec2(w, 30.0), Sense::hover());
@@ -2256,7 +2394,11 @@ impl App {
             p.add(verre(ui.ctx(), r, 12, 0.66 + 0.1 * h));
             // Choisie : sélection Windows 7 par-dessus le verre.
             selection(&p, r.shrink(3.0), 9.0, if sel { 1.0 } else { 0.35 * h });
-            let nom = e.name.clone().unwrap_or_else(|| e.url.clone());
+            // Pas encore de nom (échec avant la sonde) : fin du chemin plutôt que l'URL entière.
+            let nom = e
+                .name
+                .clone()
+                .unwrap_or_else(|| engine::name_from_url(&e.url).unwrap_or_else(|| e.url.clone()));
             let tuile =
                 Rect::from_min_size(pos2(r.left() + 16.0, r.top() + 16.0), Vec2::splat(40.0));
             tuile_fichier(&p, tuile, type_de(e, &nom));
@@ -2276,6 +2418,11 @@ impl App {
                     (Icone::Dossier, "Open folder", Act::Folder),
                     (Icone::Fermer, "Cancel", Act::Cancel),
                 ],
+                // Réservée aux abonnés : pas de « Réessayer » (rien ne changerait).
+                Status::Failed(m) if m == video::ERR_ABONNES => &[
+                    (Icone::Lien, "Open in browser", Act::Navigateur),
+                    (Icone::Fermer, "Remove from list", Act::Remove),
+                ],
                 Status::Failed(m) if m == engine::ERR_PAGE => &[
                     (Icone::Lien, "Open in browser", Act::Navigateur),
                     (Icone::Lecture, "Try as video", Act::Video),
@@ -2292,7 +2439,15 @@ impl App {
                     (Icone::Dossier, "Open folder", Act::Folder),
                     (Icone::Fermer, "Cancel", Act::Cancel),
                 ],
-                Status::Done | Status::Canceled => &[
+                Status::Done => &[
+                    (Icone::Dossier, "Open folder", Act::Folder),
+                    (
+                        Icone::Fermer,
+                        "Remove from list (the file stays)",
+                        Act::Remove,
+                    ),
+                ],
+                Status::Canceled => &[
                     (Icone::Dossier, "Open folder", Act::Folder),
                     (Icone::Fermer, "Remove from list", Act::Remove),
                 ],
@@ -2325,7 +2480,7 @@ impl App {
             let ym = r.top() + 66.0;
             let pr = pastille(ui, pos2(x0, ym), etat, ce);
             let gauche = match (&e.status, e.size) {
-                (Status::Failed(m), _) => crate::i18n::tr(l, m).to_string(),
+                (Status::Failed(m), _) => crate::i18n::erreur(l, m).0,
                 (_, Some(s)) if e.status == Status::Done => octets(s),
                 // En cours, le pourcentage cède la place au débit et au temps restant.
                 (Status::Running, Some(s)) => format!("{} / {}", octets(e.done.min(s)), octets(s)),
@@ -2395,6 +2550,12 @@ impl App {
             }
             let g = ligne(ui, gauche, regulier(12.5), cg, xd - pr.right() - 10.0);
             p.galley(pos2(pr.right() + 10.0, ym - g.size().y / 2.0), g, cg);
+            // Échec : le message brut (code HTTP, sortie de yt-dlp…) en infobulle de la carte.
+            if let Status::Failed(m) = &e.status {
+                if let (_, Some(d)) = crate::i18n::erreur(l, m) {
+                    rep.clone().on_hover_text(d);
+                }
+            }
             if rep.clicked() && action.is_none() {
                 action = Some(Act::Select);
             }
@@ -2420,7 +2581,10 @@ impl App {
     fn act(&mut self, i: usize, a: Act) {
         let id = self.entries[i].id;
         match a {
-            Act::Select => self.selected = Some(id),
+            Act::Select => {
+                self.selected = Some(id);
+                self.detail_ouvert = true;
+            }
             Act::Folder => open_folder(Path::new(&self.entries[i].dir)),
             Act::Navigateur => {
                 ouvrir_url(&self.entries[i].url);
@@ -2577,7 +2741,10 @@ impl App {
             return;
         };
         let w = ui.available_width();
-        let nom = e.name.clone().unwrap_or_else(|| e.url.clone());
+        let nom = e
+            .name
+            .clone()
+            .unwrap_or_else(|| engine::name_from_url(&e.url).unwrap_or_else(|| e.url.clone()));
         let (r, _) = ui.allocate_exact_size(vec2(w, 46.0), Sense::hover());
         let tuile = Rect::from_min_size(r.min, Vec2::splat(46.0));
         tuile_fichier(ui.painter(), tuile, type_de(e, &nom));
@@ -2613,9 +2780,42 @@ impl App {
         if e.status == Status::Done && !matches!(e.kind, Kind::Torrent { .. }) {
             self.detail_outils(ui, e);
         }
-        // Limite propre au téléchargement (en plus de la globale) ; torrents : globale seulement.
+        // Vidéo gardée sans ses ajouts : dit, avec le message brut de yt-dlp.
+        if let Some(a) = self
+            .avis_fin
+            .get(&e.id)
+            .filter(|_| e.status == Status::Done)
+        {
+            ui.add_space(12.0);
+            ui.label(
+                egui::RichText::new(t(
+                    l,
+                    "Video kept, but subtitles, thumbnail or chapters could not be added.",
+                ))
+                .font(moyen(13.5))
+                .color(ATTENTION),
+            );
+            ui.label(egui::RichText::new(a).font(regulier(12.0)).color(TEXTE3));
+        }
+        // Échec : la raison lisible, puis le message brut en ligne secondaire.
+        if let Status::Failed(m) = &e.status {
+            let (court, detail) = crate::i18n::erreur(l, m);
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new(court).font(moyen(13.5)).color(DANGER));
+            if let Some(d) = detail {
+                ui.label(egui::RichText::new(d).font(regulier(12.0)).color(TEXTE3));
+            }
+        }
+        // Limite propre au téléchargement (en plus de la globale) ; torrents : globale seulement ;
+        // rien pour un téléchargement fini, échoué ou annulé.
         ui.add_space(14.0);
-        if matches!(e.kind, Kind::Torrent { .. }) {
+        let fini = matches!(
+            e.status,
+            Status::Done | Status::Failed(_) | Status::Canceled
+        );
+        if fini {
+            // Rien à limiter.
+        } else if matches!(e.kind, Kind::Torrent { .. }) {
             ui.label(
                 egui::RichText::new(t(
                     l,
@@ -3724,6 +3924,8 @@ impl App {
                         ],
                         en_direct: false,
                         sous_titres: demo_sous_titres(),
+                        h264: true,
+                        miniature: true,
                     })),
                     choix: video::Qualite::P1080,
                     de: "00:02:00".into(),
@@ -3758,6 +3960,8 @@ impl App {
                         ],
                         en_direct: false,
                         sous_titres: demo_sous_titres(),
+                        h264: true,
+                        miniature: true,
                     })),
                     choix: video::Qualite::Best,
                     de: String::new(),
@@ -3795,6 +3999,8 @@ impl App {
                         ],
                         en_direct: true,
                         sous_titres: Vec::new(),
+                        h264: true,
+                        miniature: true,
                     })),
                     choix: video::Qualite::Best,
                     de: String::new(),
@@ -4519,8 +4725,13 @@ impl eframe::App for App {
                 panneau(ui, marge, 0.5);
                 self.sidebar(ui)
             });
-        // Fenêtre étroite (petit écran à 125–150 %) : la liste prend la place du détail.
-        if self.tab == Tab::Downloads && ecran.width() >= 1100.0 {
+        // Fenêtre étroite (petit écran à 125–150 %) : la liste prend la place du détail ; un
+        // clic sur une ligne montre son détail à la place de la liste (« Retour à la liste »).
+        let large = ecran.width() >= 1100.0;
+        if large || self.tab != Tab::Downloads {
+            self.detail_ouvert = false;
+        }
+        if self.tab == Tab::Downloads && large {
             let marge = Margin {
                 left: 28,
                 right: 38,
@@ -4537,19 +4748,48 @@ impl eframe::App for App {
                     self.detail(ui)
                 });
         }
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.inner_margin(Margin {
-                left: 18,
-                right: 18,
-                top: 22,
-                bottom: 0,
-            }))
-            .show(ui, |ui| match self.tab {
-                Tab::Downloads => self.downloads(ui),
-                Tab::History => self.page_historique(ui),
-                Tab::Benchmark => self.benchmark(ui),
-                Tab::Settings => self.settings_tab(ui),
-            });
+        if self.detail_ouvert {
+            let marge = Margin {
+                left: 28,
+                right: 38,
+                top: 36,
+                bottom: 30,
+            };
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE.inner_margin(marge))
+                .show(ui, |ui| {
+                    panneau(ui, marge, 0.66);
+                    let l = self.settings.lang;
+                    let txt = t(l, "Back to the list");
+                    let w = ui
+                        .painter()
+                        .layout_no_wrap(txt.into(), demi(13.5), TEXTE)
+                        .size()
+                        .x
+                        + 40.0;
+                    let echap =
+                        self.modale.is_none() && ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    if bouton_secondaire(ui, txt, None, vec2(w, 32.0)).clicked() || echap {
+                        self.detail_ouvert = false;
+                    }
+                    ui.add_space(14.0);
+                    self.detail(ui)
+                });
+        } else {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE.inner_margin(Margin {
+                    left: 18,
+                    right: 18,
+                    top: 22,
+                    bottom: 0,
+                }))
+                .show(ui, |ui| match self.tab {
+                    Tab::Downloads => self.downloads(ui),
+                    Tab::History => self.page_historique(ui),
+                    Tab::Benchmark => self.benchmark(ui),
+                    Tab::Settings => self.settings_tab(ui),
+                });
+        }
         self.modale(&ctx);
         self.bulle_maj(&ctx);
         self.bulle_extension(&ctx);
@@ -5340,6 +5580,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// Audit H1 B3 : la barre « coller » dit pourquoi un lien n'est pas ajouté et garde le
+    /// texte à corriger ; en échec → relancé ; déjà téléchargé → « Retélécharger ».
+    #[test]
+    fn barre_coller_avis() {
+        let d = std::env::temp_dir().join(format!("fluxdl-test-coller-{}", std::process::id()));
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, Some(d.join("cap")), None);
+        ctx.run_ui(Default::default(), |_| {})
+            .textures_delta
+            .clear();
+        app.entries.clear();
+        app.jobs.clear();
+        std::fs::create_dir_all(d.join("dl")).unwrap();
+        std::fs::write(d.join("dl").join("fini.bin"), b"x").unwrap();
+        app.settings.folder = d.join("dl").to_string_lossy().into_owned();
+        app.url = "pas un lien".into();
+        app.add();
+        assert_eq!(app.url, "pas un lien");
+        assert!(matches!(
+            app.avis_coller,
+            Some(("Paste an http(s) or magnet link.", ..))
+        ));
+        assert!(app.entries.is_empty());
+        app.ajouter("https://h/fini.bin".into(), None, None, false);
+        app.ajouter("https://h/rate.bin".into(), None, None, false);
+        app.entries[0].status = Status::Done;
+        app.entries[0].name = Some("fini.bin".into());
+        app.entries[1].status = Status::Failed("HTTP 500".into());
+        app.url = " https://h/fini.bin ".into();
+        app.add();
+        assert_eq!(
+            app.avis_coller,
+            Some((
+                "Already downloaded.",
+                ATTENTION,
+                Some("https://h/fini.bin".into())
+            ))
+        );
+        assert!(!app.url.is_empty());
+        app.url = "https://h/rate.bin".into();
+        app.add();
+        assert!(matches!(
+            app.avis_coller,
+            Some(("Retrying the failed download.", ..))
+        ));
+        assert!(app.url.is_empty());
+        assert_eq!(app.entries[1].status, Status::Queued);
+        assert_eq!(app.entries.len(), 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// 0.2.9 : action de fin jamais au lancement ni après un échec ou une pause ; compte à
     /// rebours de 60 s puis la commande (fausse ici : jamais de vraie veille ni d'arrêt).
     #[test]
@@ -5383,6 +5674,26 @@ mod tests {
         assert_eq!(*APPELS.lock().unwrap(), [true]);
         assert!(app.modale.is_none());
         // Une seule fois : l'action est remise à « Rien ».
+        assert_eq!(app.settings.end_action, Fin::Rien);
+        // Audit H1 B7 : Échap (comme Annuler) pendant le compte à rebours désarme l'arrêt.
+        app.settings.end_action = Fin::Eteindre;
+        app.fini_session = true;
+        app.action_de_fin(&ctx);
+        assert!(matches!(app.modale, Some(Modale::FinCompte { .. })));
+        let echap = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            ..Default::default()
+        };
+        ctx.run_ui(echap, |ui| app.modale(ui.ctx()))
+            .textures_delta
+            .clear();
+        assert!(app.modale.is_none());
         assert_eq!(app.settings.end_action, Fin::Rien);
         let _ = std::fs::remove_dir_all(&d);
     }

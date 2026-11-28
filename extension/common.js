@@ -191,15 +191,17 @@ function parseList(text) {
 // Même site que la page : hôte exact de la page ou un de ses sous-domaines (jamais deux voisins
 // sous un même suffixe : a.co.uk ≠ b.co.uk, x.github.io ≠ y.github.io) ;
 // raccourci : cdn.exemple.fr depuis www.exemple.fr n'a pas le référent, à revoir si ça gêne.
+// Le port compte aussi (127.0.0.1:18995 ≠ 127.0.0.1:18990).
 function sameSite(url, page) {
-  const h = hostOf(url);
-  const p = hostOf(page);
+  const h = hostOf(url, true);
+  const p = hostOf(page, true);
   return !!p && (h === p || h.endsWith("." + p));
 }
 
-function hostOf(url) {
+function hostOf(url, port = false) {
   try {
-    return new URL(url).hostname.toLowerCase();
+    const u = new URL(url);
+    return (port ? u.host : u.hostname).toLowerCase();
   } catch {
     return "";
   }

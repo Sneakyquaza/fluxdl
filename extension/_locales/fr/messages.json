@@ -27,7 +27,7 @@
   "optConnection": {"message": "Connexion à l'appli"},
   "optPort": {"message": "Port"},
   "optToken": {"message": "Jeton"},
-  "optTokenHint": {"message": "Copiez-le dans fluxdl → Paramètres, puis collez-le ici."},
+  "optTokenHint": {"message": "Copiez-le dans fluxdl → Réglages, puis collez-le ici."},
   "optShow": {"message": "Afficher"},
   "optHide": {"message": "Masquer"},
   "optTest": {"message": "Tester la connexion"},

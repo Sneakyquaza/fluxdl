@@ -121,6 +121,14 @@ fn handle(c: &Cfg, mut s: TcpStream) -> std::io::Result<()> {
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         );
     }
+    if chemin.starts_with("/gone") {
+        return s.write_all(b"HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    }
+    if chemin.starts_with("/page_expiree") {
+        return s.write_all(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\nContent-Length: 25\r\nConnection: close\r\n\r\n<p>Link has expired.</p>",
+        );
+    }
     let n_req = c.requests.fetch_add(1, Ordering::SeqCst);
     let ouvertes = c.actives.fetch_add(1, Ordering::SeqCst) + 1;
     let _o = Ouverte(&c.actives);
@@ -761,6 +769,21 @@ fn lien_expire() {
 }
 
 #[test]
+fn sonde_refusee() {
+    // Audit H1 B4 : 410 et page HTML « expired » dès la sonde = lien expiré ; 404 gardé tel quel
+    // (traduit par l'interface).
+    let (_c, url, _) = serveur(1 << 10, |_| {});
+    let d = dossier("sonde_refusee");
+    let essai = |chemin: &str| {
+        let ctl = Arc::new(Control::default());
+        engine::run(&url.replace("/file.bin", chemin), &d, None, &opts(2), &ctl).unwrap_err()
+    };
+    assert_eq!(essai("/gone"), engine::ERR_EXPIRE);
+    assert_eq!(essai("/page_expiree"), engine::ERR_EXPIRE);
+    assert_eq!(essai("/absent"), "probe: HTTP 404");
+}
+
+#[test]
 fn etag_faible_ou_variable() {
     // Audit M6 : `W/` et ETag propre à un nœud de CDN (même date) ne font pas échouer.
     let (_c, url, data) = serveur(1 << 20, |c| c.etag_weak = true);
@@ -857,15 +880,39 @@ fn tri_par_type_avant_d_ecrire() {
     assert_eq!(ctl.snapshot().dir, None);
 }
 
-/// Débit moyen (octets/s) d'un téléchargement lancé sur `ctl`, sonde comprise.
-fn debit_sur(url: &str, d: &Path, n: usize, ctl: &Arc<Control>) -> (PathBuf, f64) {
+/// Débit moyen (octets/s) d'un téléchargement lancé sur `ctl`, sonde comprise, jusqu'au dernier
+/// octet reçu : le `sync_all` final n'est pas compté (jusqu'à 0,7 s sur un disque chargé, ce
+/// qui faisait croire à un limiteur trop strict quand les tests tournent en parallèle).
+/// Renvoie aussi l'instant du dernier octet.
+fn debit_sur(url: &str, d: &Path, n: usize, ctl: &Arc<Control>) -> (PathBuf, f64, Instant) {
     let t = Instant::now();
-    let r = engine::run(url, d, None, &opts(n), ctl).unwrap();
-    let Outcome::Done(p) = r else {
+    let h = {
+        let (url, d, ctl) = (url.to_string(), d.to_path_buf(), ctl.clone());
+        std::thread::spawn(move || engine::run(&url, &d, None, &opts(n), &ctl))
+    };
+    let fin = tout_recu(ctl);
+    let Outcome::Done(p) = h.join().unwrap().unwrap() else {
         panic!("arrêté")
     };
     let l = ctl.snapshot();
-    (p, l.received as f64 / t.elapsed().as_secs_f64())
+    (p, l.received as f64 / (fin - t).as_secs_f64(), fin)
+}
+
+/// Instant où tous les octets annoncés sont reçus (attente par pas de 2 ms, 60 s au plus : un
+/// téléchargement en échec fait échouer le test au lieu de le bloquer).
+fn tout_recu(ctl: &Control) -> Instant {
+    let debut = Instant::now();
+    loop {
+        let l = ctl.snapshot();
+        if l.size.is_some_and(|t| l.received >= t) {
+            return Instant::now();
+        }
+        assert!(
+            debut.elapsed() < Duration::from_secs(60),
+            "jamais tout reçu"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 #[test]
@@ -876,7 +923,7 @@ fn limite_de_debit_sur_4_connexions() {
     let ctl = Arc::new(Control::avec_limites(vec![Arc::new(engine::Seau::new(
         2_000_000,
     ))]));
-    let (p, v) = debit_sur(&url, &d, 4, &ctl);
+    let (p, v, _) = debit_sur(&url, &d, 4, &ctl);
     verifie(&p, &data);
     assert_eq!(ctl.snapshot().workers.len(), 4);
     eprintln!("limite 2 Mo/s : {:.2} Mo/s", v / 1e6);
@@ -895,21 +942,26 @@ fn limite_changee_en_cours() {
         let (url, d, ctl) = (url.clone(), d.clone(), ctl.clone());
         std::thread::spawn(move || engine::run(&url, &d, None, &opts(4), &ctl))
     };
+    // Débits rapportés au temps vraiment écoulé (un `sleep` peut durer plus sous charge).
     let recu = || ctl.snapshot().received as f64;
+    let t = Instant::now();
     std::thread::sleep(Duration::from_millis(600));
     let a = recu();
-    assert!((0.3e6..=0.9e6).contains(&a), "1 Mo/s : {a} o en 0,6 s");
+    let v = a / t.elapsed().as_secs_f64();
+    assert!((0.5e6..=1.5e6).contains(&v), "1 Mo/s : {v:.0} o/s");
     propre.regler(4_000_000);
+    let t = Instant::now();
     std::thread::sleep(Duration::from_millis(500));
-    let b = recu() - a;
-    assert!((1.3e6..=2.7e6).contains(&b), "4 Mo/s : {b} o en 0,5 s");
-    // Sans limite : le reste (plus de 5 Mo) arrive tout de suite.
+    let v = (recu() - a) / t.elapsed().as_secs_f64();
+    assert!((2.6e6..=5.4e6).contains(&v), "4 Mo/s : {v:.0} o/s");
+    // Sans limite : le reste (plus de 5 Mo) arrive tout de suite (`sync_all` final non compté).
     propre.regler(0);
     let t = Instant::now();
+    let fin = tout_recu(&ctl);
+    assert!(fin - t < Duration::from_secs(1), "{:?}", fin - t);
     let Outcome::Done(p) = h.join().unwrap().unwrap() else {
         panic!("arrêté")
     };
-    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
     verifie(&p, &data);
 }
 
@@ -924,15 +976,17 @@ fn limite_globale_partagee_par_2_telechargements() {
             let ctl = Arc::new(Control::avec_limites(vec![globale.clone()]));
             std::thread::spawn(move || {
                 let _c = _c;
-                let (p, _) = debit_sur(&url, &d, 4, &ctl);
+                let (p, _, fin) = debit_sur(&url, &d, 4, &ctl);
                 verifie(&p, &data);
-                ctl.snapshot().received
+                (ctl.snapshot().received, fin)
             })
         })
         .collect();
     let t = Instant::now();
-    let total: u64 = fils.into_iter().map(|f| f.join().unwrap()).sum();
-    let v = total as f64 / t.elapsed().as_secs_f64();
+    let fins: Vec<(u64, Instant)> = fils.into_iter().map(|f| f.join().unwrap()).collect();
+    let total: u64 = fins.iter().map(|f| f.0).sum();
+    let fin = fins.iter().map(|f| f.1).max().unwrap();
+    let v = total as f64 / (fin - t).as_secs_f64();
     eprintln!(
         "limite globale 2 Mo/s, 2 téléchargements : {:.2} Mo/s",
         v / 1e6

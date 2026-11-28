@@ -159,6 +159,9 @@ pub struct Live {
     pub seeding: bool,
     /// Torrents : carte des pièces réduite (0 = rien, 255 = tout reçu) ; vide sinon.
     pub pieces: Vec<u8>,
+    /// Vidéo finie mais passe finale de yt-dlp ratée (sous-titres, miniature, chapitres) :
+    /// message brut, affiché comme avertissement.
+    pub avis: Option<String>,
 }
 
 impl Live {

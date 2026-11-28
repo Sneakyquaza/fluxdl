@@ -95,8 +95,8 @@ const FR: &[(&str, &str)] = &[
     ),
     ("Leave some bandwidth", "Garde de la bande passante"),
     (
-        "Settings → Speed limit: each download leaves bandwidth for everyone else.",
-        "Réglages → Limite de débit : chaque téléchargement laisse du réseau aux autres.",
+        "Click the speed pill at the top: one limit for all downloads (or per download in its detail).",
+        "Clique sur la pastille de débit en haut : une limite pour tous les téléchargements (ou par téléchargement dans son détail).",
     ),
     ("Always up to date", "Toujours à jour"),
     (
@@ -773,6 +773,67 @@ const FR: &[(&str, &str)] = &[
     ("File not found", "Fichier introuvable"),
     ("Copy link", "Copier le lien"),
     ("Remove from history", "Retirer de l'historique"),
+    ("File not found on the server", "Fichier introuvable sur le serveur"),
+    (
+        "The server is having trouble: try again later",
+        "Le serveur est en panne : réessaie plus tard",
+    ),
+    (
+        "The server limits requests: try again later",
+        "Le serveur limite les demandes : réessaie plus tard",
+    ),
+    ("The server refuses access", "Le serveur refuse l'accès"),
+    ("The server answered with an error", "Le serveur a répondu par une erreur"),
+    (
+        "Server unreachable: check the connection or try again later.",
+        "Serveur injoignable : vérifie la connexion ou réessaie plus tard.",
+    ),
+    (
+        "Assembling the video failed (ffmpeg).",
+        "L'assemblage de la vidéo a échoué (ffmpeg).",
+    ),
+    ("ffmpeg is missing for this video.", "ffmpeg manque pour cette vidéo."),
+    ("The download failed.", "Le téléchargement a échoué."),
+    (
+        "The PC will shut down when everything is finished",
+        "Le PC s'éteindra quand tout sera fini",
+    ),
+    (
+        "The PC will go to sleep when everything is finished",
+        "Le PC se mettra en veille quand tout sera fini",
+    ),
+    ("Disable", "Désactiver"),
+    ("Back to the list", "Retour à la liste"),
+    ("Starts tomorrow at", "Démarre demain à"),
+    ("Remove from list (the file stays)", "Retirer de la liste (le fichier reste)"),
+    (
+        "MP4 unavailable for this video (no H.264): original format, MKV or WebM.",
+        "MP4 impossible pour cette vidéo (pas de H.264) : format d'origine, MKV ou WebM.",
+    ),
+    ("No thumbnail for this video.", "Pas de miniature pour cette vidéo."),
+    (
+        "ffmpeg missing: a single file with picture and sound (quality may be lower).",
+        "ffmpeg absent : un seul fichier image et son (qualité parfois moindre).",
+    ),
+    ("Already in the list.", "Déjà dans la liste."),
+    ("Already downloaded.", "Déjà téléchargé."),
+    ("Retrying the failed download.", "Le téléchargement en échec est relancé."),
+    (
+        "Paste an http(s) or magnet link.",
+        "Colle un lien http(s) ou magnet.",
+    ),
+    (
+        "The clipboard has no link.",
+        "Le presse-papiers ne contient pas de lien.",
+    ),
+    (
+        "This video is for subscribers of the channel only.",
+        "Vidéo réservée aux abonnés de la chaîne.",
+    ),
+    (
+        "Video kept, but subtitles, thumbnail or chapters could not be added.",
+        "Vidéo gardée, mais sous-titres, miniature ou chapitres n'ont pas pu être ajoutés.",
+    ),
 ];
 
 pub fn t(lang: Lang, en: &'static str) -> &'static str {
@@ -785,5 +846,86 @@ pub fn tr(lang: Lang, en: &str) -> &str {
     match lang {
         Lang::En => en,
         Lang::Fr => FR.iter().find(|(k, _)| *k == en).map_or(en, |(_, f)| f),
+    }
+}
+
+/// Message d'erreur lisible et traduit, avec le détail technique (message brut) quand il n'est
+/// pas déjà une phrase de la table : codes HTTP, réseau, ffmpeg, message brut de yt-dlp.
+pub fn erreur(lang: Lang, m: &str) -> (String, Option<String>) {
+    if FR.iter().any(|(k, _)| *k == m) {
+        return (tr(lang, m).to_string(), None);
+    }
+    let bas = m.to_ascii_lowercase();
+    let code = bas
+        .split("http ")
+        .nth(1)
+        .and_then(|r| r.get(..3))
+        .and_then(|c| c.parse::<u16>().ok());
+    let court = match code {
+        Some(404) => format!("{} (404).", t(lang, "File not found on the server")),
+        Some(429) => format!(
+            "{} (429).",
+            t(lang, "The server limits requests: try again later")
+        ),
+        Some(c @ 500..=599) => format!(
+            "{} ({c}).",
+            t(lang, "The server is having trouble: try again later")
+        ),
+        Some(c @ (401 | 403)) => format!("{} ({c}).", t(lang, "The server refuses access")),
+        Some(c) => format!("{} ({c}).", t(lang, "The server answered with an error")),
+        None if [
+            "timeout",
+            "dns",
+            "connection failed",
+            "connection refused",
+            "network",
+        ]
+        .iter()
+        .any(|k| bas.contains(k)) =>
+        {
+            t(
+                lang,
+                "Server unreachable: check the connection or try again later.",
+            )
+            .into()
+        }
+        None if bas == "ffmpeg missing" => t(lang, "ffmpeg is missing for this video.").into(),
+        None if bas.contains("ffmpeg") => t(lang, "Assembling the video failed (ffmpeg).").into(),
+        None => t(lang, "The download failed.").into(),
+    };
+    (court, Some(m.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn erreurs_lisibles() {
+        let fr = |m: &str| erreur(Lang::Fr, m);
+        assert_eq!(
+            fr("probe: HTTP 404"),
+            (
+                "Fichier introuvable sur le serveur (404).".into(),
+                Some("probe: HTTP 404".into())
+            )
+        );
+        assert!(fr("HTTP 503").0.starts_with("Le serveur est en panne"));
+        assert!(fr("probe: Dns Failed").0.starts_with("Serveur injoignable"));
+        assert!(fr("timeout").0.starts_with("Serveur injoignable"));
+        assert_eq!(
+            fr("ffmpeg exited with code -11").0,
+            "L'assemblage de la vidéo a échoué (ffmpeg)."
+        );
+        assert_eq!(fr("[youtube] x: boom").0, "Le téléchargement a échoué.");
+        // Phrase déjà dans la table : traduite, sans détail.
+        assert_eq!(
+            fr(crate::engine::ERR_EXPIRE),
+            (tr(Lang::Fr, crate::engine::ERR_EXPIRE).into(), None)
+        );
+        assert_eq!(
+            erreur(Lang::En, "HTTP 410").0,
+            "The server answered with an error (410)."
+        );
     }
 }

@@ -2,7 +2,6 @@
 //! vidéo, confirmations), bulle de mise à jour, cartes de réglages de la v0.2.
 
 use super::*;
-use crate::i18n::tr;
 
 /// Largeur des fenêtres modales.
 const LARGEUR: f32 = 500.0;
@@ -25,6 +24,10 @@ impl App {
                         let s = video::sous_titres_par_defaut(&i.sous_titres, langue);
                         sortie.sub_lang = s.map(|s| s.code.clone());
                         sortie.sub_auto = s.is_some_and(|s| s.auto);
+                        // Ce que la vidéo n'a pas est décoché (et grisé dans la fenêtre).
+                        sortie.subtitles &= !i.sous_titres.is_empty();
+                        sortie.thumbnail &= i.miniature;
+                        sortie.mp4 &= i.h264;
                         // Qualité par défaut des réglages si disponible, sinon la première.
                         if !i.choix.iter().any(|c| c.0 == *choix && c.1) {
                             if let Some(c) = i.choix.iter().find(|c| c.1) {
@@ -148,7 +151,15 @@ impl App {
                         } else {
                             LARGEUR
                         });
-                        fermer = self.contenu_modale(ui);
+                        // Jamais plus haute que l'appli (900×600) : le reste défile. Vidéo et
+                        // liste bornent leur milieu (`milieu_max`), boutons toujours visibles.
+                        let haut = ecran.height() - 2.0 * 24.0 - 32.0;
+                        egui::ScrollArea::vertical()
+                            .id_salt("modale")
+                            .max_height(haut)
+                            .min_scrolled_height(haut)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| fermer = self.contenu_modale(ui));
                     });
                 let r = rep.response.rect;
                 ui.painter().set(fond, verre(ui.ctx(), r, 16, 0.86));
@@ -166,6 +177,9 @@ impl App {
             }
             if let Some(Modale::Liste { stop, .. }) = &self.modale {
                 stop.store(true, Ordering::Relaxed);
+            }
+            if let Some(Modale::FinCompte { .. }) = &self.modale {
+                self.desarmer_fin();
             }
             self.modale = None;
         }
@@ -351,7 +365,7 @@ impl App {
                 } else {
                     (t(l, "The PC will go to sleep"), t(l, "Going to sleep in"))
                 };
-                titre_modale(ui, Icone::Pause, titre);
+                titre_modale(ui, Icone::Horloge, titre);
                 paragraphe(ui, t(l, "All downloads are finished."));
                 ui.add_space(14.0);
                 ui.vertical_centered(|ui| {
@@ -381,7 +395,9 @@ impl App {
                 if !annuler.has_focus() {
                     annuler.request_focus();
                 }
+                // Annuler désarme : le téléchargement fini suivant ne relance pas l'arrêt.
                 if annuler.clicked() {
+                    self.desarmer_fin();
                     return true;
                 }
                 self.modale = Some(Modale::FinCompte { eteindre, depuis });
@@ -423,192 +439,222 @@ impl App {
                 match &infos {
                     None => attente(ui, t(l, "Reading the available formats…")),
                     Some(Err(m)) => {
-                        erreur(ui, tr(l, m));
+                        erreur(ui, l, m);
                         // yt-dlp ne sait pas lire la page : passer par le navigateur.
                         ui.add_space(8.0);
                         fermer = self.page_web(ui, &url, false).is_some();
                     }
                     Some(Ok(i)) => {
-                        let g = ligne(ui, i.titre.as_str(), demi(14.5), TEXTE, LARGEUR);
-                        let (r, _) = ui.allocate_exact_size(g.size(), Sense::hover());
-                        ui.painter().galley(r.min, g, TEXTE);
-                        if let Some(d) = i.duree {
-                            ui.label(
-                                egui::RichText::new(duree(d))
-                                    .font(regulier(12.5))
-                                    .color(TEXTE3),
-                            );
-                        }
-                        ui.add_space(10.0);
-                        for &(q, dispo, taille) in &i.choix {
-                            let nom = match q {
-                                video::Qualite::Best => format!(
-                                    "{} ({} {})",
-                                    t(l, "Best quality"),
-                                    t(l, "up to"),
-                                    video::nom_hauteur(i.hauteur_max)
-                                ),
-                                video::Qualite::P1080 => "1080p".into(),
-                                video::Qualite::P720 => "720p".into(),
-                                video::Qualite::M4a => {
-                                    format!(
-                                        "{} ({})",
-                                        t(l, "Audio only"),
-                                        t(l, "original M4A/Opus")
-                                    )
-                                }
-                                video::Qualite::Mp3 => format!("{} (MP3)", t(l, "Audio only")),
-                            };
-                            let droite = taille.map_or("—".into(), |t| format!("~{}", octets(t)));
-                            if choix_radio(ui, choix == q, dispo, &nom, &droite) {
-                                choix = q;
-                            }
-                        }
-                        ui.add_space(6.0);
-                        let petit = |ui: &mut Ui, s: &str| {
-                            ui.label(egui::RichText::new(s).font(regulier(12.0)).color(TEXTE3));
-                        };
-                        // Live : depuis le début (YouTube) ; sinon passage « de … à … ».
+                        // Milieu défilant : titre et boutons toujours visibles (900×600).
                         let mut section = None;
                         let mut section_ok = true;
-                        if i.en_direct {
-                            if video::debut_possible(&url) {
-                                coche(ui, &mut debut, t(l, "Live: from its beginning"), "");
-                                petit(ui, t(l, "Off: recorded from now. Recording runs until the live ends or until Pause."));
-                            } else {
-                                petit(ui, t(l, "Live: recorded from now until it ends or until Pause (this site cannot start from the beginning)."));
-                            }
-                        } else {
-                            let ff = self.outils.ffmpeg.is_some();
-                            let (r, _) =
-                                ui.allocate_exact_size(vec2(LARGEUR, 34.0), Sense::hover());
-                            let y = r.center().y;
-                            let col = if ff { TEXTE } else { TEXTE3 };
-                            let mut x = r.left() + 2.0;
-                            x += texte(
-                                ui,
-                                pos2(x, y),
-                                Align2::LEFT_CENTER,
-                                t(l, "Section only: from"),
-                                moyen(13.0),
-                                col,
-                            ) + 8.0;
-                            let zone = |ui: &mut Ui, x: f32, v: &mut String, indice: &str| {
-                                let z =
-                                    Rect::from_min_size(pos2(x, r.top() + 1.0), vec2(96.0, 32.0));
-                                ui.add_enabled_ui(ff, |ui| {
-                                    champ(ui, z, v, indice, None, regulier(13.0))
+                        egui::ScrollArea::vertical()
+                            .id_salt("video_milieu")
+                            .max_height(milieu_max(ui))
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                let g = ligne(ui, i.titre.as_str(), demi(14.5), TEXTE, LARGEUR);
+                                let (r, _) = ui.allocate_exact_size(g.size(), Sense::hover());
+                                ui.painter().galley(r.min, g, TEXTE);
+                                if let Some(d) = i.duree {
+                                    ui.label(
+                                        egui::RichText::new(duree(d))
+                                            .font(regulier(12.5))
+                                            .color(TEXTE3),
+                                    );
+                                }
+                                ui.add_space(10.0);
+                                // Passage choisi (valeurs de l'image d'avant) : tailles au prorata.
+                                let part = i
+                                    .duree
+                                    .filter(|d| *d > 0.0 && !(de.trim().is_empty() && a.trim().is_empty()))
+                                    .and_then(|d| {
+                                        let s = if de.trim().is_empty() { Some(0) } else { video::temps(&de) }?;
+                                        let f = if a.trim().is_empty() { Some(d.ceil() as u32) } else { video::temps(&a) }?;
+                                        (f > s).then(|| ((f - s) as f64 / d).min(1.0))
+                                    })
+                                    .unwrap_or(1.0);
+                                for &(q, dispo, taille) in &i.choix {
+                                    let nom = match q {
+                                        video::Qualite::Best => format!(
+                                            "{} ({} {})",
+                                            t(l, "Best quality"),
+                                            t(l, "up to"),
+                                            video::nom_hauteur(i.hauteur_max)
+                                        ),
+                                        video::Qualite::P1080 => "1080p".into(),
+                                        video::Qualite::P720 => "720p".into(),
+                                        video::Qualite::M4a => {
+                                            format!(
+                                                "{} ({})",
+                                                t(l, "Audio only"),
+                                                t(l, "original M4A/Opus")
+                                            )
+                                        }
+                                        video::Qualite::Mp3 => format!("{} (MP3)", t(l, "Audio only")),
+                                    };
+                                    let droite = taille.map_or("—".into(), |t| {
+                                    format!("~{}", octets((t as f64 * part) as u64))
                                 });
-                                x + 96.0 + 8.0
-                            };
-                            x = zone(ui, x, &mut de, "00:00:00");
-                            x += texte(
-                                ui,
-                                pos2(x, y),
-                                Align2::LEFT_CENTER,
-                                t(l, "to"),
-                                moyen(13.0),
-                                col,
-                            ) + 8.0;
-                            let fin = i.duree.map_or("hh:mm:ss".into(), |d| video::hms(d as u32));
-                            zone(ui, x, &mut a, &fin);
-                            if !ff {
-                                (de, a) = (String::new(), String::new());
-                                petit(ui, t(l, "Sections need ffmpeg."));
-                            } else if !de.trim().is_empty() || !a.trim().is_empty() {
-                                let debut_s = if de.trim().is_empty() {
-                                    Some(0)
-                                } else {
-                                    video::temps(&de)
-                                };
-                                let fin_s = if a.trim().is_empty() {
-                                    i.duree.map(|d| d.ceil() as u32)
-                                } else {
-                                    video::temps(&a)
-                                };
-                                match (debut_s, fin_s) {
-                                    (Some(d), Some(f))
-                                        if f > d && i.duree.is_none_or(|t| d < t.ceil() as u32) =>
-                                    {
-                                        section = Some((d, f));
-                                        petit(ui, t(l, "Cut at the nearest keyframe. A section is restarted, not resumed, after Pause."));
-                                    }
-                                    _ => {
-                                        section_ok = false;
-                                        erreur(
-                                            ui,
-                                            t(l, "Times as hh:mm:ss, the end after the start."),
-                                        );
+                                    if choix_radio(ui, choix == q, dispo, &nom, &droite) {
+                                        choix = q;
                                     }
                                 }
-                            } else {
-                                petit(ui, t(l, "Empty: the whole video. Long videos can be paused and resumed."));
-                            }
-                        }
-                        // Sous-titres, miniature, chapitres, conteneur : ffmpeg requis.
-                        let ff = self.outils.ffmpeg.is_some();
-                        let image = !choix.audio();
-                        ui.add_space(4.0);
-                        ui.add_enabled_ui(ff, |ui| {
-                            if image {
-                                ui.horizontal(|ui| {
-                                    ui.allocate_ui(vec2(132.0, 34.0), |ui| {
-                                        coche(ui, &mut sortie.subtitles, t(l, "Subtitles"), "")
-                                    });
-                                    ui.add_enabled_ui(sortie.subtitles, |ui| {
-                                        let nom = |s: &video::SousTitre| {
-                                            if s.auto {
-                                                format!("{} (auto)", s.nom)
-                                            } else {
-                                                s.nom.clone()
-                                            }
-                                        };
-                                        let actuel = i.sous_titres.iter().find(|s| {
-                                            sortie.sub_lang.as_ref() == Some(&s.code)
-                                                && s.auto == sortie.sub_auto
+                                ui.add_space(6.0);
+                                let petit = |ui: &mut Ui, s: &str| {
+                                    ui.label(egui::RichText::new(s).font(regulier(12.0)).color(TEXTE3));
+                                };
+                                // Live : depuis le début (YouTube) ; sinon passage « de … à … ».
+                                if i.en_direct {
+                                    if video::debut_possible(&url) {
+                                        coche(ui, &mut debut, t(l, "Live: from its beginning"), "");
+                                        petit(ui, t(l, "Off: recorded from now. Recording runs until the live ends or until Pause."));
+                                    } else {
+                                        petit(ui, t(l, "Live: recorded from now until it ends or until Pause (this site cannot start from the beginning)."));
+                                    }
+                                } else {
+                                    let ff = self.outils.ffmpeg.is_some();
+                                    let (r, _) =
+                                        ui.allocate_exact_size(vec2(LARGEUR, 34.0), Sense::hover());
+                                    let y = r.center().y;
+                                    let col = if ff { TEXTE } else { TEXTE3 };
+                                    let mut x = r.left() + 2.0;
+                                    x += texte(
+                                        ui,
+                                        pos2(x, y),
+                                        Align2::LEFT_CENTER,
+                                        t(l, "Section only: from"),
+                                        moyen(13.0),
+                                        col,
+                                    ) + 8.0;
+                                    let zone = |ui: &mut Ui, x: f32, v: &mut String, indice: &str| {
+                                        let z =
+                                            Rect::from_min_size(pos2(x, r.top() + 1.0), vec2(96.0, 32.0));
+                                        ui.add_enabled_ui(ff, |ui| {
+                                            champ(ui, z, v, indice, None, regulier(13.0))
                                         });
-                                        let vide = if i.sous_titres.is_empty() {
-                                            t(l, "None for this video")
+                                        x + 96.0 + 8.0
+                                    };
+                                    x = zone(ui, x, &mut de, "00:00:00");
+                                    x += texte(
+                                        ui,
+                                        pos2(x, y),
+                                        Align2::LEFT_CENTER,
+                                        t(l, "to"),
+                                        moyen(13.0),
+                                        col,
+                                    ) + 8.0;
+                                    let fin = i.duree.map_or("hh:mm:ss".into(), |d| video::hms(d as u32));
+                                    zone(ui, x, &mut a, &fin);
+                                    if !ff {
+                                        (de, a) = (String::new(), String::new());
+                                        petit(ui, t(l, "Sections need ffmpeg."));
+                                    } else if !de.trim().is_empty() || !a.trim().is_empty() {
+                                        let debut_s = if de.trim().is_empty() {
+                                            Some(0)
                                         } else {
-                                            t(l, "Language")
+                                            video::temps(&de)
                                         };
-                                        egui::ComboBox::from_id_salt("sous_titres")
-                                            .width(150.0)
-                                            .height(320.0)
-                                            .selected_text(actuel.map_or(vide.into(), nom))
-                                            .show_ui(ui, |ui| {
-                                                for s in &i.sous_titres {
-                                                    if ui
-                                                        .selectable_label(Some(s) == actuel, nom(s))
-                                                        .clicked()
-                                                    {
-                                                        sortie.sub_lang = Some(s.code.clone());
-                                                        sortie.sub_auto = s.auto;
-                                                    }
-                                                }
+                                        let fin_s = if a.trim().is_empty() {
+                                            i.duree.map(|d| d.ceil() as u32)
+                                        } else {
+                                            video::temps(&a)
+                                        };
+                                        match (debut_s, fin_s) {
+                                            (Some(d), Some(f))
+                                                if f > d && i.duree.is_none_or(|t| d < t.ceil() as u32) =>
+                                            {
+                                                section = Some((d, f));
+                                                petit(ui, t(l, "Cut at the nearest keyframe. A section is restarted, not resumed, after Pause."));
+                                            }
+                                            _ => {
+                                                section_ok = false;
+                                                erreur(
+                                                    ui,
+                                                    l,
+                                                    "Times as hh:mm:ss, the end after the start.",
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        petit(ui, t(l, "Empty: the whole video. Long videos can be paused and resumed."));
+                                    }
+                                }
+                                // Sous-titres, miniature, chapitres, conteneur : ffmpeg requis.
+                                let ff = self.outils.ffmpeg.is_some();
+                                let image = !choix.audio();
+                                ui.add_space(4.0);
+                                ui.add_enabled_ui(ff, |ui| {
+                                    if image {
+                                        ui.horizontal(|ui| {
+                                            ui.allocate_ui(vec2(132.0, 34.0), |ui| {
+                                                ui.add_enabled_ui(!i.sous_titres.is_empty(), |ui| {
+                                                    coche(ui, &mut sortie.subtitles, t(l, "Subtitles"), "")
+                                                });
                                             });
-                                        segmente(
-                                            ui,
-                                            &mut sortie.srt,
-                                            &[(false, t(l, "Embedded")), (true, t(l, ".srt file"))],
-                                        );
-                                    });
+                                            ui.add_enabled_ui(sortie.subtitles, |ui| {
+                                                let nom = |s: &video::SousTitre| {
+                                                    if s.auto {
+                                                        format!("{} (auto)", s.nom)
+                                                    } else {
+                                                        s.nom.clone()
+                                                    }
+                                                };
+                                                let actuel = i.sous_titres.iter().find(|s| {
+                                                    sortie.sub_lang.as_ref() == Some(&s.code)
+                                                        && s.auto == sortie.sub_auto
+                                                });
+                                                let vide = if i.sous_titres.is_empty() {
+                                                    t(l, "None for this video")
+                                                } else {
+                                                    t(l, "Language")
+                                                };
+                                                egui::ComboBox::from_id_salt("sous_titres")
+                                                    .width(150.0)
+                                                    .height(320.0)
+                                                    .selected_text(actuel.map_or(vide.into(), nom))
+                                                    .show_ui(ui, |ui| {
+                                                        for s in &i.sous_titres {
+                                                            if ui
+                                                                .selectable_label(Some(s) == actuel, nom(s))
+                                                                .clicked()
+                                                            {
+                                                                sortie.sub_lang = Some(s.code.clone());
+                                                                sortie.sub_auto = s.auto;
+                                                            }
+                                                        }
+                                                    });
+                                                segmente(
+                                                    ui,
+                                                    &mut sortie.srt,
+                                                    &[(false, t(l, "Embedded")), (true, t(l, ".srt file"))],
+                                                );
+                                            });
+                                        });
+                                    }
+                                    miniature_chapitres_format(ui, l, &mut sortie, image, (i.miniature, i.h264));
                                 });
-                            }
-                            miniature_chapitres_format(ui, l, &mut sortie, image);
-                        });
-                        if !ff {
-                            petit(ui, t(l, "Subtitles, thumbnail and chapters need ffmpeg."));
-                        }
-                        if self.jarres.contains_key(&url) {
-                            petit(ui, t(l, "With your login cookies for this site (members, subscribers): kept in memory only, given to yt-dlp in a private temporary file deleted right after."));
-                        }
-                        let aide = t(
-                            l,
-                            "Downloaded by yt-dlp; picture and sound are merged by ffmpeg.",
-                        );
-                        ui.label(egui::RichText::new(aide).font(regulier(12.0)).color(TEXTE3));
-                        match boutons(ui, t(l, "Cancel"), t(l, "Download"), section_ok) {
+                                if !ff {
+                                    petit(ui, t(l, "Subtitles, thumbnail and chapters need ffmpeg."));
+                                }
+                                if self.jarres.contains_key(&url) {
+                                    petit(ui, t(l, "With your login cookies for this site (members, subscribers): kept in memory only, given to yt-dlp in a private temporary file deleted right after."));
+                                }
+                                let aide = if ff {
+                                    t(
+                                        l,
+                                        "Downloaded by yt-dlp; picture and sound are merged by ffmpeg.",
+                                    )
+                                } else {
+                                    t(l, "ffmpeg missing: a single file with picture and sound (quality may be lower).")
+                                };
+                                ui.label(egui::RichText::new(aide).font(regulier(12.0)).color(TEXTE3));
+                            });
+                        // Entrée = Télécharger (Échap = Annuler, pour toutes les fenêtres).
+                        let entree = ui.input(|i| i.key_pressed(egui::Key::Enter)) && section_ok;
+                        match boutons(ui, t(l, "Cancel"), t(l, "Download"), section_ok)
+                            .or(entree.then_some(true))
+                        {
                             Some(true) => {
                                 let estimate = i
                                     .choix
@@ -619,9 +665,22 @@ impl App {
                                 let titre = i.titre.clone();
                                 let login = self.jarres.contains_key(&url);
                                 // Défaut des prochaines vidéos (langue : celle de l'interface).
+                                // Grisé pour cette vidéo : le choix d'avant reste pour les suivantes.
+                                let avant = &self.settings.video_options;
                                 self.settings.video_options = video::Sortie {
                                     sub_lang: None,
                                     sub_auto: false,
+                                    subtitles: if i.sous_titres.is_empty() {
+                                        avant.subtitles
+                                    } else {
+                                        sortie.subtitles
+                                    },
+                                    thumbnail: if i.miniature {
+                                        sortie.thumbnail
+                                    } else {
+                                        avant.thumbnail
+                                    },
+                                    mp4: if i.h264 { sortie.mp4 } else { avant.mp4 },
                                     ..sortie.clone()
                                 };
                                 let e = self.nouvelle(
@@ -703,162 +762,197 @@ impl App {
                         fermer = boutons(ui, t(l, "Cancel"), "", false).is_some();
                     }
                     Some(Err(m)) => {
-                        erreur(ui, tr(l, m));
+                        erreur(ui, l, m);
                         fermer = boutons(ui, t(l, "Close"), "", false).is_some();
                     }
                     Some(Ok(p)) => {
-                        let g = ligne(ui, p.titre.as_str(), demi(14.5), TEXTE, LARGEUR);
-                        let (r, _) = ui.allocate_exact_size(g.size(), Sense::hover());
-                        ui.painter().galley(r.min, g, TEXTE);
+                        // Milieu défilant : titre et boutons toujours visibles (900×600).
                         let n = coches.iter().filter(|c| **c).count();
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} {n} / {}{}",
-                                t(l, "Selected:"),
-                                p.videos.len(),
-                                if p.suite { "+" } else { "" }
-                            ))
-                            .font(regulier(12.5))
-                            .color(TEXTE3),
-                        );
-                        ui.add_space(8.0);
-                        // Filtre sur le titre ; « Tout cocher / décocher » = les vidéos montrées.
-                        let f = filtre.trim().to_lowercase();
-                        let vues: Vec<usize> = (0..p.videos.len())
-                            .filter(|&i| {
-                                f.is_empty() || p.videos[i].titre.to_lowercase().contains(&f)
-                            })
-                            .collect();
-                        let (r, _) = ui.allocate_exact_size(vec2(LARGEUR, 34.0), Sense::hover());
-                        let mut x = r.right();
-                        for (nom, v) in [(t(l, "Uncheck all"), false), (t(l, "Check all"), true)] {
-                            let w = ui
-                                .painter()
-                                .layout_no_wrap(nom.into(), demi(13.5), TEXTE)
-                                .size()
-                                .x
-                                + 32.0;
-                            let b = Rect::from_min_size(pos2(x - w, r.top()), vec2(w, 34.0));
-                            if a_la_place(ui, b, |ui| bouton_secondaire(ui, nom, None, b.size()))
-                                .clicked()
-                            {
-                                for &i in &vues {
-                                    coches[i] = v;
-                                }
-                            }
-                            x = b.left() - 8.0;
-                        }
-                        let z = Rect::from_min_max(r.min, pos2(x - 2.0, r.bottom()));
-                        champ(
-                            ui,
-                            z,
-                            &mut filtre,
-                            t(l, "Filter by title"),
-                            None,
-                            regulier(13.0),
-                        );
-                        ui.add_space(6.0);
-                        ui.scope(|ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            egui::ScrollArea::vertical()
-                                .max_height(180.0)
-                                .auto_shrink([false, false])
-                                .show_rows(ui, 26.0, vues.len(), |ui, lignes| {
-                                    for &i in &vues[lignes] {
-                                        let v = &p.videos[i];
-                                        coche(
-                                            ui,
-                                            &mut coches[i],
-                                            &format!("{}. {}", v.numero, v.titre),
-                                            &v.duree.map_or(String::new(), duree),
-                                        );
+                        let mut filtre_entree = false;
+                        egui::ScrollArea::vertical()
+                            .id_salt("liste_milieu")
+                            .max_height(milieu_max(ui))
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                let g = ligne(ui, p.titre.as_str(), demi(14.5), TEXTE, LARGEUR);
+                                let (r, _) = ui.allocate_exact_size(g.size(), Sense::hover());
+                                ui.painter().galley(r.min, g, TEXTE);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} {n} / {}{}",
+                                        t(l, "Selected:"),
+                                        p.videos.len(),
+                                        if p.suite { "+" } else { "" }
+                                    ))
+                                    .font(regulier(12.5))
+                                    .color(TEXTE3),
+                                );
+                                ui.add_space(8.0);
+                                // Filtre sur le titre ; « Tout cocher / décocher » = les vidéos montrées.
+                                let f = filtre.trim().to_lowercase();
+                                let vues: Vec<usize> = (0..p.videos.len())
+                                    .filter(|&i| {
+                                        f.is_empty()
+                                            || p.videos[i].titre.to_lowercase().contains(&f)
+                                    })
+                                    .collect();
+                                let (r, _) =
+                                    ui.allocate_exact_size(vec2(LARGEUR, 34.0), Sense::hover());
+                                let mut x = r.right();
+                                for (nom, v) in
+                                    [(t(l, "Uncheck all"), false), (t(l, "Check all"), true)]
+                                {
+                                    let w = ui
+                                        .painter()
+                                        .layout_no_wrap(nom.into(), demi(13.5), TEXTE)
+                                        .size()
+                                        .x
+                                        + 32.0;
+                                    let b =
+                                        Rect::from_min_size(pos2(x - w, r.top()), vec2(w, 34.0));
+                                    if a_la_place(ui, b, |ui| {
+                                        bouton_secondaire(ui, nom, None, b.size())
+                                    })
+                                    .clicked()
+                                    {
+                                        for &i in &vues {
+                                            coches[i] = v;
+                                        }
                                     }
-                                });
-                        });
-                        let petit = |ui: &mut Ui, s: &str| {
-                            ui.label(egui::RichText::new(s).font(regulier(12.0)).color(TEXTE3));
-                        };
-                        if vues.is_empty() {
-                            petit(ui, t(l, "No video matches the filter."));
-                        }
-                        if let Some(e) = &erreur_suite {
-                            erreur(ui, tr(l, e));
-                        }
-                        if p.suite {
-                            if rx.is_some() {
-                                attente(ui, t(l, "Reading more videos…"));
-                            } else {
-                                ui.add_space(4.0);
-                                let nom = t(l, "Load more");
-                                let w = ui
-                                    .painter()
-                                    .layout_no_wrap(nom.into(), demi(13.5), TEXTE)
-                                    .size()
-                                    .x
-                                    + 32.0;
-                                if bouton_secondaire(ui, nom, None, vec2(w, 32.0)).clicked() {
-                                    suite = Some(p.lues);
+                                    x = b.left() - 8.0;
                                 }
-                            }
-                        }
-                        ui.add_space(8.0);
-                        // Une qualité pour toutes : celles qu'une vidéo n'a pas sont prises au
-                        // plus près par yt-dlp (« /b »).
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(t(l, "Quality"))
-                                    .font(moyen(13.0))
-                                    .color(TEXTE),
-                            );
-                            ui.add_space(8.0);
-                            segmente(
-                                ui,
-                                &mut choix,
-                                &[
-                                    (video::Qualite::Best, t(l, "Best")),
-                                    (video::Qualite::P1080, "1080p"),
-                                    (video::Qualite::P720, "720p"),
-                                    (video::Qualite::M4a, t(l, "Audio")),
-                                    (video::Qualite::Mp3, "MP3"),
-                                ],
-                            );
-                        });
-                        let ff = self.outils.ffmpeg.is_some();
-                        let image = !choix.audio();
-                        ui.add_enabled_ui(ff, |ui| {
-                            if image {
-                                ui.horizontal(|ui| {
-                                    ui.allocate_ui(vec2(290.0, 26.0), |ui| {
-                                        coche(
-                                            ui,
-                                            &mut sortie.subtitles,
-                                            t(l, "Subtitles in the interface language"),
-                                            "",
-                                        )
-                                    });
-                                    ui.add_enabled_ui(sortie.subtitles, |ui| {
-                                        segmente(
-                                            ui,
-                                            &mut sortie.srt,
-                                            &[(false, t(l, "Embedded")), (true, t(l, ".srt file"))],
-                                        );
-                                    });
+                                let z = Rect::from_min_max(r.min, pos2(x - 2.0, r.bottom()));
+                                // Entrée dans le filtre : filtre seulement, pas Télécharger.
+                                filtre_entree = champ(
+                                    ui,
+                                    z,
+                                    &mut filtre,
+                                    t(l, "Filter by title"),
+                                    None,
+                                    regulier(13.0),
+                                )
+                                .lost_focus();
+                                ui.add_space(6.0);
+                                ui.scope(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                    egui::ScrollArea::vertical()
+                                        .max_height(180.0)
+                                        .auto_shrink([false, false])
+                                        .show_rows(ui, 26.0, vues.len(), |ui, lignes| {
+                                            for &i in &vues[lignes] {
+                                                let v = &p.videos[i];
+                                                coche(
+                                                    ui,
+                                                    &mut coches[i],
+                                                    &format!("{}. {}", v.numero, v.titre),
+                                                    &v.duree.map_or(String::new(), duree),
+                                                );
+                                            }
+                                        });
                                 });
-                            }
-                            miniature_chapitres_format(ui, l, &mut sortie, image);
-                        });
-                        if !ff {
-                            petit(ui, t(l, "Subtitles, thumbnail and chapters need ffmpeg."));
-                        }
-                        let nom = video::nom_dossier(&p.titre);
-                        coche(
-                            ui,
-                            &mut dossier,
-                            &format!("{} {nom}", t(l, "In a subfolder:")),
-                            "",
-                        );
+                                let petit = |ui: &mut Ui, s: &str| {
+                                    ui.label(
+                                        egui::RichText::new(s).font(regulier(12.0)).color(TEXTE3),
+                                    );
+                                };
+                                if vues.is_empty() {
+                                    petit(ui, t(l, "No video matches the filter."));
+                                }
+                                if let Some(e) = &erreur_suite {
+                                    erreur(ui, l, e);
+                                }
+                                if p.suite {
+                                    if rx.is_some() {
+                                        attente(ui, t(l, "Reading more videos…"));
+                                    } else {
+                                        ui.add_space(4.0);
+                                        let nom = t(l, "Load more");
+                                        let w = ui
+                                            .painter()
+                                            .layout_no_wrap(nom.into(), demi(13.5), TEXTE)
+                                            .size()
+                                            .x
+                                            + 32.0;
+                                        if bouton_secondaire(ui, nom, None, vec2(w, 32.0)).clicked()
+                                        {
+                                            suite = Some(p.lues);
+                                        }
+                                    }
+                                }
+                                ui.add_space(8.0);
+                                // Une qualité pour toutes : celles qu'une vidéo n'a pas sont prises au
+                                // plus près par yt-dlp (« /b »).
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(t(l, "Quality"))
+                                            .font(moyen(13.0))
+                                            .color(TEXTE),
+                                    );
+                                    ui.add_space(8.0);
+                                    segmente(
+                                        ui,
+                                        &mut choix,
+                                        &[
+                                            (video::Qualite::Best, t(l, "Best")),
+                                            (video::Qualite::P1080, "1080p"),
+                                            (video::Qualite::P720, "720p"),
+                                            (video::Qualite::M4a, t(l, "Audio")),
+                                            (video::Qualite::Mp3, "MP3"),
+                                        ],
+                                    );
+                                });
+                                let ff = self.outils.ffmpeg.is_some();
+                                let image = !choix.audio();
+                                ui.add_enabled_ui(ff, |ui| {
+                                    if image {
+                                        ui.horizontal(|ui| {
+                                            ui.allocate_ui(vec2(290.0, 26.0), |ui| {
+                                                coche(
+                                                    ui,
+                                                    &mut sortie.subtitles,
+                                                    t(l, "Subtitles in the interface language"),
+                                                    "",
+                                                )
+                                            });
+                                            ui.add_enabled_ui(sortie.subtitles, |ui| {
+                                                segmente(
+                                                    ui,
+                                                    &mut sortie.srt,
+                                                    &[
+                                                        (false, t(l, "Embedded")),
+                                                        (true, t(l, ".srt file")),
+                                                    ],
+                                                );
+                                            });
+                                        });
+                                    }
+                                    miniature_chapitres_format(
+                                        ui,
+                                        l,
+                                        &mut sortie,
+                                        image,
+                                        (true, true),
+                                    );
+                                });
+                                if !ff {
+                                    petit(
+                                        ui,
+                                        t(l, "Subtitles, thumbnail and chapters need ffmpeg."),
+                                    );
+                                }
+                                let nom = video::nom_dossier(&p.titre);
+                                coche(
+                                    ui,
+                                    &mut dossier,
+                                    &format!("{} {nom}", t(l, "In a subfolder:")),
+                                    "",
+                                );
+                            });
                         let ok = format!("{} ({n})", t(l, "Download"));
-                        match boutons(ui, t(l, "Cancel"), &ok, n > 0) {
+                        let entree = ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            && !filtre_entree
+                            && n > 0;
+                        match boutons(ui, t(l, "Cancel"), &ok, n > 0).or(entree.then_some(true)) {
                             Some(true) => {
                                 self.settings.video_options = video::Sortie {
                                     sub_lang: None,
@@ -917,7 +1011,7 @@ impl App {
                         fermer = boutons(ui, t(l, "Cancel"), "", false).is_some();
                     }
                     Some(Err(m)) => {
-                        erreur(ui, tr(l, m));
+                        erreur(ui, l, m);
                         fermer = boutons(ui, t(l, "Close"), "", false).is_some();
                     }
                     Some(Ok(a)) => {
@@ -1087,7 +1181,7 @@ impl App {
                         fermer = boutons(ui, t(l, "Cancel"), "", false).is_some();
                     }
                     EtatOutils::Erreur(m) => {
-                        erreur(ui, t(l, m));
+                        erreur(ui, l, m);
                         fermer = boutons(ui, t(l, "Close"), "", false).is_some();
                     }
                 }
@@ -1776,11 +1870,20 @@ impl App {
 }
 
 /// Miniature, chapitres et conteneur (vidéo seule et liste ; ffmpeg requis, vérifié avant).
-fn miniature_chapitres_format(ui: &mut Ui, l: Lang, sortie: &mut video::Sortie, image: bool) {
+/// `dispo` : (miniature, H.264) de la vidéo ; absents → grisés, avec la raison.
+fn miniature_chapitres_format(
+    ui: &mut Ui,
+    l: Lang,
+    sortie: &mut video::Sortie,
+    image: bool,
+    dispo: (bool, bool),
+) {
     ui.horizontal(|ui| {
         let w = (LARGEUR - 8.0) / 2.0;
         ui.allocate_ui(vec2(w, 26.0), |ui| {
-            coche(ui, &mut sortie.thumbnail, t(l, "Embed the thumbnail"), "")
+            ui.add_enabled_ui(dispo.0, |ui| {
+                coche(ui, &mut sortie.thumbnail, t(l, "Embed the thumbnail"), "")
+            })
         });
         ui.allocate_ui(vec2(w, 26.0), |ui| {
             coche(ui, &mut sortie.chapters, t(l, "Embed the chapters"), "")
@@ -1794,13 +1897,20 @@ fn miniature_chapitres_format(ui: &mut Ui, l: Lang, sortie: &mut video::Sortie, 
                     .color(TEXTE),
             );
             ui.add_space(8.0);
-            segmente(
-                ui,
-                &mut sortie.mp4,
-                &[(true, "MP4"), (false, t(l, "Original"))],
-            );
+            ui.add_enabled_ui(dispo.1, |ui| {
+                segmente(
+                    ui,
+                    &mut sortie.mp4,
+                    &[(true, "MP4"), (false, t(l, "Original"))],
+                )
+            });
         });
-        let s = if sortie.mp4 {
+        let s = if !dispo.1 {
+            t(
+                l,
+                "MP4 unavailable for this video (no H.264): original format, MKV or WebM.",
+            )
+        } else if sortie.mp4 {
             t(
                 l,
                 "MP4: plays everywhere (H.264/AAC when available, up to 1080p on YouTube).",
@@ -1809,6 +1919,13 @@ fn miniature_chapitres_format(ui: &mut Ui, l: Lang, sortie: &mut video::Sortie, 
             t(l, "Original: best quality, MKV or WebM.")
         };
         ui.label(egui::RichText::new(s).font(regulier(12.0)).color(TEXTE3));
+    }
+    if !dispo.0 {
+        ui.label(
+            egui::RichText::new(t(l, "No thumbnail for this video."))
+                .font(regulier(12.0))
+                .color(TEXTE3),
+        );
     }
 }
 
@@ -1835,8 +1952,24 @@ pub(super) fn paragraphe(ui: &mut Ui, s: &str) {
     ui.label(egui::RichText::new(s).font(regulier(13.5)).color(TEXTE2));
 }
 
-fn erreur(ui: &mut Ui, s: &str) {
-    ui.label(egui::RichText::new(s).font(regulier(13.5)).color(DANGER));
+/// Hauteur permise au milieu défilant d'une fenêtre, titre et boutons toujours visibles :
+/// hauteur de l'appli moins les marges du cadre (2 × 24), un écart au bord (2 × 16), le titre
+/// (~50), la rangée de boutons (~60) et un peu de jeu.
+fn milieu_max(ui: &Ui) -> f32 {
+    (ui.ctx().content_rect().height() - 200.0).max(160.0)
+}
+
+/// Raison lisible et traduite ; message brut (code, sortie de yt-dlp) en infobulle.
+fn erreur(ui: &mut Ui, l: Lang, m: &str) {
+    let (court, detail) = crate::i18n::erreur(l, m);
+    let r = ui.label(
+        egui::RichText::new(court)
+            .font(regulier(13.5))
+            .color(DANGER),
+    );
+    if let Some(d) = detail {
+        r.on_hover_text(d);
+    }
 }
 
 fn attente(ui: &mut Ui, s: &str) {
