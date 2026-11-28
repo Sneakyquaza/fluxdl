@@ -66,6 +66,9 @@ pub struct Settings {
     pub extract_delete: bool,
     /// « Réduire les animations » : aucune animation (durées à 0).
     pub reduce_motion: bool,
+    /// Visite guidée terminée ou passée (absent d'un ancien réglage = pas vue : montrée une
+    /// fois aussi après la mise à jour).
+    pub tour_seen: bool,
 }
 
 /// Action quand tous les téléchargements sont finis.
@@ -111,6 +114,7 @@ impl Default for Settings {
             auto_extract: false,
             extract_delete: false,
             reduce_motion: false,
+            tour_seen: false,
         }
     }
 }
@@ -321,6 +325,25 @@ fn system_lang() -> Lang {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Visite guidée : absente d'un ancien settings.json = pas vue (montrée après la mise à
+    /// jour) ; vue = gardée d'un lancement à l'autre.
+    #[test]
+    fn visite_vue_gardee() {
+        let ancien: Settings =
+            serde_json::from_str(r#"{"lang":"Fr","extension_asked":true}"#).unwrap();
+        assert!(!ancien.tour_seen);
+        let d = std::env::temp_dir().join(format!("{APP_NAME}-visite-{}", std::process::id()));
+        let s = Settings {
+            tour_seen: true,
+            ..ancien
+        };
+        save_in(&d, "settings.json", &s);
+        let relu: Settings =
+            serde_json::from_slice(&std::fs::read(d.join("settings.json")).unwrap()).unwrap();
+        assert!(relu.tour_seen);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     /// Audit M1 : une entrée d'un `Kind` inconnu (version plus récente) ne vide plus la file.
     #[test]

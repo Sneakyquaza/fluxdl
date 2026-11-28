@@ -56,6 +56,9 @@ A free, open-source multi-connection download manager (Windows + Linux, single e
   files (asked on the first torrent, toggle in Settings, current user only).
 - **Browser extension** (below).
 
+### New in 0.2.10
+- **Guided tour** at first launch (and once after updating): ten short illustrated cards on what fluxdl does, with arrows, step dots and ← → / Esc. Setup cards have their own button (watch the clipboard, install the extension, video tools, scheduling, sorting and extraction, download folder, magnet links on Windows) and show "Done" once set. Replay it from Settings → Guided tour.
+
 ### New in 0.2.9
 - **Videos:** one progress bar for picture + sound, real name from the start, Stop works at every step. Subtitles (language, embedded or .srt), embedded thumbnail and chapters, MP4 or original, MP3.
 - **Playlists and channels:** paste a YouTube playlist or channel, tick the videos you want.

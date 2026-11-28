@@ -1835,7 +1835,7 @@ impl App {
     }
 
     /// Réglages → Vidéos → Télécharger : même fenêtre d'accord, sans vidéo à ouvrir après.
-    fn ouvrir_video_outils(&mut self) {
+    pub(super) fn ouvrir_video_outils(&mut self) {
         let o = self.outils.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {

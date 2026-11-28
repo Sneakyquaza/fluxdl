@@ -471,7 +471,7 @@ impl App {
 }
 
 /// Fenêtre de navigateur miniature (fond blanc, barre d'adresse) ; renvoie la zone de la page.
-fn fenetre(p: &egui::Painter, r: Rect, adresse: &str) -> Rect {
+pub(super) fn fenetre(p: &egui::Painter, r: Rect, adresse: &str) -> Rect {
     p.add(lueur(r.translate(vec2(0.0, 2.0)), nuit(40), 6.0));
     p.rect_filled(r, 7.0, rgb(0xf4, 0xf7, 0xfb));
     let barre = Rect::from_min_size(r.min, vec2(r.width(), 18.0));
@@ -499,7 +499,7 @@ fn fenetre(p: &egui::Painter, r: Rect, adresse: &str) -> Rect {
 }
 
 /// Contour orange autour de l'élément à cliquer, et le pointeur de la souris.
-fn repere(p: &egui::Painter, r: Rect, rayon: f32) {
+pub(super) fn repere(p: &egui::Painter, r: Rect, rayon: f32) {
     p.add(lueur(r.expand(2.0), REPERE.gamma_multiply(0.45), 5.0));
     p.rect_stroke(
         r.expand(2.0),
@@ -527,7 +527,7 @@ fn repere(p: &egui::Painter, r: Rect, rayon: f32) {
 }
 
 /// Barres grises : lignes de texte factices.
-fn lignes(p: &egui::Painter, x: f32, y: f32, largeurs: &[f32]) {
+pub(super) fn lignes(p: &egui::Painter, x: f32, y: f32, largeurs: &[f32]) {
     for (i, w) in largeurs.iter().enumerate() {
         p.rect_filled(
             Rect::from_min_size(pos2(x, y + i as f32 * 7.0), vec2(*w, 3.0)),

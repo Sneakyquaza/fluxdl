@@ -5,6 +5,7 @@ mod anim;
 mod draw;
 mod fenetres;
 mod guide;
+mod visite;
 
 use crate::apres::{self, Categorie};
 use crate::historique::{self, Filtre, Trace};
@@ -370,6 +371,10 @@ pub struct App {
     hist_filtre: Filtre,
     hist_cat: Option<Categorie>,
     hist_recentes: bool,
+    /// Visite guidée (premier lancement, ou Réglages → « Revoir la visite guidée »).
+    visite: Option<visite::Visite>,
+    /// Réglages ouverts depuis la visite : défiler jusqu'à la planification.
+    vers_plan: bool,
 }
 
 impl App {
@@ -378,7 +383,7 @@ impl App {
         let textures = installer_style(ctx);
         let logo = ctx.load_texture(
             "logo",
-            egui::ColorImage::from_rgba_unmultiplied([64, 64], &crate::icone::icone_rgba(64)),
+            egui::ColorImage::from_rgba_unmultiplied([128, 128], &crate::icone::icone_rgba(128)),
             egui::TextureOptions {
                 mipmap_mode: Some(egui::TextureFilter::Linear),
                 ..egui::TextureOptions::LINEAR
@@ -455,6 +460,8 @@ impl App {
             hist_filtre: Filtre::Tous,
             hist_cat: None,
             hist_recentes: true,
+            visite: None,
+            vers_plan: false,
         };
         if let Some(d) = capture {
             // Captures : jamais de vraie veille ni d'arrêt du PC.
@@ -504,6 +511,8 @@ impl App {
             app.settings.token = serveur::nouveau_jeton();
         }
         app.lancer_serveur(ctx);
+        // Visite guidée : attend derrière la fenêtre d'un lien passé au lancement.
+        app.visite = visite::au_lancement(app.settings.tour_seen, &app.settings.folder);
         if let Some(u) = ouvrir {
             app.ajouter(u, None, None, true);
         }
@@ -3684,6 +3693,19 @@ impl App {
                             interrupteur(ui, &mut self.settings.reduce_motion);
                         },
                     );
+                    separateur(ui);
+                    reglage(
+                        ui,
+                        t(l, "Guided tour"),
+                        t(l, "The cards shown at first launch: what fluxdl does, and setting it up."),
+                        |ui| {
+                            let txt = t(l, "Replay the tour");
+                            let w = ui.painter().layout_no_wrap(txt.into(), demi(13.5), TEXTE).size().x + 64.0;
+                            if bouton_secondaire(ui, txt, Some(Icone::Lecture), vec2(w, 36.0)).clicked() {
+                                self.revoir_visite();
+                            }
+                        },
+                    );
                 });
                 ui.add_space(20.0);
                 carte(ui, Margin::symmetric(20, 6), |ui| {
@@ -3819,6 +3841,10 @@ impl App {
             }
             change
         };
+        // Ouverte depuis la visite guidée : la carte de planification en haut.
+        if std::mem::take(&mut self.vers_plan) {
+            ui.scroll_to_cursor(Some(Align::TOP));
+        }
         let mut change = false;
         carte(ui, Margin::symmetric(20, 6), |ui| {
             ui.set_width(ui.available_width());
@@ -3892,7 +3918,7 @@ impl App {
         let f = *frame;
         let dir = dir.clone();
         // Assez d'images entre le changement de vue et la capture pour finir les animations.
-        let vues: [(Tab, Lang, &str); 37] = [
+        let vues: [(Tab, Lang, &str); 52] = [
             (Tab::Downloads, Lang::En, "downloads"),
             (Tab::Benchmark, Lang::En, "benchmark"),
             (Tab::Settings, Lang::En, "settings"),
@@ -3929,7 +3955,22 @@ impl App {
             (Tab::History, Lang::Fr, "lotG_search_fr"),
             (Tab::History, Lang::Fr, "lotG_clear_fr"),
             (Tab::Downloads, Lang::Fr, "lotG_retry_card_fr"),
+            (Tab::Downloads, Lang::Fr, "tour_0_fr"),
+            (Tab::Downloads, Lang::Fr, "tour_1_fr"),
+            (Tab::Downloads, Lang::Fr, "tour_2_fr"),
+            (Tab::Downloads, Lang::Fr, "tour_3_fr"),
+            (Tab::Downloads, Lang::Fr, "tour_4_fr"),
+            (Tab::Downloads, Lang::Fr, "tour_5_fr"),
+            (Tab::Downloads, Lang::Fr, "tour_6_fr"),
+            (Tab::Downloads, Lang::Fr, "tour_7_fr"),
+            (Tab::Downloads, Lang::Fr, "tour_8_fr"),
+            (Tab::Downloads, Lang::Fr, "tour_9_fr"),
+            (Tab::Downloads, Lang::En, "tour_0_en"),
+            (Tab::Downloads, Lang::En, "tour_3_en"),
+            (Tab::Settings, Lang::Fr, "tour_pause_fr"),
             (Tab::Downloads, Lang::Fr, "narrow_900x600_fr"),
+            (Tab::Downloads, Lang::Fr, "tour_6_900x600_fr"),
+            (Tab::Downloads, Lang::Fr, "tour_2_900x600_fr"),
         ];
         for (i, (tab, lang, nom)) in vues.into_iter().enumerate() {
             let k = 30 * (i as u32 + 1);
@@ -3959,6 +4000,23 @@ impl App {
         self.maj.mettre(maj::Etat::Rien);
         self.selected = Some(1);
         self.plan_arme = nom == "lotD_downloads_fr";
+        // Visite guidée : la carte du nom (`tour_<carte>_…`), ou en pause sur la planification.
+        self.visite = nom
+            .strip_prefix("tour_")
+            .and_then(|r| r.split('_').next())
+            .and_then(|k| k.parse().ok())
+            .map(|k| {
+                let mut v = visite::Visite::new(&self.settings.folder);
+                v.aller(k);
+                v
+            });
+        if nom == "tour_pause_fr" {
+            let mut v = visite::Visite::new(&self.settings.folder);
+            v.aller(5);
+            v.pause = true;
+            self.visite = Some(v);
+            self.vers_plan = true;
+        }
         let f = |nom: &str, size| crate::github::Fichier {
             name: nom.into(),
             browser_download_url: format!("https://github.com/x/{nom}"),
@@ -4773,6 +4831,7 @@ impl eframe::App for App {
         if ctx.global_style().animation_time != a {
             ctx.global_style_mut(|s| s.animation_time = a);
         }
+        self.visite_touches(&ctx);
         let ecran = ctx.content_rect();
         fond(&ctx.layer_painter(egui::LayerId::background()), ecran);
         // Panneaux de verre posés sur le fond, à 12 px des bords de la fenêtre.
@@ -4879,9 +4938,13 @@ impl eframe::App for App {
                 });
         }
         self.modale(&ctx);
-        self.bulle_maj(&ctx);
-        self.bulle_extension(&ctx);
-        self.bulle_lien(&ctx);
+        self.visite(&ctx);
+        // Bulles : après la visite guidée (elle les montre ou les recouvrirait).
+        if self.visite.is_none() {
+            self.bulle_maj(&ctx);
+            self.bulle_extension(&ctx);
+            self.bulle_lien(&ctx);
+        }
         self.zone_depot(&ctx);
         // Textes copiés par l'appli (Ctrl+C, bouton Copier) : à ne pas proposer.
         if let Some(c) = ctx.output(|o| {
@@ -5298,6 +5361,43 @@ fn screenshot(f: PathBuf) -> egui::ViewportCommand {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// Visite guidée : attend derrière une fenêtre ouverte et reprend sur la même carte ;
+    /// planification ouverte depuis une carte = pause, « Reprendre » ; fin = vue pour de bon.
+    #[test]
+    fn visite_pause_reprise_fin() {
+        let ctx = egui::Context::default();
+        let d = std::env::temp_dir().join(format!("fluxdl-test-visite-{}", std::process::id()));
+        let mut app = App::new(&ctx, Some(d), None);
+        ctx.run_ui(Default::default(), |_| {})
+            .textures_delta
+            .clear();
+        // Mode capture gardé : rien n'est écrit dans le vrai dossier de données.
+        assert!(app.visite.is_none());
+        app.revoir_visite();
+        app.visite.as_mut().unwrap().aller(5);
+        app.modale = Some(Modale::ViderHistorique);
+        assert!(!visite::visible(app.visite.as_ref(), app.modale.is_some()));
+        app.modale = None;
+        assert!(visite::visible(app.visite.as_ref(), app.modale.is_some()));
+        assert_eq!(app.visite.as_ref().unwrap().carte, 5);
+        app.agir_visite(visite::Action::Plan);
+        assert!(app.tab == Tab::Settings);
+        assert!(app.vers_plan);
+        assert!(!visite::visible(app.visite.as_ref(), false));
+        app.revoir_visite();
+        assert!(visite::visible(app.visite.as_ref(), false));
+        assert_eq!(app.visite.as_ref().unwrap().carte, 5);
+        app.agir_visite(visite::Action::Presse);
+        assert!(app.settings.clipboard_watch);
+        app.settings.extension_asked = false;
+        app.finir_visite();
+        assert!(app.visite.is_none());
+        assert!(app.settings.tour_seen && app.settings.extension_asked);
+        // Revoir depuis les réglages : depuis la première carte.
+        app.revoir_visite();
+        assert_eq!(app.visite.as_ref().unwrap().carte, 0);
+    }
 
     /// Faux yt-dlp qui rend une playlist → une entrée par vidéo cochée, dans le sous-dossier
     /// au nom nettoyé, sans doublon, et pas plus de `MAX_ACTIFS` lancées à la fois.

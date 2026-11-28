@@ -1329,6 +1329,65 @@ pub fn interrupteur(ui: &mut Ui, on: &mut bool) -> Response {
     rep
 }
 
+/// Bouton rond en gel bleu avec un chevron (gauche ou droite) ; grisé si le bouton est
+/// désactivé (`Ui::disable`). `aide` : infobulle et nom lu par les lecteurs d'écran.
+pub fn bouton_fleche(ui: &mut Ui, diametre: f32, droite: bool, aide: &str) -> Response {
+    let (r, rep) = ui.allocate_exact_size(Vec2::splat(diametre), Sense::click());
+    rep.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), aide));
+    let h = survol(ui, &rep);
+    let pr = pression(ui, &rep);
+    anneau_focus(ui, &rep, r, diametre / 2.0);
+    let p = ui.painter();
+    let g = if ui.is_enabled() {
+        GEL_BLEU
+    } else {
+        gel_alpha(GEL_ARGENT, 0.8)
+    };
+    if h > 0.0 {
+        p.add(lueur(
+            r.expand(3.0 + 2.0 * h),
+            g.lueur.gamma_multiply(0.55 * h),
+            10.0,
+        ));
+    }
+    gel_anime(p, r, diametre / 2.0, g, true, pr, h);
+    let c = r.center() + vec2(if droite { 1.5 } else { -1.5 }, pr);
+    let s = diametre * 0.16;
+    let x = if droite { -s * 0.6 } else { s * 0.6 };
+    let pts = [
+        c + vec2(x, -s * 1.2),
+        c + vec2(-x, 0.0),
+        c + vec2(x, s * 1.2),
+    ];
+    let blanc_ = if ui.is_enabled() {
+        Color32::WHITE
+    } else {
+        TEXTE3
+    };
+    if ui.is_enabled() {
+        trait_(
+            p,
+            &pts.map(|q| q + vec2(0.0, 1.0)),
+            Stroke::new(2.4, nuit(80)),
+        );
+    }
+    trait_(p, &pts, Stroke::new(2.4, blanc_));
+    rep.on_hover_text(aide)
+}
+
+/// Pastille verte ronde avec une coche blanche (« Fait »).
+pub fn coche_ronde(p: &egui::Painter, c: Pos2, rayon: f32) {
+    orbe(p, c, rayon, GEL_VERT);
+    let k = rayon / 8.0;
+    let pts = [vec2(-3.6, 0.2), vec2(-1.0, 2.8), vec2(3.8, -2.6)].map(|v| c + v * k);
+    trait_(
+        p,
+        &pts.map(|q| q + vec2(0.0, 1.0)),
+        Stroke::new(1.9 * k, nuit(80)),
+    );
+    trait_(p, &pts, Stroke::new(1.9 * k, Color32::WHITE));
+}
+
 /// Contrôle segmenté : gel argenté, segment choisi en gel bleu qui glisse.
 pub fn segmente<T: PartialEq + Copy>(ui: &mut Ui, v: &mut T, options: &[(T, &str)]) -> Response {
     let l = 96.0;
