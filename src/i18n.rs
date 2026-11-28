@@ -549,6 +549,38 @@ const FR: &[(&str, &str)] = &[
     (
         "Login cookies are gone (fluxdl was restarted): click the fluxdl button on the video page again to resume.",
         "Cookies de connexion perdus (fluxdl a redémarré) : clique à nouveau sur le bouton fluxdl de la page de la vidéo pour reprendre.",
+    ),    (
+        "This playlist is private: only its owner can see it.",
+        "Cette playlist est privée : seul son propriétaire peut la voir.",
+    ),
+    (
+        "Playlist or channel not found: check the link.",
+        "Playlist ou chaîne introuvable : vérifie le lien.",
+    ),
+    ("This list has no video.", "Cette liste ne contient aucune vidéo."),
+    ("This video is in a playlist", "Cette vidéo fait partie d'une playlist"),
+    (
+        "Download only this video, or choose among the videos of the whole playlist?",
+        "Télécharger seulement cette vidéo, ou choisir parmi les vidéos de toute la playlist ?",
+    ),
+    ("This video only", "Cette vidéo seule"),
+    ("The whole playlist", "Toute la playlist"),
+    ("Download a playlist or channel", "Télécharger une playlist ou une chaîne"),
+    ("Reading the list of videos…", "Lecture de la liste des vidéos…"),
+    ("Selected:", "Sélectionnées :"),
+    ("Check all", "Tout cocher"),
+    ("Uncheck all", "Tout décocher"),
+    ("Filter by title", "Filtrer par titre"),
+    ("No video matches the filter.", "Aucune vidéo ne correspond au filtre."),
+    ("Reading more videos…", "Lecture des vidéos suivantes…"),
+    ("Load more", "Charger plus"),
+    ("Quality", "Qualité"),
+    ("Audio", "Son"),
+    ("Subtitles in the interface language", "Sous-titres dans la langue de l'interface"),
+    ("In a subfolder:", "Dans un sous-dossier :"),
+    (
+        "The selected videos are already in the list.",
+        "Les vidéos cochées sont déjà dans la liste.",
     ),
 ];
 

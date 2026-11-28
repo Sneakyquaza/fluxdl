@@ -24,7 +24,10 @@ const VIDEO_SITES = [
       u.hostname === "youtu.be"
         ? /^\/[\w-]{6,}$/.test(u.pathname)
         : (u.pathname === "/watch" && /^[\w-]{6,}$/.test(u.searchParams.get("v") || "")) ||
-          /^\/(live|shorts)\/[\w-]{6,}\/?$/.test(u.pathname),
+          /^\/(live|shorts)\/[\w-]{6,}\/?$/.test(u.pathname) ||
+          // Playlist, chaîne (l'appli montre la liste de ses vidéos à cocher)
+          (u.pathname === "/playlist" && !!u.searchParams.get("list")) ||
+          /^\/(@|(channel|c)\/)[\w.%-]{1,100}(\/(videos|shorts|streams))?\/?$/.test(u.pathname),
     // yt-dlp ne lit que les cookies de youtube.com (SAPISID, LOGIN_INFO…), pas ceux de google.com
     cookieDomains: ["youtube.com"],
     player: ["#movie_player", "ytd-player", "#player", "video"],
@@ -38,8 +41,9 @@ const VIDEO_SITES = [
       if (u.hostname === "clips.twitch.tv") return /^\/[\w-]{3,}\/?$/.test(p);
       // Rediffusion : /videos/N, ancienne forme /<chaîne>/v/N ou /<chaîne>/video/N
       if (/^\/(videos|\w+\/v(ideo)?)\/\d+\/?$/.test(p) || /^\/\w+\/clip\/[\w-]+\/?$/.test(p)) return true;
-      // Chaîne : enregistre le live en cours (yt-dlp refuse si la chaîne est hors ligne)
-      const m = /^\/(\w{3,25})\/?$/.exec(p);
+      // Chaîne : enregistre le live en cours (yt-dlp refuse si la chaîne est hors ligne) ;
+      // /<chaîne>/videos : ses rediffusions publiques, à cocher dans l'appli
+      const m = /^\/(\w{3,25})(\/videos)?\/?$/.exec(p);
       return !!m && !TWITCH_RESERVED.has(m[1].toLowerCase());
     },
     // yt-dlp lit le cookie auth-token de .twitch.tv

@@ -307,6 +307,256 @@ pub fn site_video(url: &str) -> bool {
         .any(|h| hote == *h || hote.ends_with(&format!(".{h}")))
 }
 
+/// Lien vers plusieurs vidéos (playlist, chaîne, rediffusions d'une chaîne Twitch).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GenreListe {
+    /// Playlist, chaîne ou rediffusions : la liste seule.
+    Liste,
+    /// Vidéo ouverte dans une playlist (`watch?v=…&list=…`) : demander laquelle.
+    VideoDeListe,
+}
+
+/// Lien de liste et lien à donner à yt-dlp : chaîne YouTube sans onglet → son onglet Vidéos
+/// (sinon yt-dlp rend la liste des onglets Vidéos / Live / Shorts, pas les vidéos).
+pub fn liste(url: &str) -> Option<(GenreListe, String)> {
+    let reste = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let reste = reste.split('#').next().unwrap_or("");
+    let (hote, chemin) = reste.split_at(reste.find(['/', '?']).unwrap_or(reste.len()));
+    let (chemin, requete) = chemin.split_once('?').unwrap_or((chemin, ""));
+    let param = |n: &str| {
+        requete
+            .split('&')
+            .find_map(|p| p.strip_prefix(n)?.strip_prefix('='))
+            .filter(|v| !v.is_empty())
+    };
+    let s: Vec<&str> = chemin.split('/').filter(|s| !s.is_empty()).collect();
+    let nom = |n: &str| {
+        (1..=100).contains(&n.len())
+            && n.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.%".contains(&b))
+    };
+    let lien = |u: String| Some((GenreListe::Liste, u));
+    match crate::cookies::site_de(url).as_str() {
+        "youtube.com" => {
+            let liste = param("list").is_some();
+            let hote = hote.to_ascii_lowercase();
+            match s[..] {
+                ["playlist"] if liste => lien(url.into()),
+                ["watch"] if liste && param("v").is_some() => {
+                    Some((GenreListe::VideoDeListe, url.into()))
+                }
+                [_] if liste && (hote == "youtu.be" || hote.ends_with(".youtu.be")) => {
+                    Some((GenreListe::VideoDeListe, url.into()))
+                }
+                [c] if c.starts_with('@') && nom(&c[1..]) => {
+                    lien(format!("https://www.youtube.com/{c}/videos"))
+                }
+                ["channel" | "c", c] if nom(c) => {
+                    lien(format!("https://www.youtube.com/{}/{c}/videos", s[0]))
+                }
+                [c, "videos" | "shorts" | "streams"] if c.starts_with('@') && nom(&c[1..]) => {
+                    lien(url.into())
+                }
+                ["channel" | "c", c, "videos" | "shorts" | "streams"] if nom(c) => lien(url.into()),
+                _ => None,
+            }
+        }
+        // Rediffusions publiques d'une chaîne (`twitch.tv/videos/N` = une seule).
+        "twitch.tv" => match s[..] {
+            [c, "videos"]
+                if c != "videos"
+                    && (3..=25).contains(&c.len())
+                    && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') =>
+            {
+                lien(url.into())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Entrées lues à la fois (« Charger plus » lit les suivantes).
+pub const LISTE_MAX: usize = 500;
+
+pub const ERR_LISTE_PRIVEE: &str = "This playlist is private: only its owner can see it.";
+pub const ERR_LISTE_INTROUVABLE: &str = "Playlist or channel not found: check the link.";
+pub const ERR_LISTE_VIDE: &str = "This list has no video.";
+
+/// Vidéos d'une playlist ou d'une chaîne (`yt-dlp --flat-playlist -J`, sans les formats).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Playlist {
+    pub titre: String,
+    pub videos: Vec<VideoListe>,
+    /// D'autres entrées suivent (plus de `LISTE_MAX`).
+    pub suite: bool,
+    /// Entrées lues depuis le début de la liste, écartées comprises (début de la suite).
+    pub lues: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VideoListe {
+    pub url: String,
+    pub titre: String,
+    pub duree: Option<f64>,
+    /// Place dans la liste (1 = la première).
+    pub numero: usize,
+}
+
+#[derive(Deserialize)]
+struct JsonListe {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    entries: Vec<Option<JsonEntree>>,
+}
+
+#[derive(Deserialize)]
+struct JsonEntree {
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    duration: Option<f64>,
+}
+
+/// `--flat-playlist -J` lu à partir de l'entrée `debut` (0 = la première), `LISTE_MAX + 1`
+/// demandées : la dernière dit seulement qu'il y a une suite. Écartés : entrées sans lien
+/// http(s) et listes dans la liste (onglets d'une chaîne, playlists d'un onglet).
+pub fn playlist_depuis_json(d: &[u8], debut: usize) -> Result<Playlist, String> {
+    let j: JsonListe = serde_json::from_slice(d).map_err(|e| format!("yt-dlp: {e}"))?;
+    let suite = j.entries.len() > LISTE_MAX;
+    let lues = debut + j.entries.len().min(LISTE_MAX);
+    let videos = j
+        .entries
+        .into_iter()
+        .take(LISTE_MAX)
+        .enumerate()
+        .filter_map(|(i, e)| {
+            let e = e?;
+            let url = e.url.filter(|u| {
+                (u.starts_with("https://") || u.starts_with("http://")) && liste(u).is_none()
+            })?;
+            let titre = e
+                .title
+                .map(|t| t.trim().chars().take(200).collect::<String>())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| url.clone());
+            Some(VideoListe {
+                url,
+                titre,
+                duree: e.duration,
+                numero: debut + i + 1,
+            })
+        })
+        .collect();
+    Ok(Playlist {
+        titre: j
+            .title
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "playlist".into()),
+        videos,
+        suite,
+        lues,
+    })
+}
+
+/// Liste des vidéos d'une playlist / chaîne sans rien télécharger (bloquant : à lancer dans un
+/// fil). `stop` : yt-dlp tué (fenêtre fermée). Erreurs connues traduites (privée, introuvable,
+/// vide).
+pub fn lire_liste(
+    o: &Outils,
+    url: &str,
+    cookies: Option<&Path>,
+    debut: usize,
+    stop: &AtomicBool,
+) -> Result<Playlist, String> {
+    let yt = o.ytdlp.as_ref().ok_or("yt-dlp missing")?;
+    let mut c = commande(yt);
+    c.args(["--flat-playlist", "-J"]);
+    args_communs(&mut c, o, cookies);
+    // Après `--no-playlist` des arguments communs : la dernière l'emporte.
+    let mut fils = c
+        .arg("--yes-playlist")
+        .arg("--playlist-start")
+        .arg((debut + 1).to_string())
+        .arg("--playlist-end")
+        .arg((debut + LISTE_MAX + 1).to_string())
+        .arg("--")
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("yt-dlp: {e}"))?;
+    let lire = |r: Option<Box<dyn Read + Send>>| {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut s = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut s);
+            }
+            let _ = tx.send(s);
+        });
+        rx
+    };
+    let sortie = lire(fils.stdout.take().map(|r| Box::new(r) as _));
+    let err = lire(fils.stderr.take().map(|r| Box::new(r) as _));
+    let s = loop {
+        if stop.load(Ordering::Relaxed) {
+            tuer(&mut fils);
+            return Err("stopped".into());
+        }
+        match sortie.recv_timeout(Duration::from_millis(100)) {
+            Ok(s) => break s,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break Vec::new(),
+        }
+    };
+    let ok = fils.wait().is_ok_and(|e| e.success());
+    let err = String::from_utf8_lossy(&err.recv().unwrap_or_default()).into_owned();
+    if !ok {
+        let e = derniere_erreur(&err);
+        let m = e.to_ascii_lowercase();
+        return Err(if m.contains("private") {
+            ERR_LISTE_PRIVEE.into()
+        } else if m.contains("does not exist") || m.contains("not found") || m.contains("404") {
+            ERR_LISTE_INTROUVABLE.into()
+        } else {
+            e
+        });
+    }
+    let p = playlist_depuis_json(&s, debut)?;
+    if debut == 0 && p.videos.is_empty() {
+        return Err(ERR_LISTE_VIDE.into());
+    }
+    Ok(p)
+}
+
+/// Nom de sous-dossier pour une playlist : nom de fichier sûr (Windows et Linux), 100 octets
+/// au plus, sans point ni espace final ; vide → « playlist ».
+pub fn nom_dossier(titre: &str) -> String {
+    let mut n = engine::sanitize(titre);
+    if n.len() > 100 {
+        let mut coupe = 100;
+        while !n.is_char_boundary(coupe) {
+            coupe -= 1;
+        }
+        n.truncate(coupe);
+    }
+    // Windows refuse un point ou une espace final ; nom réservé (« NUL ») revérifié après coupe.
+    let n = engine::sanitize(n.trim_end_matches(|c: char| c == '.' || c.is_whitespace()));
+    if n.is_empty() {
+        "playlist".into()
+    } else {
+        n
+    }
+}
+
 /// Ligne de progression (`--progress-template`) : « fluxdl <reçus> <total> <estimé> ».
 pub fn progression(l: &str) -> Option<(u64, Option<u64>)> {
     let mut m = l.strip_prefix("fluxdl ")?.split_whitespace();
@@ -2052,6 +2302,225 @@ mod tests {
         assert_eq!(args.len(), 1);
         assert!(args[0].contains("--merge-output-format mp4"));
         assert!(!args[0].contains("--embed") && !args[0].contains("subs"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn liens_de_listes() {
+        use GenreListe::*;
+        let pl = "https://www.youtube.com/playlist?list=PLRqwX-V7Uu6ZiZxtDDRCi6uhfTH4FilpH";
+        let cas: &[(&str, Option<(GenreListe, &str)>)] = &[
+            (pl, Some((Liste, pl))),
+            (
+                "https://www.youtube.com/watch?v=17WoOqgXsRM&list=PLx&index=2",
+                Some((
+                    VideoDeListe,
+                    "https://www.youtube.com/watch?v=17WoOqgXsRM&list=PLx&index=2",
+                )),
+            ),
+            (
+                "https://youtu.be/17WoOqgXsRM?list=PLx",
+                Some((VideoDeListe, "https://youtu.be/17WoOqgXsRM?list=PLx")),
+            ),
+            (
+                "https://www.youtube.com/@TheCodingTrain",
+                Some((Liste, "https://www.youtube.com/@TheCodingTrain/videos")),
+            ),
+            (
+                "https://m.youtube.com/@TheCodingTrain/",
+                Some((Liste, "https://www.youtube.com/@TheCodingTrain/videos")),
+            ),
+            (
+                "https://www.youtube.com/@TheCodingTrain/videos",
+                Some((Liste, "https://www.youtube.com/@TheCodingTrain/videos")),
+            ),
+            (
+                "https://www.youtube.com/@TheCodingTrain/shorts",
+                Some((Liste, "https://www.youtube.com/@TheCodingTrain/shorts")),
+            ),
+            (
+                "https://www.youtube.com/channel/UCvjgXvBlbQiydffZU7m1_aw",
+                Some((
+                    Liste,
+                    "https://www.youtube.com/channel/UCvjgXvBlbQiydffZU7m1_aw/videos",
+                )),
+            ),
+            (
+                "https://www.youtube.com/c/TheCodingTrain/videos?view=0",
+                Some((
+                    Liste,
+                    "https://www.youtube.com/c/TheCodingTrain/videos?view=0",
+                )),
+            ),
+            (
+                "https://www.twitch.tv/riotgames/videos",
+                Some((Liste, "https://www.twitch.tv/riotgames/videos")),
+            ),
+            (
+                "https://www.twitch.tv/zerator/videos?filter=archives&sort=time",
+                Some((
+                    Liste,
+                    "https://www.twitch.tv/zerator/videos?filter=archives&sort=time",
+                )),
+            ),
+            // Une seule vidéo, ou pas une liste de vidéos.
+            ("https://www.youtube.com/watch?v=17WoOqgXsRM", None),
+            ("https://www.youtube.com/watch?list=PLx", None),
+            ("https://www.youtube.com/playlist", None),
+            ("https://www.youtube.com/shorts/abcdefghijk", None),
+            ("https://www.youtube.com/@TheCodingTrain/community", None),
+            ("https://www.youtube.com/@TheCodingTrain/playlists", None),
+            ("https://www.youtube.com/", None),
+            ("https://www.youtube.com/feed/subscriptions", None),
+            ("https://www.twitch.tv/videos/2928653119", None),
+            ("https://www.twitch.tv/videos/videos", None),
+            ("https://www.twitch.tv/riotgames", None),
+            ("https://youtube.com.evil.example/playlist?list=PLx", None),
+            ("https://evil.example/@x/videos", None),
+            ("ftp://www.youtube.com/playlist?list=PLx", None),
+        ];
+        for (u, attendu) in cas {
+            assert_eq!(liste(u), attendu.map(|(g, l)| (g, l.to_string())), "{u}");
+        }
+    }
+
+    /// Sortie réelle de `yt-dlp --flat-playlist -J` (YouTube, playlist publique, 3 premières
+    /// entrées, 2026-11-28, miniatures retirées).
+    const PLAYLIST: &[u8] = include_bytes!("../tests/fixtures/ytdlp_playlist.json");
+
+    #[test]
+    fn liste_d_une_vraie_sortie() {
+        let p = playlist_depuis_json(PLAYLIST, 0).unwrap();
+        assert_eq!(p.titre, "Coding Challenges");
+        assert!(!p.suite);
+        assert_eq!(p.lues, 3);
+        assert_eq!(p.videos.len(), 3);
+        assert_eq!(
+            p.videos[0],
+            VideoListe {
+                url: "https://www.youtube.com/watch?v=17WoOqgXsRM".into(),
+                titre: "Coding Challenge 1: Starfield Simulation".into(),
+                duree: Some(834.0),
+                numero: 1,
+            }
+        );
+        assert_eq!(p.videos[2].numero, 3);
+        // Rediffusions Twitch (url_transparent), onglets d'une chaîne (listes sans lien),
+        // entrée nulle, lien non http, suite de la liste (numéros à partir de `debut`).
+        let j = r#"{"title":"riotgames - All Videos","entries":[
+            {"_type":"url_transparent","url":"https://www.twitch.tv/videos/2928653119","title":" GEN vs BLG ","duration":33077.0},
+            {"_type":"playlist","title":"The Coding Train - Videos"},
+            {"_type":"url","url":"https://www.youtube.com/@x/videos","title":"onglet"},
+            null,
+            {"url":"javascript:alert(1)","title":"x"},
+            {"url":"https://www.twitch.tv/videos/2","title":""}]}"#;
+        let p = playlist_depuis_json(j.as_bytes(), 500).unwrap();
+        let v: Vec<_> = p
+            .videos
+            .iter()
+            .map(|v| (v.numero, v.titre.as_str(), v.duree))
+            .collect();
+        assert_eq!(
+            v,
+            [
+                (501, "GEN vs BLG", Some(33077.0)),
+                (506, "https://www.twitch.tv/videos/2", None)
+            ]
+        );
+        assert_eq!(p.lues, 506);
+        // Plus de LISTE_MAX entrées : la dernière dit seulement qu'il y a une suite.
+        let e: Vec<String> = (0..=LISTE_MAX)
+            .map(|i| format!(r#"{{"url":"https://www.youtube.com/watch?v={i}"}}"#))
+            .collect();
+        let p = playlist_depuis_json(format!(r#"{{"entries":[{}]}}"#, e.join(",")).as_bytes(), 0)
+            .unwrap();
+        assert!(p.suite);
+        assert_eq!((p.videos.len(), p.lues), (LISTE_MAX, LISTE_MAX));
+        assert_eq!(p.titre, "playlist");
+    }
+
+    #[test]
+    fn nom_de_dossier() {
+        assert_eq!(nom_dossier("Coding Challenges"), "Coding Challenges");
+        assert_eq!(nom_dossier("a/b\\c: d?*"), "a_b_c_ d__");
+        assert_eq!(nom_dossier("../.."), "_");
+        assert_eq!(nom_dossier("  ...  "), "playlist");
+        assert_eq!(nom_dossier(""), "playlist");
+        assert_eq!(nom_dossier("NUL"), "_NUL");
+        assert_eq!(nom_dossier("Fin. "), "Fin");
+        assert_eq!(nom_dossier("\u{202E}gpj.exe"), "gpj.exe");
+        let long = "é".repeat(80) + " suite";
+        let n = nom_dossier(&long);
+        assert!(n.len() <= 100 && n.chars().all(|c| c == 'é'), "{n}");
+        // Coupe qui laisse un point final : retiré.
+        let n = nom_dossier(&("a".repeat(99) + ".b"));
+        assert_eq!(n, "a".repeat(99));
+    }
+
+    /// Faux yt-dlp : la liste est lue avec `--flat-playlist --yes-playlist` et ses bornes ;
+    /// erreurs connues traduites ; arrêt = processus tué.
+    #[cfg(unix)]
+    #[test]
+    fn liste_par_un_faux_ytdlp() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("fluxdl-test-liste-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let yt = d.join("yt-dlp");
+        std::fs::write(
+            &yt,
+            format!(
+                "#!/bin/sh\necho \"$@\" > '{0}/args.txt'\ncase \"$*\" in\n*prive*) echo 'ERROR: [youtube:tab] PLp: YouTube said: This playlist is private' >&2; echo null; exit 1 ;;\n*absente*) echo 'ERROR: [youtube:tab] PLa: YouTube said: The playlist does not exist.' >&2; exit 1 ;;\n*vide*) echo '{{\"title\":\"V\",\"entries\":[]}}' ;;\n*lente*) sleep 30 ;;\n*) cat '{0}/liste.json' ;;\nesac\n",
+                d.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(d.join("liste.json"), PLAYLIST).unwrap();
+        let o = Outils {
+            ytdlp: Some(yt),
+            ..Default::default()
+        };
+        let non = AtomicBool::new(false);
+        let p = lire_liste(
+            &o,
+            "https://www.youtube.com/playlist?list=PLx",
+            None,
+            0,
+            &non,
+        )
+        .unwrap();
+        assert_eq!(p.videos.len(), 3);
+        let a = std::fs::read_to_string(d.join("args.txt")).unwrap();
+        assert!(a.starts_with("--flat-playlist -J --ignore-config"), "{a}");
+        assert!(
+            a.contains("--no-playlist")
+                && a.contains("--yes-playlist --playlist-start 1 --playlist-end 501 -- https://www.youtube.com/playlist?list=PLx"),
+            "{a}"
+        );
+        lire_liste(&o, "https://x/suite", None, 500, &non).unwrap();
+        let a = std::fs::read_to_string(d.join("args.txt")).unwrap();
+        assert!(
+            a.contains("--playlist-start 501 --playlist-end 1001"),
+            "{a}"
+        );
+        let err = |u: &str| lire_liste(&o, u, None, 0, &non).unwrap_err();
+        assert_eq!(err("https://x/prive"), ERR_LISTE_PRIVEE);
+        assert_eq!(err("https://x/absente"), ERR_LISTE_INTROUVABLE);
+        assert_eq!(err("https://x/vide"), ERR_LISTE_VIDE);
+        // Suite vide : pas une erreur.
+        assert!(lire_liste(&o, "https://x/vide", None, 500, &non)
+            .unwrap()
+            .videos
+            .is_empty());
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            s2.store(true, Ordering::Relaxed);
+        });
+        let t = std::time::Instant::now();
+        assert!(lire_liste(&o, "https://x/lente", None, 0, &stop).is_err());
+        assert!(t.elapsed() < Duration::from_secs(5));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

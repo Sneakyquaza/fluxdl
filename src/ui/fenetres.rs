@@ -36,6 +36,33 @@ impl App {
                     *rx = None;
                 }
             }
+            Some(Modale::Liste {
+                rx,
+                liste,
+                coches,
+                erreur_suite,
+                ..
+            }) => {
+                if let Some(r) = rx.as_ref().and_then(|r| r.try_recv().ok()) {
+                    match (liste.as_mut(), r) {
+                        // « Charger plus » : la suite s'ajoute, cochée elle aussi.
+                        (Some(Ok(p)), Ok(s)) => {
+                            coches.extend(std::iter::repeat_n(true, s.videos.len()));
+                            p.videos.extend(s.videos);
+                            p.suite = s.suite;
+                            p.lues = s.lues;
+                        }
+                        (Some(Ok(_)), Err(e)) => *erreur_suite = Some(e),
+                        (_, r) => {
+                            if let Ok(p) = &r {
+                                *coches = vec![true; p.videos.len()];
+                            }
+                            *liste = Some(r);
+                        }
+                    }
+                    *rx = None;
+                }
+            }
             Some(Modale::Torrent {
                 rx, apercu, coches, ..
             }) => {
@@ -135,6 +162,9 @@ impl App {
                 ..
             }) = &self.modale
             {
+                stop.store(true, Ordering::Relaxed);
+            }
+            if let Some(Modale::Liste { stop, .. }) = &self.modale {
                 stop.store(true, Ordering::Relaxed);
             }
             self.modale = None;
@@ -465,43 +495,12 @@ impl App {
                                         segmente(
                                             ui,
                                             &mut sortie.srt,
-                                            &[
-                                                (false, t(l, "Embedded")),
-                                                (true, t(l, ".srt file")),
-                                            ],
+                                            &[(false, t(l, "Embedded")), (true, t(l, ".srt file"))],
                                         );
                                     });
                                 });
                             }
-                            ui.horizontal(|ui| {
-                                let w = (LARGEUR - 8.0) / 2.0;
-                                ui.allocate_ui(vec2(w, 26.0), |ui| {
-                                    coche(ui, &mut sortie.thumbnail, t(l, "Embed the thumbnail"), "")
-                                });
-                                ui.allocate_ui(vec2(w, 26.0), |ui| {
-                                    coche(ui, &mut sortie.chapters, t(l, "Embed the chapters"), "")
-                                });
-                            });
-                            if image {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(t(l, "Format"))
-                                            .font(moyen(13.0))
-                                            .color(TEXTE),
-                                    );
-                                    ui.add_space(8.0);
-                                    segmente(
-                                        ui,
-                                        &mut sortie.mp4,
-                                        &[(true, "MP4"), (false, t(l, "Original"))],
-                                    );
-                                });
-                                petit(ui, if sortie.mp4 {
-                                    t(l, "MP4: plays everywhere (H.264/AAC when available, up to 1080p on YouTube).")
-                                } else {
-                                    t(l, "Original: best quality, MKV or WebM.")
-                                });
-                            }
+                            miniature_chapitres_format(ui, l, &mut sortie, image);
                         });
                         if !ff {
                             petit(ui, t(l, "Subtitles, thumbnail and chapters need ffmpeg."));
@@ -564,6 +563,245 @@ impl App {
                         debut,
                         sortie,
                     });
+                }
+            }
+            Modale::VideoOuListe(url) => {
+                titre_modale(ui, Icone::Lecture, t(l, "This video is in a playlist"));
+                paragraphe(
+                    ui,
+                    t(
+                        l,
+                        "Download only this video, or choose among the videos of the whole playlist?",
+                    ),
+                );
+                match boutons_avec(
+                    ui,
+                    t(l, "This video only"),
+                    t(l, "The whole playlist"),
+                    true,
+                    Icone::Telecharger,
+                    GEL_BLEU,
+                ) {
+                    Some(true) => self.ouvrir_liste(url),
+                    Some(false) => self.ouvrir_video_seule(url),
+                    None => self.modale = Some(Modale::VideoOuListe(url)),
+                }
+                return false;
+            }
+            Modale::Liste {
+                url,
+                mut rx,
+                stop,
+                liste,
+                mut erreur_suite,
+                mut coches,
+                mut filtre,
+                mut choix,
+                mut sortie,
+                mut dossier,
+            } => {
+                titre_modale(ui, Icone::Lecture, t(l, "Download a playlist or channel"));
+                let mut suite = None;
+                match &liste {
+                    None => {
+                        attente(ui, t(l, "Reading the list of videos…"));
+                        fermer = boutons(ui, t(l, "Cancel"), "", false).is_some();
+                    }
+                    Some(Err(m)) => {
+                        erreur(ui, tr(l, m));
+                        fermer = boutons(ui, t(l, "Close"), "", false).is_some();
+                    }
+                    Some(Ok(p)) => {
+                        let g = ligne(ui, p.titre.as_str(), demi(14.5), TEXTE, LARGEUR);
+                        let (r, _) = ui.allocate_exact_size(g.size(), Sense::hover());
+                        ui.painter().galley(r.min, g, TEXTE);
+                        let n = coches.iter().filter(|c| **c).count();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} {n} / {}{}",
+                                t(l, "Selected:"),
+                                p.videos.len(),
+                                if p.suite { "+" } else { "" }
+                            ))
+                            .font(regulier(12.5))
+                            .color(TEXTE3),
+                        );
+                        ui.add_space(8.0);
+                        // Filtre sur le titre ; « Tout cocher / décocher » = les vidéos montrées.
+                        let f = filtre.trim().to_lowercase();
+                        let vues: Vec<usize> = (0..p.videos.len())
+                            .filter(|&i| {
+                                f.is_empty() || p.videos[i].titre.to_lowercase().contains(&f)
+                            })
+                            .collect();
+                        let (r, _) = ui.allocate_exact_size(vec2(LARGEUR, 34.0), Sense::hover());
+                        let mut x = r.right();
+                        for (nom, v) in [(t(l, "Uncheck all"), false), (t(l, "Check all"), true)] {
+                            let w = ui
+                                .painter()
+                                .layout_no_wrap(nom.into(), demi(13.5), TEXTE)
+                                .size()
+                                .x
+                                + 32.0;
+                            let b = Rect::from_min_size(pos2(x - w, r.top()), vec2(w, 34.0));
+                            if a_la_place(ui, b, |ui| bouton_secondaire(ui, nom, None, b.size()))
+                                .clicked()
+                            {
+                                for &i in &vues {
+                                    coches[i] = v;
+                                }
+                            }
+                            x = b.left() - 8.0;
+                        }
+                        let z = Rect::from_min_max(r.min, pos2(x - 2.0, r.bottom()));
+                        champ(
+                            ui,
+                            z,
+                            &mut filtre,
+                            t(l, "Filter by title"),
+                            None,
+                            regulier(13.0),
+                        );
+                        ui.add_space(6.0);
+                        ui.scope(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            egui::ScrollArea::vertical()
+                                .max_height(180.0)
+                                .auto_shrink([false, false])
+                                .show_rows(ui, 26.0, vues.len(), |ui, lignes| {
+                                    for &i in &vues[lignes] {
+                                        let v = &p.videos[i];
+                                        coche(
+                                            ui,
+                                            &mut coches[i],
+                                            &format!("{}. {}", v.numero, v.titre),
+                                            &v.duree.map_or(String::new(), duree),
+                                        );
+                                    }
+                                });
+                        });
+                        let petit = |ui: &mut Ui, s: &str| {
+                            ui.label(egui::RichText::new(s).font(regulier(12.0)).color(TEXTE3));
+                        };
+                        if vues.is_empty() {
+                            petit(ui, t(l, "No video matches the filter."));
+                        }
+                        if let Some(e) = &erreur_suite {
+                            erreur(ui, tr(l, e));
+                        }
+                        if p.suite {
+                            if rx.is_some() {
+                                attente(ui, t(l, "Reading more videos…"));
+                            } else {
+                                ui.add_space(4.0);
+                                let nom = t(l, "Load more");
+                                let w = ui
+                                    .painter()
+                                    .layout_no_wrap(nom.into(), demi(13.5), TEXTE)
+                                    .size()
+                                    .x
+                                    + 32.0;
+                                if bouton_secondaire(ui, nom, None, vec2(w, 32.0)).clicked() {
+                                    suite = Some(p.lues);
+                                }
+                            }
+                        }
+                        ui.add_space(8.0);
+                        // Une qualité pour toutes : celles qu'une vidéo n'a pas sont prises au
+                        // plus près par yt-dlp (« /b »).
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(t(l, "Quality"))
+                                    .font(moyen(13.0))
+                                    .color(TEXTE),
+                            );
+                            ui.add_space(8.0);
+                            segmente(
+                                ui,
+                                &mut choix,
+                                &[
+                                    (video::Qualite::Best, t(l, "Best")),
+                                    (video::Qualite::P1080, "1080p"),
+                                    (video::Qualite::P720, "720p"),
+                                    (video::Qualite::M4a, t(l, "Audio")),
+                                    (video::Qualite::Mp3, "MP3"),
+                                ],
+                            );
+                        });
+                        let ff = self.outils.ffmpeg.is_some();
+                        let image = !choix.audio();
+                        ui.add_enabled_ui(ff, |ui| {
+                            if image {
+                                ui.horizontal(|ui| {
+                                    ui.allocate_ui(vec2(290.0, 26.0), |ui| {
+                                        coche(
+                                            ui,
+                                            &mut sortie.subtitles,
+                                            t(l, "Subtitles in the interface language"),
+                                            "",
+                                        )
+                                    });
+                                    ui.add_enabled_ui(sortie.subtitles, |ui| {
+                                        segmente(
+                                            ui,
+                                            &mut sortie.srt,
+                                            &[(false, t(l, "Embedded")), (true, t(l, ".srt file"))],
+                                        );
+                                    });
+                                });
+                            }
+                            miniature_chapitres_format(ui, l, &mut sortie, image);
+                        });
+                        if !ff {
+                            petit(ui, t(l, "Subtitles, thumbnail and chapters need ffmpeg."));
+                        }
+                        let nom = video::nom_dossier(&p.titre);
+                        coche(
+                            ui,
+                            &mut dossier,
+                            &format!("{} {nom}", t(l, "In a subfolder:")),
+                            "",
+                        );
+                        let ok = format!("{} ({n})", t(l, "Download"));
+                        match boutons(ui, t(l, "Cancel"), &ok, n > 0) {
+                            Some(true) => {
+                                self.settings.video_options = video::Sortie {
+                                    sub_lang: None,
+                                    sub_auto: false,
+                                    ..sortie.clone()
+                                };
+                                if self.ajouter_liste(&url, p, &coches, choix, &sortie, dossier) > 0
+                                {
+                                    garder = false;
+                                } else {
+                                    erreur_suite =
+                                        Some("The selected videos are already in the list.".into());
+                                }
+                            }
+                            Some(false) => fermer = true,
+                            None => {}
+                        }
+                    }
+                }
+                if let Some(debut) = suite {
+                    erreur_suite = None;
+                    rx = Some(self.lire_liste(&url, debut, &stop));
+                }
+                if garder && !fermer {
+                    self.modale = Some(Modale::Liste {
+                        url,
+                        rx,
+                        stop,
+                        liste,
+                        erreur_suite,
+                        coches,
+                        filtre,
+                        choix,
+                        sortie,
+                        dossier,
+                    });
+                } else {
+                    stop.store(true, Ordering::Relaxed);
                 }
             }
             Modale::Torrent {
@@ -1439,6 +1677,43 @@ impl App {
             x = b.left() - 10.0;
         }
         res
+    }
+}
+
+/// Miniature, chapitres et conteneur (vidéo seule et liste ; ffmpeg requis, vérifié avant).
+fn miniature_chapitres_format(ui: &mut Ui, l: Lang, sortie: &mut video::Sortie, image: bool) {
+    ui.horizontal(|ui| {
+        let w = (LARGEUR - 8.0) / 2.0;
+        ui.allocate_ui(vec2(w, 26.0), |ui| {
+            coche(ui, &mut sortie.thumbnail, t(l, "Embed the thumbnail"), "")
+        });
+        ui.allocate_ui(vec2(w, 26.0), |ui| {
+            coche(ui, &mut sortie.chapters, t(l, "Embed the chapters"), "")
+        });
+    });
+    if image {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(t(l, "Format"))
+                    .font(moyen(13.0))
+                    .color(TEXTE),
+            );
+            ui.add_space(8.0);
+            segmente(
+                ui,
+                &mut sortie.mp4,
+                &[(true, "MP4"), (false, t(l, "Original"))],
+            );
+        });
+        let s = if sortie.mp4 {
+            t(
+                l,
+                "MP4: plays everywhere (H.264/AAC when available, up to 1080p on YouTube).",
+            )
+        } else {
+            t(l, "Original: best quality, MKV or WebM.")
+        };
+        ui.label(egui::RichText::new(s).font(regulier(12.0)).color(TEXTE3));
     }
 }
 

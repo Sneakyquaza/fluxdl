@@ -168,6 +168,25 @@ enum Modale {
         /// Sous-titres, miniature, chapitres, conteneur (défaut : réglages).
         sortie: video::Sortie,
     },
+    /// Vidéo ouverte dans une playlist : cette vidéo seule ou toute la playlist ?
+    VideoOuListe(String),
+    /// Vidéos d'une playlist / chaîne (lues par yt-dlp dans un fil, `LISTE_MAX` à la fois) :
+    /// cases, une qualité et les mêmes ajouts pour toutes.
+    Liste {
+        url: String,
+        rx: Attente<Result<video::Playlist, String>>,
+        /// Arrête la lecture en cours (fenêtre fermée).
+        stop: Arc<AtomicBool>,
+        liste: Option<Result<video::Playlist, String>>,
+        /// Échec de « Charger plus » (la liste déjà lue reste).
+        erreur_suite: Option<String>,
+        coches: Vec<bool>,
+        filtre: String,
+        choix: video::Qualite,
+        sortie: video::Sortie,
+        /// Sous-dossier au nom de la playlist.
+        dossier: bool,
+    },
     /// Outils vidéo manquants ; `url` : vidéo à ouvrir ensuite (vide depuis les réglages).
     Outils { url: String, etat: EtatOutils },
     /// Fichiers d'un torrent (lien magnet résolu par les pairs dans un fil).
@@ -488,6 +507,7 @@ impl App {
     }
 
     /// Vidéo : formats lus par yt-dlp ; outils manquants → accord (Windows) ou message.
+    /// Playlist / chaîne → liste des vidéos ; vidéo dans une playlist → question.
     fn ouvrir_video(&mut self, url: String) {
         if cfg!(windows) && !self.outils.complets() {
             let o = self.outils.clone();
@@ -501,6 +521,17 @@ impl App {
             });
             return;
         }
+        match video::liste(&url) {
+            Some((video::GenreListe::Liste, _)) => self.ouvrir_liste(url),
+            Some((video::GenreListe::VideoDeListe, _)) => {
+                self.modale = Some(Modale::VideoOuListe(url))
+            }
+            None => self.ouvrir_video_seule(url),
+        }
+    }
+
+    /// Formats d'une seule vidéo lus par yt-dlp dans un fil (outils déjà vérifiés).
+    fn ouvrir_video_seule(&mut self, url: String) {
         let (tx, rx) = std::sync::mpsc::channel();
         let o = self.outils.clone();
         let u = url.clone();
@@ -529,6 +560,111 @@ impl App {
             debut: false,
             sortie: self.settings.video_options.clone(),
         });
+    }
+
+    /// Playlist / chaîne : vidéos lues dans un fil (`debut` = déjà lues, « Charger plus »).
+    fn lire_liste(
+        &self,
+        url: &str,
+        debut: usize,
+        stop: &Arc<AtomicBool>,
+    ) -> Receiver<Result<video::Playlist, String>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let o = self.outils.clone();
+        let jarre = self.jarres.get(url).cloned();
+        let lien = video::liste(url).map_or_else(|| url.to_string(), |l| l.1);
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let r = if o.ytdlp.is_none() {
+                Err(video::ABSENT.to_string())
+            } else {
+                match jarre.map(|j| crate::cookies::Fichier::creer(&crate::cookies::dossier(), &j))
+                {
+                    Some(Err(e)) => Err(format!("cookies: {e}")),
+                    Some(Ok(f)) => video::lire_liste(&o, &lien, Some(f.chemin()), debut, &stop),
+                    None => video::lire_liste(&o, &lien, None, debut, &stop),
+                }
+            };
+            let _ = tx.send(r);
+        });
+        rx
+    }
+
+    fn ouvrir_liste(&mut self, url: String) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let rx = self.lire_liste(&url, 0, &stop);
+        self.modale = Some(Modale::Liste {
+            url,
+            rx: Some(rx),
+            stop,
+            liste: None,
+            erreur_suite: None,
+            coches: Vec::new(),
+            filtre: String::new(),
+            choix: self.settings.video_quality,
+            sortie: self.settings.video_options.clone(),
+            dossier: true,
+        });
+    }
+
+    /// Une entrée par vidéo cochée (même chemin qu'une vidéo seule : moteur multi-connexions,
+    /// ajouts), sans doublon d'une vidéo déjà dans la file ; renvoie le nombre ajouté.
+    /// Sous-titres : langue de l'interface (absente : rien), comme l'ajout direct.
+    fn ajouter_liste(
+        &mut self,
+        url: &str,
+        p: &video::Playlist,
+        coches: &[bool],
+        qualite: video::Qualite,
+        sortie: &video::Sortie,
+        dossier: bool,
+    ) -> usize {
+        let mut dir = PathBuf::from(&self.settings.folder);
+        if dossier {
+            dir.push(video::nom_dossier(&p.titre));
+        }
+        let dir = dir.to_string_lossy().into_owned();
+        // Cookies de la page de la liste (playlist privée à soi, vidéos réservées aux membres).
+        let jarre = self.jarres.get(url).cloned();
+        let options = video::Sortie {
+            sub_lang: Some(self.settings.lang.code().into()),
+            sub_auto: false,
+            ..sortie.clone()
+        };
+        let mut n = 0;
+        for (v, _) in p.videos.iter().zip(coches).filter(|(_, c)| **c) {
+            let deja = self.entries.iter().any(|e| {
+                e.url == v.url
+                    && match &e.status {
+                        Status::Done => e
+                            .name
+                            .as_ref()
+                            .is_some_and(|n| Path::new(&e.dir).join(n).exists()),
+                        s => *s != Status::Canceled,
+                    }
+            });
+            if deja {
+                continue;
+            }
+            if let Some(j) = &jarre {
+                self.jarres.insert(v.url.clone(), j.clone());
+            }
+            let e = self.nouvelle(
+                v.url.clone(),
+                Kind::Video {
+                    quality: qualite,
+                    estimate: None,
+                    section: None,
+                    from_start: false,
+                    login: jarre.is_some(),
+                    options: options.clone(),
+                },
+            );
+            e.dir = dir.clone();
+            e.name = Some(v.titre.clone());
+            n += 1;
+        }
+        n
     }
 
     /// Page vidéo envoyée par l'extension (bouton près du lecteur, menu) : choix du format,
@@ -563,7 +699,11 @@ impl App {
             self.tab = Tab::Downloads;
             return Statut::DejaActif;
         }
-        if reduite && self.outils.ytdlp.is_some() && (cfg!(not(windows)) || self.outils.complets())
+        // Une liste demande toujours ses cases (pas d'ajout direct de centaines de vidéos).
+        if reduite
+            && video::liste(&url).is_none()
+            && self.outils.ytdlp.is_some()
+            && (cfg!(not(windows)) || self.outils.complets())
         {
             let login = self.jarres.contains_key(&url);
             self.nouvelle(
@@ -750,7 +890,12 @@ impl App {
         });
         // Cookies d'une page dont plus rien n'attend : oubliés.
         let ouverte = match &self.modale {
-            Some(Modale::Video { url, .. } | Modale::Outils { url, .. }) => Some(url.as_str()),
+            Some(
+                Modale::Video { url, .. }
+                | Modale::Outils { url, .. }
+                | Modale::Liste { url, .. }
+                | Modale::VideoOuListe(url),
+            ) => Some(url.as_str()),
             _ => None,
         };
         let entries = &self.entries;
@@ -793,6 +938,7 @@ impl App {
             self.modale,
             Some(
                 Modale::Video { rx: Some(_), .. }
+                    | Modale::Liste { rx: Some(_), .. }
                     | Modale::Torrent { rx: Some(_), .. }
                     | Modale::Outils { .. }
                     | Modale::Appairage { .. }
@@ -2303,7 +2449,7 @@ impl App {
         let f = *frame;
         let dir = dir.clone();
         // Assez d'images entre le changement de vue et la capture pour finir les animations.
-        let vues: [(Tab, Lang, &str); 21] = [
+        let vues: [(Tab, Lang, &str); 24] = [
             (Tab::Downloads, Lang::En, "downloads"),
             (Tab::Benchmark, Lang::En, "benchmark"),
             (Tab::Settings, Lang::En, "settings"),
@@ -2324,6 +2470,9 @@ impl App {
             (Tab::Downloads, Lang::Fr, "cancel_fr"),
             (Tab::Downloads, Lang::Fr, "expired_link_fr"),
             (Tab::Downloads, Lang::Fr, "non_latin_names_fr"),
+            (Tab::Downloads, Lang::Fr, "playlist_fr"),
+            (Tab::Downloads, Lang::En, "playlist_choice_en"),
+            (Tab::Downloads, Lang::Fr, "playlist_private_fr"),
             (Tab::Downloads, Lang::Fr, "narrow_900x600_fr"),
         ];
         for (i, (tab, lang, nom)) in vues.into_iter().enumerate() {
@@ -2465,6 +2614,65 @@ impl App {
                     debut: true,
                     sortie: video::Sortie::default(),
                 });
+            }
+            "playlist_fr" | "playlist_private_fr" => {
+                self.outils.ffmpeg = Some(PathBuf::from("ffmpeg"));
+                let titres = [
+                    ("Coding Challenge 1: Starfield Simulation", 834.0),
+                    ("Coding Challenge #2: Menger Sponge Fractal", 841.0),
+                    ("Coding Challenge 3: The Snake Game", 1647.0),
+                    ("Coding Challenge #4: Purple Rain in Processing", 563.0),
+                    ("Coding Challenge #5: Space Invaders in JavaScript", 2481.0),
+                    ("Coding Challenge #6: Mitosis Simulation with p5.js", 1072.0),
+                    ("Coding Challenge #7: Solar System in Processing - Part 1 (2D)", 1325.0),
+                    ("Coding Challenge #8: Solar System in Processing - Part 2 (3D)", 1166.0),
+                ];
+                let videos: Vec<_> = titres
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (titre, d))| video::VideoListe {
+                        url: format!("https://www.youtube.com/watch?v=demo{i}"),
+                        titre: (*titre).into(),
+                        duree: Some(*d),
+                        numero: i + 1,
+                    })
+                    .collect();
+                let mut coches = vec![true; videos.len()];
+                coches[3] = false;
+                let liste = if nom == "playlist_fr" {
+                    Ok(video::Playlist {
+                        titre: "Coding Challenges".into(),
+                        videos,
+                        suite: true,
+                        lues: 500,
+                    })
+                } else {
+                    Err(video::ERR_LISTE_PRIVEE.into())
+                };
+                self.modale = Some(Modale::Liste {
+                    url: "https://www.youtube.com/playlist?list=PLRqwX-V7Uu6ZiZxtDDRCi6uhfTH4FilpH"
+                        .into(),
+                    rx: None,
+                    stop: Arc::default(),
+                    liste: Some(liste),
+                    erreur_suite: None,
+                    coches,
+                    filtre: String::new(),
+                    choix: video::Qualite::P1080,
+                    sortie: video::Sortie {
+                        subtitles: true,
+                        thumbnail: true,
+                        mp4: true,
+                        ..Default::default()
+                    },
+                    dossier: true,
+                });
+            }
+            "playlist_choice_en" => {
+                self.modale = Some(Modale::VideoOuListe(
+                    "https://www.youtube.com/watch?v=17WoOqgXsRM&list=PLRqwX-V7Uu6ZiZxtDDRCi6uhfTH4FilpH"
+                        .into(),
+                ))
             }
             "settings_video_fr" => self.defile = Some(1150.0),
             "torrent_pieces_fr" => self.selected = Some(5),
@@ -3279,4 +3487,104 @@ fn screenshot(f: PathBuf) -> egui::ViewportCommand {
         );
         println!("capture {} : {:?}", f.display(), r.err());
     }))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// Faux yt-dlp qui rend une playlist → une entrée par vidéo cochée, dans le sous-dossier
+    /// au nom nettoyé, sans doublon, et pas plus de `MAX_ACTIFS` lancées à la fois.
+    #[test]
+    fn liste_dans_la_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("fluxdl-test-file-liste-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let e: Vec<String> = (1..=5)
+            .map(|i| {
+                format!(r#"{{"url":"https://www.youtube.com/watch?v=v{i}","title":"Vidéo {i}","duration":6{i}}}"#)
+            })
+            .collect();
+        std::fs::write(
+            d.join("liste.json"),
+            format!(
+                r#"{{"title":"Ma liste: été/2026","entries":[{}]}}"#,
+                e.join(",")
+            ),
+        )
+        .unwrap();
+        // Liste lue ; téléchargement : échec immédiat (rien ne sort sur Internet).
+        let yt = d.join("yt-dlp");
+        std::fs::write(
+            &yt,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n*--flat-playlist*) cat '{}/liste.json' ;;\n*) exit 1 ;;\nesac\n",
+                d.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let o = video::Outils {
+            ytdlp: Some(yt),
+            ..Default::default()
+        };
+        let url = "https://www.youtube.com/playlist?list=PLx";
+        let p = video::lire_liste(&o, url, None, 0, &AtomicBool::new(false)).unwrap();
+        assert_eq!(p.videos.len(), 5);
+
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, Some(d.join("cap")), None);
+        ctx.run_ui(Default::default(), |_| {})
+            .textures_delta
+            .clear();
+        app.capture = None;
+        app.entries.clear();
+        app.jobs.clear();
+        app.outils = o;
+        app.settings.folder = d.join("dl").to_string_lossy().into_owned();
+        let sortie = video::Sortie {
+            subtitles: true,
+            thumbnail: true,
+            ..Default::default()
+        };
+        let mut ajoute = |coches: [bool; 5], dossier: bool| {
+            app.ajouter_liste(url, &p, &coches, video::Qualite::P720, &sortie, dossier)
+        };
+        assert_eq!(ajoute([false, true, false, false, false], true), 1);
+        // La 2e est déjà dans la file : pas en double.
+        assert_eq!(ajoute([true, true, true, false, true], true), 3);
+        assert_eq!(ajoute([true; 5], false), 1);
+        assert_eq!(ajoute([true; 5], true), 0);
+        let urls: Vec<_> = app.entries.iter().map(|e| e.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [2, 1, 3, 5, 4].map(|i| format!("https://www.youtube.com/watch?v=v{i}"))
+        );
+        let sous = d.join("dl").join("Ma liste_ été_2026");
+        let e = &app.entries[0];
+        assert_eq!(e.dir, sous.to_string_lossy());
+        assert_eq!(e.name.as_deref(), Some("Vidéo 2"));
+        assert_eq!(e.status, Status::Queued);
+        assert_eq!(
+            e.kind,
+            Kind::Video {
+                quality: video::Qualite::P720,
+                estimate: None,
+                section: None,
+                from_start: false,
+                login: false,
+                options: video::Sortie {
+                    sub_lang: Some(app.settings.lang.code().into()),
+                    ..sortie.clone()
+                },
+            }
+        );
+        // Sans sous-dossier : le dossier de téléchargement.
+        assert_eq!(app.entries[4].dir, app.settings.folder);
+        // Le nombre de téléchargements simultanés est respecté.
+        app.schedule(1.0);
+        let n = |s: Status| app.entries.iter().filter(|e| e.status == s).count();
+        assert_eq!((n(Status::Running), n(Status::Queued)), (MAX_ACTIFS, 2));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
